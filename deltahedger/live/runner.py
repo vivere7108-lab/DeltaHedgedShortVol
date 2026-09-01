@@ -21,15 +21,33 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 from ..broker.ibkr import IbkrChainProvider, IbkrConnection, IbkrExecution, WhatIfMarginModel
 from ..config import Config
 from ..data.base import MarketBar
+from ..portfolio import OptionPosition
 from ..sizing import build_margin_model
 from ..strategy import ShortVolStrategy
 
 log = logging.getLogger(__name__)
+
+
+def _parse_ibkr_expiry(value: str) -> date:
+    """Parse a contract's lastTradeDateOrContractMonth (YYYYMMDD or YYYYMM).
+
+    Raises rather than returning ``None`` on a bad parse: an adopted option
+    leg with an unknown expiry can't be risk-managed (the close-before-
+    expiry check has nothing to compare against), so failing loudly here
+    beats silently adopting a leg the runner then can't close on time.
+    """
+    text = (value or "").strip()
+    for fmt in ("%Y%m%d", "%Y%m"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"could not parse an expiry from lastTradeDateOrContractMonth={value!r}")
 
 
 class LiveRunner:
@@ -138,37 +156,94 @@ class LiveRunner:
 
         Starting a live session with a stale in-memory book is how a hedger
         ends up doubling a position, so the runner trusts the broker, not
-        itself.
+        itself -- this includes option legs, not just the hedge. A process
+        restart (a crash, a redeploy, or IB Gateway's own mandatory nightly
+        restart under IBC) must not require a human to notice and manually
+        re-seed the position, or "unattended forward test" stops being
+        true. Only a *foreign* position -- one whose strike or expiry the
+        strategy did not itself choose and so cannot risk-manage against --
+        is worth refusing to start over; anything shaped like our own put
+        (and call, if selling one) is adopted instead.
+
+        What is necessarily approximate about an adopted leg: IBKR's
+        position feed has no entry timestamp, and its avgCost is a cost
+        basis, not the exact per-unit premium our own fills would have
+        recorded -- and whether IBKR reports avgCost signed by long/short or
+        as an unsigned magnitude is not something this codebase can verify
+        without a live account, so entry_price and avg_price both take
+        abs(avgCost): a per-unit price must come out positive either way,
+        and everything downstream (unrealised P&L, the stop/target ratio)
+        already assumes a positive entry_price the way a normal fill
+        produces one. entry_time, entry_iv and entry_delta are placeholders
+        (informational only -- nothing downstream keys exit decisions off
+        them). Log the derived entry_price on every adoption
+        specifically so this is auditable rather than silently trusted.
         """
         assert self.strategy is not None
         positions = conn.ib.positions(conn.account)
         hedge_symbol = self.source.hedge.symbol
-        adopted = 0
+        option_symbol = self.source.option.symbol
+        option_mult = self.source.option.multiplier
+        adopted_legs: dict[str, OptionPosition] = {}
+        now = datetime.now(self.strategy.clock.tz)
+
         for position in positions:
             contract = position.contract
             if not position.position:
                 continue  # closed-out legs still surface in some feeds
+
             if contract.secType == "FUT" and contract.symbol == hedge_symbol:
                 self.strategy.portfolio.hedge.quantity = int(position.position)
-                self.strategy.portfolio.hedge.avg_price = float(position.avgCost) / (
+                # abs(): avgCost is a per-contract cost-basis magnitude, not
+                # signed by long/short -- a price must come out positive
+                # regardless of which convention this account's feed uses.
+                self.strategy.portfolio.hedge.avg_price = abs(float(position.avgCost)) / (
                     self.source.hedge.multiplier or 1.0
                 )
-                adopted += 1
                 log.warning(
                     "adopted an existing hedge position: %+d %s @ %.2f",
                     self.strategy.portfolio.hedge.quantity, hedge_symbol,
                     self.strategy.portfolio.hedge.avg_price,
                 )
-            elif contract.secType == "FOP" and contract.symbol == self.source.option.symbol:
-                log.error(
-                    "an existing %s option position is open (%+d %s %g%s). This "
-                    "runner will not adopt option legs it did not open -- close it "
-                    "or restart once flat.",
-                    contract.symbol, int(position.position),
-                    contract.lastTradeDateOrContractMonth, contract.strike, contract.right,
+
+            elif contract.secType == "FOP" and contract.symbol == option_symbol:
+                right = contract.right[:1].upper()  # IBKR sends "P"/"PUT" inconsistently
+                entry_price = abs(float(position.avgCost)) / option_mult
+                expiry = _parse_ibkr_expiry(contract.lastTradeDateOrContractMonth)
+                leg = OptionPosition(
+                    strike=float(contract.strike),
+                    expiry=expiry,
+                    right=right,
+                    quantity=int(position.position),
+                    entry_price=entry_price,
+                    entry_time=now,  # unknown; IBKR positions carry no timestamp
+                    entry_iv=0.0,  # informational only -- not used in exit decisions
+                    entry_delta=0.0,
                 )
-                raise RuntimeError("refusing to start with an unmanaged option position")
-        if not adopted:
+                self.strategy.portfolio.open_leg(leg)
+                adopted_legs[right] = leg
+                log.warning(
+                    "adopted an existing %s option position: %+d %g%s exp %s "
+                    "@ derived entry price %.2f (from avgCost %.2f) -- verify "
+                    "this looks right before trusting the stop/target off it",
+                    option_symbol, leg.quantity, leg.strike, right, expiry,
+                    entry_price, float(position.avgCost),
+                )
+
+        if len(adopted_legs) == 2:
+            put, call = adopted_legs.get("P"), adopted_legs.get("C")
+            if put and call and put.expiry != call.expiry:
+                log.error(
+                    "adopted put (exp %s) and call (exp %s) have different "
+                    "expiries -- they should never diverge if this runner "
+                    "opened both together. Proceeding, but the close-before-"
+                    "expiry check only looks at one leg's expiry and the "
+                    "other may be closed later than intended. Do not trade "
+                    "manually in an account this bot manages.",
+                    put.expiry, call.expiry,
+                )
+
+        if not self.strategy.portfolio.legs and not self.strategy.portfolio.hedge.quantity:
             log.info("no existing positions to adopt")
 
 
