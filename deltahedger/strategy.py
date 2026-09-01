@@ -94,7 +94,7 @@ class ShortVolStrategy:
         self._last_hedge_time: datetime | None = None
         self._session_date: date | None = None
         self._session_start_equity = cfg.starting_equity
-        self._entries_this_session = 0
+        self._exited_this_session = False
         self._halted_for_session = False
 
     # -- main loop ------------------------------------------------------
@@ -143,7 +143,7 @@ class ShortVolStrategy:
                 moment,
             ).price
         self._session_start_equity = self.portfolio.equity(option_mark, future_price)
-        self._entries_this_session = 0
+        self._exited_this_session = False
         self._halted_for_session = False
 
     def _record(self, moment: datetime, kind: str, detail: str, net_delta: float = 0.0) -> None:
@@ -185,7 +185,7 @@ class ShortVolStrategy:
         cfg = self.cfg.strategy
         if self._halted_for_session:
             return
-        if self._entries_this_session and not cfg.reenter_after_exit:
+        if self._exited_this_session and not cfg.reenter_after_exit:
             return
 
         local = moment.timetz().replace(tzinfo=None)
@@ -246,7 +246,6 @@ class ShortVolStrategy:
                 entry_delta=quote.greeks.delta,
             )
         )
-        self._entries_this_session += 1
         credit = -fill.quantity * fill.price * self.source.option.multiplier
         self._record(
             moment, "entry",
@@ -318,6 +317,7 @@ class ShortVolStrategy:
         self.fills.append(fill)
         self.portfolio.charge_fees(fill.fees)
         pnl = self.portfolio.close_option(fill.price)
+        self._exited_this_session = True
         self._record(
             moment, "exit",
             f"bought back {abs(position.quantity)} {position.strike:g}P @ "

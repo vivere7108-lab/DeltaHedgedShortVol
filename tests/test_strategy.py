@@ -157,6 +157,72 @@ class TestExits:
         assert strategy.portfolio.hedge.quantity != 0
 
 
+def bar_on(day_offset: int, minutes: int, price: float = 5000.0, iv: float = 0.15) -> MarketBar:
+    moment = OPEN + timedelta(days=day_offset, minutes=minutes)
+    return MarketBar(moment, price, price, price, price, iv)
+
+
+class TestMultiDayReentry:
+    """Regression: for a multi-day DTE position, an exit that happens on a
+    *later* calendar day than the entry must still be gated by
+    reenter_after_exit=False.
+
+    The guard used to track "entries opened this session" and reset that
+    counter every day. A 0DTE position always opens and closes the same
+    day, so that counter happened to also mean "did a position close
+    today" -- but a multi-day position opens on one day and can close on a
+    later one, where the counter is back to zero. That silently bypassed
+    the guard: a stop-out on day 3 of a held position could immediately
+    reenter the same day, exactly as if reenter_after_exit were True. Found
+    by a real backtest that entered three short puts across four days
+    during a sustained selloff, one of them a same-day pile-on five minutes
+    after a stop.
+    """
+
+    def cfg(self, **overrides):
+        return make_cfg(**{
+            "strategy.min_days_to_expiry": 4,
+            "strategy.max_days_to_expiry": 6,
+            "strategy.stop_loss_premium_multiple": 2.0,
+            "strategy.daily_loss_limit_pct": None,  # isolate the stop path
+            **overrides,
+        })
+
+    def test_a_stop_on_a_later_day_does_not_reenter_the_same_day(self):
+        bars = [
+            bar_on(0, 0, 5000.0),    # day 0 (Tue): entry, ~5 calendar days out
+            bar_on(3, 0, 5000.0),    # day 3 (Fri): still open, unchanged mark
+            bar_on(3, 5, 4900.0),    # day 3: sharp drop triggers the stop
+            bar_on(3, 10, 4900.0),   # day 3: a pile-on attempt would fire here
+        ]
+        strategy = drive(self.cfg(), bars)
+        assert kinds(strategy).count("exit") == 1
+        assert kinds(strategy).count("entry") == 1  # no same-day pile-on
+        assert strategy.portfolio.option is None
+
+    def test_a_fresh_entry_is_allowed_on_the_next_trading_day(self):
+        bars = [
+            bar_on(0, 0, 5000.0),
+            bar_on(3, 0, 5000.0),
+            bar_on(3, 5, 4900.0),    # stop fires (Friday)
+            bar_on(6, 0, 4900.0),    # next trading day (Monday): fresh entry OK
+        ]
+        strategy = drive(self.cfg(), bars)
+        assert kinds(strategy).count("entry") == 2
+
+    def test_reenter_after_exit_still_allows_the_same_day_pile_on(self):
+        """The flag exists to permit exactly this -- confirms the guard,
+        not the feature, was the bug."""
+        bars = [
+            bar_on(0, 0, 5000.0),
+            bar_on(3, 0, 5000.0),
+            bar_on(3, 5, 4900.0),
+            bar_on(3, 10, 4900.0),
+        ]
+        strategy = drive(self.cfg(**{"strategy.reenter_after_exit": True}), bars)
+        assert kinds(strategy).count("entry") == 2
+
+
 class TestHedging:
     def test_it_hedges_the_short_put_delta_down_to_the_target(self):
         strategy = drive(make_cfg(), [bar(0), bar(5)])

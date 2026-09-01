@@ -34,6 +34,12 @@ def _load(args: argparse.Namespace) -> Config:
         cfg.hedge.target = args.target
     if args.band is not None:
         cfg.hedge.band = args.band
+    if getattr(args, "min_dte", None) is not None:
+        cfg.strategy.min_days_to_expiry = args.min_dte
+    if getattr(args, "max_dte", None) is not None:
+        cfg.strategy.max_days_to_expiry = args.max_dte
+    if getattr(args, "stop_multiple", None) is not None:
+        cfg.strategy.stop_loss_premium_multiple = args.stop_multiple
     if getattr(args, "source", None):
         cfg.data.source = args.source
     if getattr(args, "bar_size", None):
@@ -145,6 +151,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
 
     common = argparse.ArgumentParser(add_help=False)
+    # Also accepted after the subcommand (`deltahedger backtest -v ...`), not
+    # just before it: argparse hands each subparser a *fresh* namespace and
+    # copies every attribute it produces onto the real one, so if this used
+    # the ordinary store_true default (False), giving `-v` before the
+    # subcommand would be silently overwritten back to False by the
+    # subparser's own default the moment it ran. SUPPRESS means "only
+    # produce this attribute if the flag was actually seen here", so the
+    # copy leaves an already-True value alone.
+    common.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="debug logging",
+    )
     common.add_argument("-c", "--config", help="path to a YAML config file")
     common.add_argument("--start", help="start date, YYYY-MM-DD")
     common.add_argument("--end", help="end date, YYYY-MM-DD")
@@ -155,6 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--target", type=float, help="delta target in delta units")
     common.add_argument("--band", type=float, help="delta band half-width")
+    common.add_argument(
+        "--min-dte", type=int, dest="min_dte",
+        help="minimum calendar days to expiry for the expiry selected "
+        "(strategy.min_days_to_expiry)",
+    )
+    common.add_argument(
+        "--max-dte", type=int, dest="max_dte",
+        help="maximum calendar days to expiry for the expiry selected "
+        "(strategy.max_days_to_expiry)",
+    )
+    common.add_argument(
+        "--stop-multiple", type=float, dest="stop_multiple",
+        help="buy back the short put once its mark reaches this multiple of "
+        "the entry credit (strategy.stop_loss_premium_multiple)",
+    )
     common.add_argument("--host", help="TWS / IB Gateway host (overrides ibkr.host)")
     common.add_argument(
         "--port", type=int,
@@ -200,6 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.set_defaults(func=cmd_sweep)
 
     conf = sub.add_parser("config", help="write a default config file")
+    conf.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="debug logging",
+    )
     conf.add_argument("-o", "--out", default="config.yaml")
     conf.set_defaults(func=cmd_config)
 
