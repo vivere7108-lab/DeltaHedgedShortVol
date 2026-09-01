@@ -273,6 +273,37 @@ stitching 3 front-month contract(s):
 `data.roll_days_before_expiry` (default 8) sets the handover point. Results
 are cached per window and bar size, so re-running costs nothing.
 
+By default this connects to whatever `ibkr.host`/`ibkr.port` the config
+names (paper TWS on 7497). Override per invocation without editing the file:
+`--host`, `--port`, `--client-id`. `fetch` is read-only — it never places an
+order and does not require `ibkr.allow_live_trading` — so pointing it at a
+live TWS/Gateway port (7496, or 4001 for live Gateway) is safe if that is
+the only instance you have running; the `allow_live_trading` gate and the
+paper-account refusal apply only to `live`, which routes orders.
+
+**IBKR's expired-contract lookup does not go back forever.** In practice it
+is roughly a year, and it varies by account — `reqContractDetails` and
+`qualifyContracts` simply omit anything older, with no error, just an
+absence. If the requested `--start` predates what the earliest resolvable
+contract can verify, `fetch` refuses rather than silently substituting a
+later contract's prices for the unverifiable span:
+
+```
+error: cannot verify ES front-month coverage for 2025-01-02..2025-06-30: the
+earliest contract this connection could resolve is ESU5 (expires
+2025-09-19), and nothing in IBKR's expired-contract lookup goes back far
+enough to bound when its own front-month span began. [...] No part of the
+requested range is recoverable this way: this contract only becomes
+verifiably front month on 2025-09-11, which is after the requested end
+(2025-06-30). Use a data source with longer historical contract retention.
+```
+
+When part of the range *is* recoverable, the error instead names a narrower
+`--start` to retry with. There is no config flag to silently accept the
+unverified stitch — the risk (fetching a forward-quarter contract's prices
+and labelling them as the front month's) is exactly the kind of wrong-not-
+missing data a backtest happily runs on without complaint.
+
 If the implied-vol series comes back empty — some accounts cannot request
 `OPTION_IMPLIED_VOLATILITY` on futures — the fetch still succeeds and every
 bar falls back to `data.default_atm_iv`, with a warning. That turns the run

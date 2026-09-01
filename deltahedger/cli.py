@@ -38,6 +38,12 @@ def _load(args: argparse.Namespace) -> Config:
         cfg.data.source = args.source
     if getattr(args, "bar_size", None):
         cfg.data.bar_size = args.bar_size
+    if getattr(args, "host", None):
+        cfg.ibkr.host = args.host
+    if getattr(args, "port", None):
+        cfg.ibkr.port = args.port
+    if getattr(args, "client_id", None) is not None:
+        cfg.ibkr.client_id = args.client_id
     cfg.validate()
     return cfg
 
@@ -149,6 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--target", type=float, help="delta target in delta units")
     common.add_argument("--band", type=float, help="delta band half-width")
+    common.add_argument("--host", help="TWS / IB Gateway host (overrides ibkr.host)")
+    common.add_argument(
+        "--port", type=int,
+        help="TWS / IB Gateway port (overrides ibkr.port); "
+        "7497 paper TWS, 7496 live TWS, 4002 paper gateway, 4001 live gateway",
+    )
+    common.add_argument(
+        "--client-id", type=int, dest="client_id",
+        help="API client id (overrides ibkr.client_id)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
