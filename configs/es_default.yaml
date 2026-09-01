@@ -1,0 +1,86 @@
+# Delta-hedged short volatility on ES futures options.
+#
+# Defaults as specified: sell the shortest-dated (0DTE) ~20-delta put, hold
+# net delta at 20 +/- 3 delta units by trading MES, and commit 15% of equity
+# as margin buying power.
+#
+# Generate a fresh copy of this file with:  deltahedger config -o my.yaml
+
+risk_source: ES
+starting_equity: 100000.0
+risk_free_rate: 0.04
+
+hedge:
+  # Delta units: 1 unit == 1% of one ES contract.
+  #   long 1 ES  = +100      long 1 MES = +10
+  #   short 1 put at -0.20 delta = +20
+  target: 20.0
+  band: 3.0
+  # NOTE: one MES moves net delta by 10 units, so any band narrower than 5
+  # is inert -- the hedger only trades when a whole contract gets it closer
+  # to target, which needs an error above 5. The backtest summary says so
+  # explicitly under "Band feasibility". Widen this to ~10 to make it bind.
+  min_hedge_contracts: 1
+  max_hedge_contracts: 200
+  min_seconds_between_hedges: 0.0
+  flatten_hedge_on_exit: true
+
+sizing:
+  buying_power_pct: 0.15      # the parameter you asked to be tunable
+  hedge_margin_reserve_pct: 0.30
+  min_short_contracts: 1
+  max_short_contracts: 50
+  margin_model: span_scan     # span_scan | reg_t | fixed
+  span_scan_multiplier: 1.0
+  span_vol_scan_pct: 0.30
+  span_short_option_minimum: 250.0
+
+strategy:
+  min_days_to_expiry: 0       # 0 == take the 0DTE series when it is listed
+  max_days_to_expiry: 1
+  short_put_delta: 0.20
+  short_put_delta_tolerance: 0.10
+  strike_mode: delta          # delta | moneyness
+  entry_time: '09:35'
+  entry_cutoff_time: '11:00'
+  close_before_expiry_minutes: 5
+  stop_loss_premium_multiple: 3.0
+  take_profit_pct: null
+  daily_loss_limit_pct: 0.05
+  reenter_after_exit: false
+
+vol:
+  # iv(K) = atm_iv + slope*ln(K/F) + curvature*ln(K/F)^2
+  # Negative slope puts more vol on lower strikes, as ES trades. This is an
+  # assumption, and it sets the credit the strategy collects -- see README.
+  skew_slope: -1.5
+  skew_curvature: 0.0
+  iv_multiplier: 1.0
+  fallback_atm_iv: 0.15
+  min_iv: 0.02
+  max_iv: 3.0
+
+costs:
+  enabled: true
+  option_slippage_ticks: 1.0
+  hedge_slippage_ticks: 0.5
+  option_fees_per_contract: 2.32
+  hedge_fees_per_contract: 0.62
+
+data:
+  source: ibkr               # ibkr | csv | synthetic
+  bar_size: 5 mins
+  cache_dir: data_cache
+  default_atm_iv: 0.15
+
+ibkr:
+  host: 127.0.0.1
+  port: 7497                 # 7497 paper TWS, 4002 paper gateway
+  client_id: 17
+  account: null
+  allow_live_trading: false  # must be true to route orders to a live account
+  use_delayed_data: false
+  poll_seconds: 5.0
+  use_whatif_margin: true
+  hedge_order_type: MKT
+  limit_cross_ticks: 1.0
