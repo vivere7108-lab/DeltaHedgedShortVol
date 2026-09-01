@@ -7,16 +7,16 @@ from deltahedger.config import SizingConfig
 from deltahedger.pricing import black76
 from deltahedger.sizing import (
     FixedMarginModel, RegTMarginModel, SpanScanMarginModel,
-    build_margin_model, size_short_puts,
+    build_margin_model, size_short_option_position, size_short_puts,
 )
 
 F = 5000.0
 T = 6.4 / 24 / 365
 
 
-def quote(strike, iv=0.156):
-    greeks = black76(F, strike, T, iv, 0.04, "P")
-    return OptionQuote(strike, "P", date(2025, 6, 10), greeks.price, iv, greeks, T)
+def quote(strike, iv=0.156, right="P"):
+    greeks = black76(F, strike, T, iv, 0.04, right)
+    return OptionQuote(strike, right, date(2025, 6, 10), greeks.price, iv, greeks, T)
 
 
 @pytest.fixture
@@ -121,3 +121,105 @@ class TestModelSelection:
         cfg = SizingConfig(margin_model="fixed", fixed_margin_per_contract=1234.0)
         model = build_margin_model(cfg, es)
         assert model.short_option_margin(quote(4980.0), F, es) == 1234.0
+
+
+class TestCombinedMargin:
+    """A strangle's two legs scanned together, not summed independently --
+    they cannot both be maximally hurt by the same price move."""
+
+    def test_degenerates_to_the_single_leg_margin(self, es, span):
+        put = quote(4980.0)
+        assert span.combined_margin([put], F, es) == pytest.approx(
+            span.short_option_margin(put, F, es)
+        )
+
+    def test_an_empty_list_costs_nothing(self, es, span):
+        assert span.combined_margin([], F, es) == 0.0
+
+    def test_is_less_than_the_naive_sum_of_both_legs(self, es, span):
+        put = quote(4980.0, right="P")
+        call = quote(5020.0, right="C")
+        combined = span.combined_margin([put, call], F, es)
+        naive_sum = span.short_option_margin(put, F, es) + span.short_option_margin(
+            call, F, es
+        )
+        assert combined < naive_sum
+
+    def test_is_at_most_the_larger_single_leg_margin(self, es, span):
+        """The offsetting leg can only help, never hurt, at the scenario
+        that drives the combined worst case."""
+        put = quote(4980.0, right="P")
+        call = quote(5020.0, right="C")
+        combined = span.combined_margin([put, call], F, es)
+        larger_leg = max(
+            span.short_option_margin(put, F, es), span.short_option_margin(call, F, es)
+        )
+        assert combined <= larger_leg + 1e-6
+
+    def test_a_wider_strangle_costs_less_than_a_tighter_one(self, es, span):
+        tight = span.combined_margin([quote(4990.0, right="P"), quote(5010.0, right="C")], F, es)
+        wide = span.combined_margin([quote(4800.0, right="P"), quote(5200.0, right="C")], F, es)
+        assert wide < tight
+
+    def test_reg_t_combined_uses_the_worse_leg_plus_the_other_premium(self, es):
+        model = RegTMarginModel()
+        put = quote(4980.0, right="P")
+        call = quote(5020.0, right="C")
+        combined = model.combined_margin([put, call], F, es)
+        put_margin = model.short_option_margin(put, F, es)
+        call_margin = model.short_option_margin(call, F, es)
+        expected = max(put_margin, call_margin) + (
+            call.price * es.option.multiplier
+            if put_margin >= call_margin
+            else put.price * es.option.multiplier
+        )
+        assert combined == pytest.approx(expected)
+
+    def test_fixed_combined_sums_flat_per_leg_cost(self, es):
+        model = FixedMarginModel(per_option_contract=1000.0, per_hedge_contract=100.0)
+        assert model.combined_margin([quote(4980.0), quote(5020.0, right="C")], F, es) == 2000.0
+
+
+class TestCombinedSizing:
+    def test_a_strangle_is_sized_off_combined_margin(self, es, span):
+        put = quote(4980.0, right="P")
+        call = quote(5020.0, right="C")
+        result = size_short_option_position(
+            250_000, [put, call], F, SizingConfig(), es, span
+        )
+        assert result.margin_per_contract == pytest.approx(
+            span.combined_margin([put, call], F, es)
+        )
+
+    def test_a_strangle_affords_at_least_as_many_units_as_naively_summing_legs(
+        self, es, span
+    ):
+        """Combined margin is never more than the naive per-leg sum
+        (verified directly in TestCombinedMargin), so buying power should
+        never afford fewer strangle units than pricing each leg
+        independently and adding them up would.
+
+        NOT the same claim as "at least as many as the put alone": whether
+        a strangle affords more or fewer units than the naked put depends
+        on whether the call's own margin happens to be smaller or larger
+        than the put's -- that's strike-selection-dependent, not a real
+        invariant of combined margining.
+        """
+        put = quote(4980.0, right="P")
+        call = quote(5020.0, right="C")
+        strangle = size_short_option_position(
+            250_000, [put, call], F, SizingConfig(), es, span
+        )
+        naive_per_unit = span.short_option_margin(put, F, es) + span.short_option_margin(
+            call, F, es
+        )
+        naive_contracts = int(strangle.option_budget // naive_per_unit)
+        assert strangle.contracts >= naive_contracts
+
+    def test_size_short_puts_matches_the_single_element_general_call(self, es, span):
+        put = quote(4980.0)
+        via_alias = size_short_puts(250_000, put, F, SizingConfig(), es, span)
+        via_general = size_short_option_position(
+            250_000, [put], F, SizingConfig(), es, span
+        )
+        assert via_alias == via_general

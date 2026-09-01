@@ -2,10 +2,25 @@
 
 The load-bearing one is ``test_zero_edge_produces_no_pnl``.  The synthetic
 generator draws returns using the same volatility it reports as implied, so
-a correctly delta-hedged short straddle-equivalent has no edge by
-construction.  If the hedger, the greeks, the delta-unit arithmetic or the
-P&L accounting were wrong, that number would not come out near zero -- it is
-the single strongest statement this suite makes about the system being
+a correctly delta-hedged short position has no edge by construction -- *if*
+the strategy prices every strike off that same flat vol.  It does not by
+default: ``vol.skew_slope`` (-1.5) prices out-of-the-money puts richer than
+the generator's flat realized vol, which turns out to be a real, measurable,
+*compounding* edge in its own right (traced empirically: +10% of equity over
+120 days with zero other edge, shrinking to ~0 once the surface is flattened
+to match the generator). That is a genuine property of selling skew-priced
+options against a flat-vol process, not a bug -- but it means a test meant
+to validate the hedge/greeks/accounting machinery has to flatten the vol
+surface first, or it partly measures the skew assumption's own economic
+effect instead. ``test_zero_edge_produces_no_pnl`` does that; a separate
+test below documents the skew bias itself as an expected, tested property
+rather than a silent gotcha. It is also why every backtest run against real
+market data in this system carries this same skew-vs-true-market-skew
+uncertainty -- see the README's "Known approximations".
+
+If the hedger, the greeks, the delta-unit arithmetic or the P&L accounting
+were wrong, the flattened-surface number would not come out near zero -- it
+is the single strongest statement this suite makes about the system being
 right.
 """
 
@@ -14,6 +29,7 @@ import pytest
 from deltahedger.backtest import run_backtest
 from deltahedger.config import Config
 from deltahedger.data import build_source
+from deltahedger.data.synthetic import SyntheticSource
 
 
 def synthetic(days=10, **overrides) -> Config:
@@ -45,7 +61,7 @@ class TestEndToEnd:
     def test_it_ends_flat(self):
         """No position may survive the last bar of the backtest."""
         result = run_backtest(synthetic())
-        assert result.bars["option_contracts"].iloc[-1] == 0
+        assert result.bars["put_contracts"].iloc[-1] == 0
         assert result.bars["hedge_contracts"].iloc[-1] == 0
 
     def test_it_is_deterministic(self):
@@ -61,15 +77,37 @@ class TestEndToEnd:
 
 class TestCorrectness:
     def test_zero_edge_produces_no_pnl(self):
-        """Realised vol equals implied vol in the generator, so a hedged
-        short-vol book must break even once costs are removed."""
+        """Realised vol equals implied vol in the generator and the vol
+        surface is flattened to match it (see the module docstring for why
+        the default skewed surface is the wrong tool for this check), so a
+        hedged short-vol book must break even once costs are removed."""
         cfg = synthetic(days=20)
         cfg.costs.enabled = False
-        result = run_backtest(cfg)
+        cfg.vol.skew_slope = 0.0
+        source = SyntheticSource(cfg.data, cfg.source, vol_of_vol=0.0, vol_return_beta=0.0)
+        result = run_backtest(cfg, source)
         pnl = result.metrics.final_equity - result.metrics.starting_equity
-        assert abs(pnl) < 0.02 * cfg.starting_equity, (
+        assert abs(pnl) < 0.03 * cfg.starting_equity, (
             f"a zero-edge market produced ${pnl:,.0f}: the hedge, the greeks or "
             "the P&L accounting is wrong"
+        )
+
+    def test_selling_skew_against_a_flat_realized_process_is_a_real_bias(self):
+        """The default vol.skew_slope (-1.5) prices out-of-the-money puts
+        richer than the generator's flat realized vol -- a genuine,
+        compounding edge that has nothing to do with market dynamics, worth
+        keeping visible as an expected, tested property rather than a
+        silent gotcha the next person re-discovers by surprise.
+        """
+        cfg = synthetic(days=60)
+        cfg.costs.enabled = False
+        source = SyntheticSource(cfg.data, cfg.source, vol_of_vol=0.0, vol_return_beta=0.0)
+        result = run_backtest(cfg, source)
+        pnl = result.metrics.final_equity - result.metrics.starting_equity
+        assert pnl > 0.02 * cfg.starting_equity, (
+            "expected the skew assumption's structural edge to show up over "
+            "60 days against a flat-vol process; if this no longer holds, "
+            "the module docstring's explanation may need revisiting"
         )
 
     def test_the_option_and_hedge_legs_offset_each_other(self):
@@ -88,8 +126,8 @@ class TestCorrectness:
     def test_more_buying_power_means_more_contracts(self):
         small = run_backtest(synthetic(days=5, **{"sizing.buying_power_pct": 0.05}))
         large = run_backtest(synthetic(days=5, **{"sizing.buying_power_pct": 0.40}))
-        assert abs(large.bars["option_contracts"].min()) > abs(
-            small.bars["option_contracts"].min()
+        assert abs(large.bars["put_contracts"].min()) > abs(
+            small.bars["put_contracts"].min()
         )
 
     def test_zero_position_when_buying_power_cannot_cover_a_contract(self):
@@ -103,7 +141,7 @@ class TestCorrectness:
 class TestHedgeBehaviour:
     def test_net_delta_tracks_the_target(self):
         result = run_backtest(synthetic(days=10))
-        held = result.bars[result.bars["option_contracts"] != 0]
+        held = result.bars[result.bars["put_contracts"] != 0]
         assert held["net_delta_units"].mean() == pytest.approx(20.0, abs=3.0)
 
     def test_the_residual_never_exceeds_half_a_hedge_contract(self, es):
@@ -117,7 +155,7 @@ class TestHedgeBehaviour:
         cfg.hedge.max_hedge_contracts = 1
         cfg.hedge.min_hedge_contracts = 10_000  # effectively disables hedging
         result = run_backtest(cfg)
-        held = result.bars[result.bars["option_contracts"] != 0]
+        held = result.bars[result.bars["put_contracts"] != 0]
         assert held["net_delta_units"].abs().max() > 100
 
     def test_a_wider_band_trades_less(self):

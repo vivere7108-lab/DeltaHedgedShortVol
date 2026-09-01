@@ -96,22 +96,42 @@ first.
 ## Correctness
 
 The synthetic generator draws returns using the same volatility it reports
-as implied, so a correctly delta-hedged short put has **no edge by
-construction**. With costs disabled, 20 days on $250k produces:
+as implied, so a correctly delta-hedged short position has **no edge by
+construction** -- *if* every strike is priced off that same flat vol. It
+isn't by default: `vol.skew_slope` (-1.5) prices out-of-the-money puts
+richer than the generator's flat realized process, and that turns out to be
+a real, measurable, **compounding** edge in its own right, nothing to do
+with genuine market dynamics:
 
 ```
-P&L  -$504     option leg -$2,889     hedge leg +$2,385
+skew_slope=-1.5 (default)         skew_slope=0.0 (flattened to match)
+ 20d: +1.4%   60d: +4.4%   120d: +10.1%      20d: -0.1%   60d: +0.0%   120d: +0.9%
 ```
 
-Essentially zero, with the two legs offsetting. That single number exercises
-the greeks, the delta-unit arithmetic, the band logic and the P&L accounting
-at once — if any were wrong it would not come out near zero. It is asserted
-in `tests/test_backtest.py::TestCorrectness::test_zero_edge_produces_no_pnl`.
+That is an expected, tested property of selling skew-priced options against
+a flat-vol process (`test_selling_skew_against_a_flat_realized_process_is_a_real_bias`),
+not a bug -- but it means the machinery-correctness check has to flatten the
+surface first, or it partly measures the skew assumption's own economic
+effect instead of validating the hedge. With the surface flattened and
+vol-of-vol removed, 20 days on $250k comes back to $66 on $250,000 (0.03%)
+— asserted in `test_zero_edge_produces_no_pnl`. That number exercises the
+greeks, the delta-unit arithmetic, the band logic and the P&L accounting at
+once; if any were wrong it would not come out near zero.
 
-The suite has 248 tests: Black-76 against put-call parity (to 1e-13) and
+**This is not just a synthetic-data footnote.** Every backtest run against
+real market data in this system prices every strike off the same assumed
+skew, since there is no strike-by-strike implied vol series to price off
+instead (see "Known approximations" below). The skew edge demonstrated
+above can run in either direction against a real market — richer than the
+true skew inflates reported credit and P&L, cheaper than the true skew
+understates it — and there is no way to tell which from inside the backtest
+alone. Treat the magnitude of any real-data backtest result with that
+uncertainty attached, not just its sign.
+
+The suite has 377 tests: Black-76 against put-call parity (to 1e-13) and
 numerical bumps, the 0DTE `T → 0` limits, band convergence and
 no-oscillation properties, fill accounting through sign flips, the exchange
-calendar, and end-to-end backtests.
+calendar, front-month contract stitching, and end-to-end backtests.
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -178,17 +198,63 @@ For live trading, `use_whatif_margin: true` asks IBKR to price the margin of
 the actual order via a `whatIf` probe, which is the number the account will
 really be charged. The heuristic is the fallback.
 
+## Selling a call alongside the put (`strategy.sell_call`)
+
+```bash
+deltahedger backtest -c configs/es_default.yaml --sell-call
+```
+
+Sets the option book to a put **and** a call against the same expiry — a
+strangle (a literal same-strike straddle only coincidentally, since the two
+legs are selected independently by delta). What this changes and what it
+doesn't:
+
+- **The delta target is unaffected.** The hedger holds net *portfolio*
+  delta — option legs plus the futures hedge — at `hedge.target` regardless
+  of how many option legs feed it. `short_call_delta` defaults to the same
+  magnitude as `short_put_delta` (0.20 each), so the two legs roughly cancel
+  *before* hedging; the hedger, not the strangle's own shape, is what holds
+  the bias.
+- **What changes is the option book's shape**: theta collected on both
+  sides instead of one, and a second source of gamma/vega risk on the
+  upside that a put-only book didn't carry — a strong rally that used to be
+  close to pure profit for the short put now also hurts the short call.
+- **Sizing uses combined SPAN margin**, not each leg's margin summed. A put
+  and a call cannot both be maximally hurt by the same price move, so
+  scanning them together (rather than pricing each independently and
+  adding) recovers the capital efficiency real portfolio margining gives a
+  strangle. Whether that affords *more* contracts than a put-only book at
+  the same buying power depends on which leg's own margin happens to be
+  larger at the strikes selected — not a fixed relationship, just never
+  worse than naively summing the two.
+- **The stop and take-profit compare combined premium**, not either leg on
+  its own — bought back together when the total cost to close both legs
+  crosses the configured multiple of the total credit received.
+- **All-or-nothing entry.** If no call strike lands within
+  `short_call_delta_tolerance`, nothing is sold that bar — a strangle that
+  can only half-form doesn't fall back to selling just the put. Symmetrically,
+  if the put leg fills but the call leg's order fails (live trading only;
+  the backtest's simulated fills never fail), the put is immediately bought
+  back rather than left open as an unintended naked position nobody chose
+  to carry.
+
+`--call-delta` overrides `short_call_delta` from the command line, same
+pattern as `--target`/`--band`.
+
 ## Known approximations
 
 Stated plainly, because they bound what the backtest can tell you:
 
 1. **Option prices are modelled, not observed.** IBKR gives an ATM implied
    vol series for the future, not a strike-by-strike surface, so
-   out-of-the-money puts are priced by extrapolating along an assumed skew
-   (`vol.skew_slope`, default −1.5). The strategy sells *on* that skew, so
-   the assumption sets the credit it collects. This is the largest
-   approximation in the system. Point `vol.skew_slope` at a fitted surface,
-   or subclass `VolSurface.iv`, if you have better data.
+   out-of-the-money puts (and calls, when `sell_call` is set) are priced by
+   extrapolating along an assumed skew (`vol.skew_slope`, default −1.5). The
+   strategy sells *on* that skew, so the assumption sets the credit it
+   collects — quantified in "Correctness" above: selling that skew against
+   a flat-realized-vol process alone is worth +10% of equity over 120 days,
+   with zero other edge. This is the largest approximation in the system.
+   Point `vol.skew_slope` at a fitted surface, or subclass `VolSurface.iv`,
+   if you have better data.
 2. **Fills are assumed.** `SimulatedExecution` charges slippage and
    commissions but assumes the order fills in full at that price. A 0DTE
    short put during a fast selloff is exactly when that is least true.

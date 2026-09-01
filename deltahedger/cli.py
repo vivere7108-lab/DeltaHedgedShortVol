@@ -40,6 +40,10 @@ def _load(args: argparse.Namespace) -> Config:
         cfg.strategy.max_days_to_expiry = args.max_dte
     if getattr(args, "stop_multiple", None) is not None:
         cfg.strategy.stop_loss_premium_multiple = args.stop_multiple
+    if getattr(args, "sell_call", False):
+        cfg.strategy.sell_call = True
+    if getattr(args, "call_delta", None) is not None:
+        cfg.strategy.short_call_delta = args.call_delta
     if getattr(args, "source", None):
         cfg.data.source = args.source
     if getattr(args, "bar_size", None):
@@ -185,8 +189,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--stop-multiple", type=float, dest="stop_multiple",
-        help="buy back the short put once its mark reaches this multiple of "
-        "the entry credit (strategy.stop_loss_premium_multiple)",
+        help="buy back the position once its combined mark reaches this "
+        "multiple of the combined entry credit "
+        "(strategy.stop_loss_premium_multiple)",
+    )
+    common.add_argument(
+        "--sell-call", action="store_true", dest="sell_call",
+        help="also sell a call against the same expiry (a strangle), "
+        "roughly delta-symmetric with the put by default "
+        "(strategy.sell_call)",
+    )
+    common.add_argument(
+        "--call-delta", type=float, dest="call_delta",
+        help="target absolute delta of the call sold when --sell-call is "
+        "set (strategy.short_call_delta)",
     )
     common.add_argument("--host", help="TWS / IB Gateway host (overrides ibkr.host)")
     common.add_argument(

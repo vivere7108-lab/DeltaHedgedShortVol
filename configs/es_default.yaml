@@ -41,6 +41,13 @@ strategy:
   short_put_delta: 0.20
   short_put_delta_tolerance: 0.10
   strike_mode: delta          # delta | moneyness
+  # Also sell a call against the same expiry (a strangle). The delta target
+  # is unaffected either way -- the hedger holds net portfolio delta at
+  # hedge.target regardless of how many option legs feed it; this changes
+  # the option book's shape (theta on both sides), not the directional bias.
+  sell_call: false
+  short_call_delta: 0.20
+  short_call_delta_tolerance: 0.10
   entry_time: '09:35'
   entry_cutoff_time: '11:00'
   close_before_expiry_minutes: 5

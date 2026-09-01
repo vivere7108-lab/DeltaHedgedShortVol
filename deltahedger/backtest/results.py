@@ -163,19 +163,25 @@ class BacktestResult:
 
 
 def bars_to_frame(states: list[BarState], target: float) -> pd.DataFrame:
+    """One row per bar. ``put_contracts`` is the position-open flag used
+    throughout: the put leg is always present whenever the book isn't flat,
+    even when a call is also sold alongside it (see ``strategy.py``)."""
     rows = []
     for s in states:
-        greeks = s.option_greeks
         rows.append(
             {
                 "timestamp": s.timestamp,
                 "future": s.future,
                 "atm_iv": s.atm_iv,
                 "hours_to_expiry": s.time_to_expiry * 365 * 24,
-                "strike": s.strike,
-                "option_contracts": s.option_contracts,
-                "option_mark": s.option_mark,
-                "option_delta": greeks.delta if greeks else None,
+                "put_strike": s.put_strike,
+                "put_contracts": s.put_contracts,
+                "put_mark": s.put_mark,
+                "put_delta": s.put_delta,
+                "call_strike": s.call_strike,
+                "call_contracts": s.call_contracts,
+                "call_mark": s.call_mark,
+                "call_delta": s.call_delta,
                 "option_delta_units": s.option_delta_units,
                 "hedge_contracts": s.hedge_contracts,
                 "hedge_delta_units": s.hedge_delta_units,
@@ -280,7 +286,7 @@ def compute_metrics(
     max_dd = float(drawdown.max())
     max_dd_pct = float((drawdown / peak).max()) if (peak > 0).all() else 0.0
 
-    held = bars[bars["option_contracts"] != 0]
+    held = bars[bars["put_contracts"] != 0]
     hedge_fills = fills[fills["instrument"] == "hedge"] if not fills.empty else fills
     entries = int((events["kind"] == "entry").sum()) if not events.empty else 0
     hedge_events = int((events["kind"] == "hedge").sum()) if not events.empty else 0

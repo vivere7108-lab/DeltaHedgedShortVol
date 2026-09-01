@@ -5,6 +5,14 @@ future -- see ``instruments``), which is the unit the hedge band is written
 in.  The same book is used by the backtest and the live runner; the live
 runner reconciles it against IBKR positions rather than keeping a separate
 representation.
+
+The option book can hold up to two legs at once, one put and one call,
+keyed by ``right`` ("P"/"C") in ``Portfolio.legs``.  Selling both turns the
+short put into a strangle: the delta target itself is unaffected (the
+hedger still holds net portfolio delta -- option legs plus the futures
+hedge -- at ``hedge.target`` regardless of how many option legs make it
+up), what changes is the option book's shape, collecting theta on both
+sides rather than one.
 """
 
 from __future__ import annotations
@@ -39,6 +47,17 @@ class OptionPosition:
     def credit_received(self, multiplier: float) -> float:
         """Positive for a short position: the premium taken in."""
         return -self.quantity * self.entry_price * multiplier
+
+    def close_value(self, mark: float, multiplier: float) -> float:
+        """Dollar cost to close this leg at ``mark`` right now.
+
+        Positive for a short position -- the mirror of ``credit_received``,
+        so a combined stop/target ratio (close value over credit received)
+        reduces to the familiar ``mark / entry_price`` for a single leg and
+        generalises correctly when a put and a call of different sizes are
+        held together.
+        """
+        return -self.quantity * mark * multiplier
 
 
 @dataclass
@@ -83,67 +102,125 @@ class Portfolio:
 
     starting_equity: float
     source: RiskSource
-    #: Realised P&L split by leg, so results can attribute the short-vol
-    #: premium separately from the cost of hedging it.
+    #: Realised P&L split by leg family, so results can attribute the
+    #: short-vol premium (both option legs combined) separately from the
+    #: cost of hedging it.
     option_realised: float = 0.0
     hedge_realised: float = 0.0
     fees_paid: float = 0.0
-    option: OptionPosition | None = None
+    #: Open option legs, keyed by right ("P"/"C"). At most one per right.
+    legs: dict[str, OptionPosition] = field(default_factory=dict)
     hedge: HedgePosition = field(default_factory=HedgePosition)
+
+    @property
+    def put(self) -> OptionPosition | None:
+        return self.legs.get("P")
+
+    @property
+    def call(self) -> OptionPosition | None:
+        return self.legs.get("C")
+
+    @property
+    def has_option(self) -> bool:
+        return bool(self.legs)
 
     # -- delta ---------------------------------------------------------
 
-    def option_delta_units(self, greeks: Greeks | None) -> float:
-        if self.option is None or greeks is None:
-            return 0.0
+    def option_delta_units(self, greeks_by_right: dict[str, Greeks]) -> float:
         per_contract = self.source.delta_units_per_contract(self.source.option)
-        return self.option.quantity * greeks.delta * per_contract
+        total = 0.0
+        for right, position in self.legs.items():
+            greeks = greeks_by_right.get(right)
+            if greeks is not None:
+                total += position.quantity * greeks.delta * per_contract
+        return total
 
     def hedge_delta_units(self) -> float:
         per_contract = self.source.delta_units_per_contract(self.source.hedge)
         return self.hedge.quantity * per_contract
 
-    def net_delta_units(self, greeks: Greeks | None) -> float:
-        return self.option_delta_units(greeks) + self.hedge_delta_units()
+    def net_delta_units(self, greeks_by_right: dict[str, Greeks]) -> float:
+        return self.option_delta_units(greeks_by_right) + self.hedge_delta_units()
 
-    def option_gamma_units(self, greeks: Greeks | None) -> float:
-        """Delta units gained per 1.00 move in the future."""
-        if self.option is None or greeks is None:
-            return 0.0
+    def option_gamma_units(self, greeks_by_right: dict[str, Greeks]) -> float:
+        """Delta units gained per 1.00 move in the future, combined legs."""
         per_contract = self.source.delta_units_per_contract(self.source.option)
-        return self.option.quantity * greeks.gamma * per_contract
+        total = 0.0
+        for right, position in self.legs.items():
+            greeks = greeks_by_right.get(right)
+            if greeks is not None:
+                total += position.quantity * greeks.gamma * per_contract
+        return total
+
+    # -- combined premium (for a shared stop / take-profit) -------------
+
+    def combined_credit_received(self) -> float:
+        mult = self.source.option.multiplier
+        return sum(p.credit_received(mult) for p in self.legs.values())
+
+    def combined_close_value(self, marks_by_right: dict[str, float]) -> float | None:
+        """Dollar cost to close every open leg right now.
+
+        ``None`` if any open leg is missing a mark -- a partial close value
+        would misstate the position, so callers should skip the check
+        rather than act on an incomplete number.
+        """
+        mult = self.source.option.multiplier
+        total = 0.0
+        for right, position in self.legs.items():
+            mark = marks_by_right.get(right)
+            if mark is None:
+                return None
+            total += position.close_value(mark, mult)
+        return total
 
     # -- valuation -----------------------------------------------------
 
-    def unrealised_pnl(self, option_mark: float | None, hedge_mark: float) -> float:
+    def unrealised_pnl(self, marks_by_right: dict[str, float], hedge_mark: float) -> float:
         total = self.hedge.unrealised(hedge_mark, self.source.hedge.multiplier)
-        if self.option is not None and option_mark is not None:
-            total += self.option.unrealised(option_mark, self.source.option.multiplier)
+        for right, position in self.legs.items():
+            mark = marks_by_right.get(right)
+            if mark is not None:
+                total += position.unrealised(mark, self.source.option.multiplier)
         return total
 
-    def equity(self, option_mark: float | None, hedge_mark: float) -> float:
+    def equity(self, marks_by_right: dict[str, float], hedge_mark: float) -> float:
         return (
             self.starting_equity
             + self.realised_pnl
             - self.fees_paid
-            + self.unrealised_pnl(option_mark, hedge_mark)
+            + self.unrealised_pnl(marks_by_right, hedge_mark)
         )
 
     # -- mutation ------------------------------------------------------
 
-    def open_option(self, position: OptionPosition) -> None:
-        if self.option is not None:
-            raise RuntimeError("an option position is already open")
-        self.option = position
+    def open_leg(self, position: OptionPosition) -> None:
+        if position.right in self.legs:
+            raise RuntimeError(f"a {position.right} position is already open")
+        self.legs[position.right] = position
 
-    def close_option(self, exit_price: float) -> float:
-        """Close the option leg and realise its P&L."""
-        if self.option is None:
+    def close_leg(self, right: str, exit_price: float) -> float:
+        """Close one leg and realise its P&L. 0.0 if that leg isn't open."""
+        position = self.legs.pop(right, None)
+        if position is None:
             return 0.0
-        pnl = self.option.unrealised(exit_price, self.source.option.multiplier)
+        pnl = position.unrealised(exit_price, self.source.option.multiplier)
         self.option_realised += pnl
-        self.option = None
         return pnl
+
+    def close_all_legs(self, exit_prices: dict[str, float]) -> float:
+        """Close every open leg at its price in ``exit_prices``.
+
+        Returns the combined realised P&L. A leg missing from
+        ``exit_prices`` is left open -- callers that need an all-or-nothing
+        close should check ``exit_prices`` covers ``self.legs`` first.
+        """
+        total = 0.0
+        for right in list(self.legs):
+            price = exit_prices.get(right)
+            if price is not None:
+                total += self.close_leg(right, price)
+        return total
 
     def apply_hedge_fill(self, filled_qty: int, fill_price: float) -> float:
         points = self.hedge.apply_fill(filled_qty, fill_price)
@@ -160,4 +237,4 @@ class Portfolio:
 
     @property
     def is_flat(self) -> bool:
-        return self.option is None and self.hedge.quantity == 0
+        return not self.legs and self.hedge.quantity == 0

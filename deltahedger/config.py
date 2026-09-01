@@ -122,7 +122,7 @@ class SizingConfig:
 
 @dataclass
 class StrategyConfig:
-    """Entry, strike selection and exit rules for the short put."""
+    """Entry, strike selection and exit rules for the short option book."""
 
     #: Prefer the shortest-dated expiry; 0 means "0DTE if one is listed".
     min_days_to_expiry: int = 0
@@ -135,17 +135,33 @@ class StrategyConfig:
     #: strike_mode == "moneyness".
     strike_mode: str = "delta"  # "delta" | "moneyness"
     short_put_otm_pct: float = 0.01
+    #: Also sell a call against the same expiry, turning the put into a
+    #: strangle (a literal same-strike straddle only coincidentally, since
+    #: the two legs are selected independently by delta).  Net portfolio
+    #: delta is still whatever ``hedge.target`` says -- adding a call does
+    #: not change the directional bias, it changes the option book's shape:
+    #: a symmetric call target (matching short_put_delta) roughly
+    #: delta-neutralises the option legs *before* hedging, so the hedge
+    #: still does all the work of holding the target bias, now against a
+    #: book that collects premium on both sides.
+    sell_call: bool = False
+    #: Target absolute delta of the call we sell. Independent of
+    #: short_put_delta so the strangle can be skewed deliberately; defaults
+    #: to the same magnitude for a roughly symmetric structure.
+    short_call_delta: float = 0.20
+    short_call_delta_tolerance: float = 0.10
     #: Earliest time of day to open a position (exchange local time).
     entry_time: time = time(9, 35)
     #: Latest time of day to open a position.
     entry_cutoff_time: time = time(11, 0)
-    #: Close the short option this many minutes before it expires.
+    #: Close the short option(s) this many minutes before they expire.
     close_before_expiry_minutes: int = 5
-    #: Buy the put back if its price reaches this multiple of the entry
+    #: Buy back the position once its *combined* mark (both legs, when
+    #: sell_call is set) reaches this multiple of the *combined* entry
     #: credit. ``None`` disables the stop.
     stop_loss_premium_multiple: float | None = 3.0
-    #: Buy the put back once this fraction of the credit has been captured.
-    #: ``None`` holds to the timed exit.
+    #: Buy back the position once this fraction of the combined credit has
+    #: been captured. ``None`` holds to the timed exit.
     take_profit_pct: float | None = None
     #: Stop trading for the day after a loss this large, as a fraction of
     #: starting equity. ``None`` disables.
@@ -158,6 +174,8 @@ class StrategyConfig:
             raise ValueError("strategy.strike_mode must be 'delta' or 'moneyness'")
         if not 0.0 < self.short_put_delta < 1.0:
             raise ValueError("strategy.short_put_delta must be in (0, 1)")
+        if not 0.0 < self.short_call_delta < 1.0:
+            raise ValueError("strategy.short_call_delta must be in (0, 1)")
         if self.min_days_to_expiry > self.max_days_to_expiry:
             raise ValueError("strategy.min_days_to_expiry > max_days_to_expiry")
         if self.entry_cutoff_time < self.entry_time:
