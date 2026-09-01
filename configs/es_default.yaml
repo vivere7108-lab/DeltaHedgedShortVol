@@ -72,6 +72,10 @@ data:
   bar_size: 5 mins
   cache_dir: data_cache
   default_atm_iv: 0.15
+  # History is stitched from the concrete quarterly contracts that were
+  # front month at each point in time -- IBKR rejects endDateTime on a
+  # continuous future (Error 10339). ES volume rolls ~8 days before expiry.
+  roll_days_before_expiry: 8
 
 ibkr:
   host: 127.0.0.1

@@ -146,6 +146,8 @@ class LiveRunner:
         adopted = 0
         for position in positions:
             contract = position.contract
+            if not position.position:
+                continue  # closed-out legs still surface in some feeds
             if contract.secType == "FUT" and contract.symbol == hedge_symbol:
                 self.strategy.portfolio.hedge.quantity = int(position.position)
                 self.strategy.portfolio.hedge.avg_price = float(position.avgCost) / (

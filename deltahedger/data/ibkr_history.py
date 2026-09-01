@@ -12,6 +12,21 @@ vol series through ``VolSurface``.  That is the central approximation in
 this backtest and it is stated again here because it is easy to forget when
 reading the results.
 
+Front-month stitching
+---------------------
+IBKR refuses ``endDateTime`` on a continuous future ("Error 10339: Setting
+end date/time for continuous future security type is not allowed"), so a
+``ContFuture`` can only ever hand back the most recent bars -- useless for
+paging through a historical window.  History is therefore assembled from the
+*concrete* quarterly contracts that were front month at each point in time,
+each queried over the window during which it led, then concatenated.
+
+The stitch is deliberately **not** back-adjusted.  Those were the prices that
+actually traded, and the strategy selects strikes off the price level, so
+shifting the series to remove roll gaps would put the backtest on strikes
+that never existed.  The strategy is flat overnight, so a gap across a roll
+costs nothing -- no position spans it.
+
 Requests are chunked (IBKR caps intraday history per request), paced (the
 API allows ~60 requests per 10 minutes), and cached to disk, so a re-run of
 the same window costs nothing.
@@ -21,9 +36,10 @@ from __future__ import annotations
 
 import logging
 import time as time_module
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -41,6 +57,76 @@ CHUNK_DAYS = 20
 #: Seconds to wait between historical requests, to stay inside the
 #: ~60-requests-per-10-minutes pacing limit.
 PACING_SECONDS = 11.0
+
+
+@dataclass(frozen=True)
+class ContractWindow:
+    """A concrete future and the span over which it was front month."""
+
+    expiry: date
+    start: datetime
+    end: datetime
+    contract: Any = None
+
+    @property
+    def label(self) -> str:
+        local = getattr(self.contract, "localSymbol", None)
+        return local or self.expiry.strftime("%Y%m")
+
+
+def front_month_windows(
+    expiries: list[date],
+    start: datetime,
+    end: datetime,
+    roll_days: int = 8,
+    tz: ZoneInfo | None = None,
+) -> list[ContractWindow]:
+    """Slice ``[start, end]`` into the spans each contract led.
+
+    A contract is front month from the previous contract's roll date until
+    its own, where the roll date is ``roll_days`` before expiry.  Only spans
+    that intersect the requested window are returned, clipped to it.
+
+    Pure and IBKR-free so the slicing can be tested directly -- getting it
+    wrong silently produces a price series stitched from the wrong contracts,
+    which is the kind of error a backtest happily runs on.
+    """
+    if start >= end:
+        raise ValueError(f"start {start} is not before end {end}")
+
+    ordered = sorted(set(expiries))
+    windows: list[ContractWindow] = []
+    previous_roll: datetime | None = None
+
+    for expiry in ordered:
+        roll = datetime.combine(
+            expiry - timedelta(days=roll_days), datetime.min.time(), tzinfo=tz
+        )
+        span_start = previous_roll if previous_roll is not None else start
+        previous_roll = roll
+        if roll <= start or span_start >= end:
+            continue  # entirely before or after the requested window
+        windows.append(
+            ContractWindow(
+                expiry=expiry,
+                start=max(span_start, start),
+                end=min(roll, end),
+            )
+        )
+
+    # The window can extend past the last listed roll -- there is no further
+    # contract to hand over to, so the newest one covers the remainder.
+    # Extend its existing span rather than emitting a second entry for it.
+    if ordered and previous_roll is not None and previous_roll < end:
+        if windows and windows[-1].expiry == ordered[-1]:
+            windows[-1] = ContractWindow(
+                expiry=windows[-1].expiry, start=windows[-1].start, end=end
+            )
+        else:
+            windows.append(
+                ContractWindow(expiry=ordered[-1], start=max(previous_roll, start), end=end)
+            )
+    return [w for w in windows if w.start < w.end]
 
 
 class IbkrHistorySource:
@@ -68,9 +154,16 @@ class IbkrHistorySource:
                 volume=float(row.volume),
             )
 
+    def cache_path(self) -> Path:
+        start, end = self._window()
+        slug = self.cfg.data.bar_size.replace(" ", "")
+        return self.cache_dir / (
+            f"{self.source.name}_{slug}_{start:%Y%m%d}_{end:%Y%m%d}.csv"
+        )
+
     def load(self) -> pd.DataFrame:
         """Return the merged frame, downloading only what isn't cached."""
-        path = self._cache_path()
+        path = self.cache_path()
         if path.exists():
             log.info("using cached history at %s", path)
             frame = pd.read_csv(path, parse_dates=["timestamp"])
@@ -86,7 +179,7 @@ class IbkrHistorySource:
 
     def download(self) -> pd.DataFrame:
         """Fetch price and IV history from a running TWS / Gateway."""
-        from ib_async import ContFuture, IB  # imported lazily: optional dependency
+        from ib_async import IB  # imported lazily: optional dependency
 
         start, end = self._window()
         ib = IB()
@@ -102,29 +195,174 @@ class IbkrHistorySource:
             readonly=True,
         )
         try:
-            contract = ContFuture(
-                symbol=self.source.future.symbol,
-                exchange=self.source.future.exchange,
-                currency=self.source.future.currency,
+            windows = self._resolve_windows(ib, start, end)
+            if not windows:
+                raise RuntimeError(
+                    f"no {self.source.future.symbol} contracts were listed over "
+                    f"{start.date()}..{end.date()}. Check the date range."
+                )
+            log.info(
+                "stitching %d front-month contract(s): %s",
+                len(windows),
+                ", ".join(
+                    f"{w.label} {w.start.date()}..{w.end.date()}" for w in windows
+                ),
             )
-            (qualified,) = ib.qualifyContracts(contract)
-            log.info("qualified %s", qualified.localSymbol or qualified.symbol)
 
-            prices = self._fetch_series(ib, qualified, "TRADES", start, end)
+            prices = self._fetch_windows(ib, windows, "TRADES")
             if prices.empty:
                 raise RuntimeError(
-                    "IBKR returned no TRADES bars. Check the date range, the "
-                    "bar size, and that the account has CME market data."
+                    "IBKR returned no TRADES bars for "
+                    f"{start.date()}..{end.date()}. Check that the account has "
+                    "CME market data, that the range is not older than IBKR's "
+                    "retention for this bar size, and that the range covers "
+                    "trading days."
                 )
-            vols = self._fetch_series(
-                ib, qualified, "OPTION_IMPLIED_VOLATILITY", start, end
-            )
+            vols = self._fetch_windows(ib, windows, "OPTION_IMPLIED_VOLATILITY")
         finally:
             ib.disconnect()
 
         return self._merge(prices, vols)
 
-    # -- internals -----------------------------------------------------
+    # -- contract resolution --------------------------------------------
+
+    def _resolve_windows(
+        self, ib, start: datetime, end: datetime
+    ) -> list[ContractWindow]:
+        """Find the concrete contracts that were front month over the window."""
+        from ib_async import Future
+
+        spec = self.source.future
+        query = Future(
+            symbol=spec.symbol,
+            exchange=spec.exchange,
+            currency=spec.currency,
+            includeExpired=True,  # required: the window is usually in the past
+        )
+        details = ib.reqContractDetails(query)
+        if not details:
+            raise RuntimeError(
+                f"IBKR returned no contract details for {spec.symbol} on "
+                f"{spec.exchange}. Check the symbol and exchange."
+            )
+
+        by_expiry: dict[date, Any] = {}
+        for detail in details:
+            expiry = _parse_expiry(detail.contract.lastTradeDateOrContractMonth)
+            if expiry is not None:
+                by_expiry.setdefault(expiry, detail.contract)
+
+        windows = front_month_windows(
+            list(by_expiry),
+            start,
+            end,
+            roll_days=self.cfg.data.roll_days_before_expiry,
+            tz=self.tz,
+        )
+        return [
+            ContractWindow(w.expiry, w.start, w.end, by_expiry[w.expiry])
+            for w in windows
+        ]
+
+    # -- fetching --------------------------------------------------------
+
+    def _fetch_windows(self, ib, windows: list[ContractWindow], what_to_show: str):
+        frames = []
+        for window in windows:
+            frame = self._fetch_series(
+                ib, window.contract, what_to_show, window.start, window.end
+            )
+            if frame.empty:
+                log.warning(
+                    "no %s bars for %s over %s..%s",
+                    what_to_show, window.label, window.start.date(), window.end.date(),
+                )
+                continue
+            frames.append(frame)
+        if not frames:
+            return pd.DataFrame()
+        return (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset="timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+    def _fetch_series(
+        self, ib, contract, what_to_show: str, start: datetime, end: datetime
+    ) -> pd.DataFrame:
+        """Page backwards through one contract's window, a chunk per request."""
+        from ib_async import util
+
+        frames: list[pd.DataFrame] = []
+        cursor = end
+        request_count = 0
+        last_error: str | None = None
+
+        while cursor > start:
+            span_days = min(CHUNK_DAYS, max((cursor - start).days, 1))
+            if request_count:
+                time_module.sleep(PACING_SECONDS)
+            log.info(
+                "requesting %dD %s of %s ending %s",
+                span_days, what_to_show,
+                getattr(contract, "localSymbol", "?"), cursor.date(),
+            )
+            try:
+                bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime=cursor,
+                    durationStr=f"{span_days} D",
+                    barSizeSetting=self.cfg.data.bar_size,
+                    whatToShow=what_to_show,
+                    useRTH=True,
+                    formatDate=2,  # UTC epoch, no ambiguous local strings
+                )
+            except Exception as exc:  # noqa: BLE001 - record, then keep paging
+                last_error = str(exc)
+                log.warning("%s request failed: %s", what_to_show, exc)
+                bars = None
+            request_count += 1
+
+            if not bars:
+                if what_to_show == "OPTION_IMPLIED_VOLATILITY":
+                    log.warning(
+                        "no implied-vol history returned%s; falling back to "
+                        "data.default_atm_iv=%.3f for the affected bars",
+                        f" ({last_error})" if last_error else "",
+                        self.cfg.data.default_atm_iv,
+                    )
+                    break
+                cursor -= timedelta(days=span_days)
+                continue
+
+            chunk = util.df(bars)
+            frames.append(chunk)
+            earliest = pd.to_datetime(chunk["date"].min(), utc=True)
+            new_cursor = earliest.to_pydatetime().astimezone(self.tz)
+            if new_cursor >= cursor:  # no progress; stop rather than spin
+                break
+            cursor = new_cursor
+
+        if not frames:
+            if last_error and what_to_show == "TRADES":
+                log.error("every %s request failed; last error: %s",
+                          what_to_show, last_error)
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged["timestamp"] = pd.to_datetime(merged["date"], utc=True).dt.tz_convert(
+            self.tz
+        )
+        merged = (
+            merged.drop(columns=["date"])
+            .drop_duplicates(subset="timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return merged[(merged["timestamp"] >= start) & (merged["timestamp"] <= end)]
+
+    # -- assembly --------------------------------------------------------
 
     def _window(self) -> tuple[datetime, datetime]:
         end = (
@@ -140,75 +378,15 @@ class IbkrHistorySource:
             raise ValueError(f"start_date {start} is not before end_date {end}")
         return start, end
 
-    def _fetch_series(
-        self, ib, contract, what_to_show: str, start: datetime, end: datetime
-    ) -> pd.DataFrame:
-        """Page backwards through the window, one chunk per request."""
-        from ib_async import util
-
-        frames: list[pd.DataFrame] = []
-        cursor = end
-        request_count = 0
-        while cursor > start:
-            span_days = min(CHUNK_DAYS, max((cursor - start).days, 1))
-            if request_count:
-                time_module.sleep(PACING_SECONDS)
-            log.info(
-                "requesting %s %s ending %s",
-                span_days, what_to_show, cursor.date(),
-            )
-            try:
-                bars = ib.reqHistoricalData(
-                    contract,
-                    endDateTime=cursor,
-                    durationStr=f"{span_days} D",
-                    barSizeSetting=self.cfg.data.bar_size,
-                    whatToShow=what_to_show,
-                    useRTH=True,
-                    formatDate=2,  # UTC epoch, no ambiguous local strings
-                )
-            except Exception as exc:  # noqa: BLE001 - surface, then continue
-                log.warning("%s request failed: %s", what_to_show, exc)
-                bars = None
-            request_count += 1
-
-            if not bars:
-                if what_to_show == "OPTION_IMPLIED_VOLATILITY":
-                    log.warning(
-                        "no implied-vol history returned; falling back to "
-                        "data.default_atm_iv=%.3f for the affected bars",
-                        self.cfg.data.default_atm_iv,
-                    )
-                    break
-                log.warning("empty %s chunk ending %s", what_to_show, cursor.date())
-                cursor -= timedelta(days=span_days)
-                continue
-
-            chunk = util.df(bars)
-            frames.append(chunk)
-            earliest = pd.to_datetime(chunk["date"].min(), utc=True)
-            new_cursor = earliest.to_pydatetime().astimezone(self.tz)
-            if new_cursor >= cursor:  # no progress; stop rather than spin
-                break
-            cursor = new_cursor
-
-        if not frames:
-            return pd.DataFrame()
-        merged = pd.concat(frames, ignore_index=True)
-        merged["timestamp"] = pd.to_datetime(merged["date"], utc=True).dt.tz_convert(
-            self.tz
-        )
-        merged = (
-            merged.drop(columns=["date"])
-            .drop_duplicates(subset="timestamp")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
-        return merged[(merged["timestamp"] >= start) & (merged["timestamp"] <= end)]
-
     def _merge(self, prices: pd.DataFrame, vols: pd.DataFrame) -> pd.DataFrame:
         frame = prices[["timestamp", "open", "high", "low", "close", "volume"]].copy()
         if vols.empty:
+            log.warning(
+                "no implied-vol series available; every bar will use "
+                "data.default_atm_iv=%.3f. The backtest becomes a constant-vol "
+                "study -- see the README on modelled option prices.",
+                self.cfg.data.default_atm_iv,
+            )
             frame["atm_iv"] = self.cfg.data.default_atm_iv
             return frame
 
@@ -232,9 +410,14 @@ class IbkrHistorySource:
         frame.loc[frame["atm_iv"] <= 0, "atm_iv"] = self.cfg.data.default_atm_iv
         return frame
 
-    def _cache_path(self) -> Path:
-        start, end = self._window()
-        slug = self.cfg.data.bar_size.replace(" ", "")
-        return self.cache_dir / (
-            f"{self.source.name}_{slug}_{start:%Y%m%d}_{end:%Y%m%d}.csv"
-        )
+
+def _parse_expiry(value: str) -> date | None:
+    """Parse IBKR's lastTradeDateOrContractMonth (YYYYMMDD or YYYYMM)."""
+    text = (value or "").strip()
+    for fmt in ("%Y%m%d", "%Y%m"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    log.warning("could not parse a contract expiry from %r", value)
+    return None

@@ -222,6 +222,11 @@ class DataConfig:
     synthetic_seed: int = 7
     #: Use this ATM IV when the source has no IV column.
     default_atm_iv: float = 0.15
+    #: Days before expiry at which the front-month future rolls. ES volume
+    #: moves to the next quarterly about 8 days out (the Thursday before the
+    #: third Friday). Used to stitch a continuous history from the concrete
+    #: contracts that were front month at each point in time.
+    roll_days_before_expiry: int = 8
 
 
 @dataclass

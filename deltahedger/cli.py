@@ -75,7 +75,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     source = IbkrHistorySource(cfg, cfg.source)
     frame = source.load()
     print(f"{len(frame)} bars from {frame['timestamp'].min()} to {frame['timestamp'].max()}")
-    print(f"cached at {source._cache_path()}")
+    print(f"cached at {source.cache_path()}")
     return 0
 
 

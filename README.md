@@ -197,7 +197,14 @@ Stated plainly, because they bound what the backtest can tell you:
    band is defined identically in both paths.
 4. **Early closes are not modelled.** Full holidays are; half days simply
    have fewer bars.
-5. **Assignment and pin risk are not modelled.** The strategy closes
+5. **The front-month stitch is not back-adjusted.** History is assembled
+   from the concrete quarterly contracts that were front month at each point
+   in time (IBKR rejects `endDateTime` on a continuous future, Error 10339),
+   concatenated without adjusting away the roll gaps. Those were the real
+   traded prices, and the strategy picks strikes off the price level, so
+   back-adjusting would put the backtest on strikes that never existed. The
+   strategy is flat overnight, so no position spans a roll.
+6. **Assignment and pin risk are not modelled.** The strategy closes
    `close_before_expiry_minutes` before settlement (5 by default) rather
    than modelling exercise.
 
@@ -239,6 +246,37 @@ register(RiskSource(
 
 Delta units rescale automatically: `reference_multiplier` makes 1 NQ = 100
 units and 1 MNQ = 10, so the same `20 ± 3` band means the same thing.
+
+## Fetching history
+
+```bash
+deltahedger fetch -c configs/es_default.yaml --start 2025-01-02 --end 2025-06-30
+```
+
+History is stitched from the concrete quarterly contracts that led at each
+point in time. IBKR rejects `endDateTime` on a continuous future:
+
+```
+Error 10339: Setting end date/time for continuous future security type is not allowed.
+```
+
+so a `ContFuture` can only return the most recent bars and is useless for
+paging a historical window. `fetch` resolves the listed contracts (with
+`includeExpired=True`, since the window is normally in the past), works out
+which was front month when, and queries each over its own span:
+
+```
+stitching 3 front-month contract(s):
+  ESH5 2025-01-02..2025-03-13, ESM5 2025-03-13..2025-06-12, ESU5 2025-06-12..2025-06-30
+```
+
+`data.roll_days_before_expiry` (default 8) sets the handover point. Results
+are cached per window and bar size, so re-running costs nothing.
+
+If the implied-vol series comes back empty — some accounts cannot request
+`OPTION_IMPLIED_VOLATILITY` on futures — the fetch still succeeds and every
+bar falls back to `data.default_atm_iv`, with a warning. That turns the run
+into a constant-vol study; check the log before trusting the output.
 
 ## Requirements
 
