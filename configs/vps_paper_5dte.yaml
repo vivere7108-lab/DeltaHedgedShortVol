@@ -1,0 +1,87 @@
+# Forward-test deployment: put-only, 5 DTE, band +/-10, 2x stop.
+#
+# This is the best-performing put-only variant from backtesting so far
+# (-44.0% vs -69.4% for the 0DTE default over the same 6-month window --
+# still a loss; forward-testing paper trading is exactly how you find out
+# whether that holds up prospectively rather than just in-sample).
+#
+# ibkr.port targets IB GATEWAY's paper port (4002), not TWS's (7497) --
+# this deployment runs IB Gateway headless via IBC, not full TWS.
+#
+# ibkr.allow_live_trading stays false. Do not flip it on this file; make a
+# separate config for that decision deliberately, when you actually mean it.
+
+risk_source: ES
+starting_equity: 100000.0   # MUST match your paper account's actual balance
+risk_free_rate: 0.04
+
+hedge:
+  target: 20.0
+  band: 10.0                 # binds correctly against MES's 10-unit quantum
+  min_hedge_contracts: 1
+  max_hedge_contracts: 200
+  min_seconds_between_hedges: 0.0
+  flatten_hedge_on_exit: true
+
+sizing:
+  buying_power_pct: 0.15
+  hedge_margin_reserve_pct: 0.30
+  min_short_contracts: 1
+  max_short_contracts: 50
+  margin_model: span_scan
+  span_scan_multiplier: 1.0
+  span_vol_scan_pct: 0.30
+  span_short_option_minimum: 250.0
+
+strategy:
+  min_days_to_expiry: 4      # ~5 calendar days out; see README on why
+  max_days_to_expiry: 6      # calendar-day DTE, not trading-day DTE
+  short_put_delta: 0.20
+  short_put_delta_tolerance: 0.10
+  strike_mode: delta
+  sell_call: false            # put-only, per this deployment's decision
+  short_call_delta: 0.20
+  short_call_delta_tolerance: 0.10
+  entry_time: '09:35'
+  entry_cutoff_time: '11:00'
+  close_before_expiry_minutes: 5
+  stop_loss_premium_multiple: 2.0
+  take_profit_pct: null
+  daily_loss_limit_pct: 0.05
+  reenter_after_exit: false
+
+vol:
+  skew_slope: -1.5
+  skew_curvature: 0.0
+  iv_multiplier: 1.0
+  fallback_atm_iv: 0.15
+  min_iv: 0.02
+  max_iv: 3.0
+
+costs:
+  # Irrelevant to the live path -- real fills carry real IBKR commissions
+  # and no simulated slippage is applied. Only used by the backtest.
+  enabled: true
+  option_slippage_ticks: 1.0
+  hedge_slippage_ticks: 0.5
+  option_fees_per_contract: 2.32
+  hedge_fees_per_contract: 0.62
+
+data:
+  source: ibkr
+  bar_size: 5 mins
+  cache_dir: data_cache
+  default_atm_iv: 0.15
+  roll_days_before_expiry: 8
+
+ibkr:
+  host: 127.0.0.1
+  port: 4002                  # IB Gateway paper (NOT 7497, which is TWS paper)
+  client_id: 101
+  account: null                # set explicitly if the Gateway ever logs into >1 account
+  allow_live_trading: false    # do not flip this on this file
+  use_delayed_data: false
+  poll_seconds: 5.0
+  use_whatif_margin: true
+  hedge_order_type: MKT
+  limit_cross_ticks: 1.0
