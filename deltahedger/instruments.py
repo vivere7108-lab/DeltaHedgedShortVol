@@ -1,7 +1,7 @@
 """Instrument and risk-source definitions.
 
 A *risk source* bundles everything the system needs to trade one underlying:
-the future we get exposure from, the option we sell to be short volatility,
+the future we get exposure from, the option series we trade volatility in,
 and the instrument we delta-hedge with.  ES is the only one wired up today;
 adding NQ, CL or anything else is a matter of appending a ``RiskSource`` to
 ``REGISTRY`` -- no strategy or engine code changes.
@@ -14,13 +14,16 @@ Every delta in this codebase is expressed in *delta units*, where
 
 For ES the reference future is ES itself, so:
 
-    long 1 ES future            -> +100 delta units
-    long 1 MES future           -> + 10 delta units   (multiplier 5 vs 50)
-    short 1 put with delta -.20 -> + 20 delta units
+    long 1 ES future             -> +100 delta units
+    long 1 MES future            -> + 10 delta units   (multiplier 5 vs 50)
+    long 1 straddle at delta .38 -> + 38 delta units
 
 Working in delta units (rather than raw contract deltas or dollar deltas)
-keeps the hedging band -- ``20 +/- 3`` by default -- readable and makes the
-micro/mini contract sizes fall out arithmetically.
+keeps the hedging band -- ``0 +/- 10`` by default -- readable and makes the
+micro/mini contract sizes fall out arithmetically.  It also makes the band
+mean the same thing on any risk source: ``reference_multiplier`` rescales
+NQ/MNQ to the same 100/10 relationship, so the band does not have to be
+re-tuned per underlying.
 """
 
 from __future__ import annotations

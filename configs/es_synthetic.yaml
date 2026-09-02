@@ -1,26 +1,42 @@
-# Runs the full system on generated data, with no IBKR connection.
-# Use it to exercise the machinery and to see the reporting output.
+# Runs the full system on generated bars and a generated option chain, with
+# no IBKR connection.
 #
 #   deltahedger backtest -c configs/es_synthetic.yaml
 #
 # Results from this config say the plumbing works. They say nothing about
-# whether the strategy works: the generator draws returns using the same
-# volatility it reports as implied, so there is no edge to find.
+# whether the strategy works, for two independent reasons:
+#
+#   1. the bar generator draws returns using the same volatility it reports
+#      as implied, so a correctly hedged straddle has no edge by
+#      construction -- in EITHER direction;
+#   2. the open-interest generator invents the GEX regime rather than
+#      observing it, so the classification is being read off a surface that
+#      was not produced by any real dealer.
+#
+# What it does establish is that both branches are exercised: the generated
+# call share swings across sessions, so a run of any length takes long and
+# short straddles rather than only one side.
 
 risk_source: ES
 starting_equity: 250000.0
 
 hedge:
-  target: 20.0
-  band: 3.0
+  target: 0.0
+  band: 10.0
 
 sizing:
   buying_power_pct: 0.15
 
 data:
   source: synthetic
+  open_interest: synthetic
   bar_size: 5 mins
   synthetic_days: 40
   synthetic_start_price: 5000.0
   synthetic_annual_vol: 0.16
   synthetic_seed: 7
+  # The swing in call share across sessions is what makes generated days
+  # span both GEX regimes instead of only one.
+  oi_call_share_mean: 0.50
+  oi_call_share_swing: 0.16
+  oi_seed: 11

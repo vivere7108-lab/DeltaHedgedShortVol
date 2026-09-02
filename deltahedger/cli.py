@@ -3,7 +3,8 @@
     deltahedger backtest  --config configs/es_default.yaml
     deltahedger fetch     --config configs/es_default.yaml
     deltahedger live      --config configs/es_default.yaml --dry-run
-    deltahedger sweep     --config configs/es_default.yaml --band 2,3,5,10
+    deltahedger sweep     --config configs/es_default.yaml --bands 5,10,20
+    deltahedger gex       --config configs/es_default.yaml --price 5000
     deltahedger config    --out configs/mine.yaml
 """
 
@@ -36,6 +37,8 @@ def _load(args: argparse.Namespace) -> Config:
         cfg.hedge.band = args.band
     if getattr(args, "source", None):
         cfg.data.source = args.source
+    if getattr(args, "open_interest", None):
+        cfg.data.open_interest = args.open_interest
     if getattr(args, "bar_size", None):
         cfg.data.bar_size = args.bar_size
     cfg.validate()
@@ -100,26 +103,90 @@ def cmd_live(args: argparse.Namespace) -> int:
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
-    """Run the backtest across several band widths and compare."""
+    """Run the backtest across several band widths and compare.
+
+    The two regime columns are the point of the sweep.  A tighter band
+    scalps more gamma on the long side and pays away more theta on the
+    short side, so one number cannot be right for both -- seeing where each
+    branch peaks is what tells you whether the single fixed threshold is
+    costing anything worth fixing.
+    """
     from .backtest import run_backtest
 
     cfg = _load(args)
     widths = [float(w) for w in args.bands.split(",")]
     print(
-        f"{'band':>6} {'return':>9} {'P&L':>11} {'hedges':>7} {'contracts':>10} "
-        f"{'fees':>10} {'in band':>8} {'mean err':>9}"
+        f"{'band':>6} {'return':>9} {'P&L':>11} {'long gamma':>12} "
+        f"{'short gamma':>12} {'hedges':>7} {'fees':>10} {'mean err':>9}"
     )
-    print("-" * 76)
+    print("-" * 84)
     for width in widths:
         cfg.hedge.band = width
-        result = run_backtest(cfg)
-        m = result.metrics
+        m = run_backtest(cfg).metrics
         print(
             f"{width:>6.1f} {m.total_return:>8.2%} "
-            f"${m.final_equity - m.starting_equity:>10,.0f} {m.hedges:>7} "
-            f"{m.hedge_contracts_traded:>10} ${m.fees_paid:>9,.0f} "
-            f"{m.pct_bars_in_band:>7.1%} {m.mean_abs_delta_error:>9.2f}"
+            f"${m.final_equity - m.starting_equity:>10,.0f} "
+            f"${m.long_gamma_pnl:>11,.0f} ${m.short_gamma_pnl:>11,.0f} "
+            f"{m.hedges:>7} ${m.fees_paid:>9,.0f} {m.mean_abs_delta_error:>9.2f}"
         )
+    return 0
+
+
+def cmd_gex(args: argparse.Namespace) -> int:
+    """Print the GEX profile at a given spot, without trading anything.
+
+    Useful before a paper session: it says which side the strategy would
+    take today and how far spot is from the flip, which is the one number
+    worth eyeballing before letting the runner act on it.
+    """
+    from datetime import datetime
+
+    from .data import build_open_interest_provider
+    from .gex import GexCalculator
+    from .session import SessionClock
+    from .volsurface import VolSurface
+
+    cfg = _load(args)
+    source = cfg.source
+    clock = SessionClock(source)
+    now = clock.localize(
+        datetime.fromisoformat(args.at) if args.at else datetime.now()
+    )
+
+    expiries = clock.candidate_expiries(now, cfg.strategy.max_days_to_expiry)
+    if not expiries:
+        print(f"no expiry inside {cfg.strategy.max_days_to_expiry} day(s) of {now:%Y-%m-%d %H:%M}")
+        return 1
+    expiry = expiries[0]
+
+    provider = build_open_interest_provider(cfg, source)
+    calculator = GexCalculator(cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate)
+    price = args.price
+    t = clock.time_to_expiry(now, expiry)
+    profile = calculator.profile(
+        price, provider.open_interest(now, price, expiry), t, args.iv
+    )
+
+    intent = {
+        1: "LONG the ATM straddle and scalp gamma",
+        -1: "SHORT the ATM straddle and collect theta",
+        0: "stand aside",
+    }[profile.direction]
+    print(f"\n{expiry} chain at {price:,.2f}, {t * 365 * 24:.2f}h to expiry, IV {args.iv:.3f}")
+    print(f"  total GEX      ${profile.total_gex / 1e6:+,.1f}M per 1% move")
+    print(f"  gross GEX      ${profile.gross_gex / 1e6:,.1f}M")
+    print(
+        "  gamma flip     "
+        + (f"{profile.flip_point:,.2f} "
+           f"({profile.distance_to_flip:+,.2f} from spot)"
+           if profile.flip_point is not None else "none inside the search range")
+    )
+    peak = profile.peak_strike
+    print(f"  peak gamma     {peak:,.0f}" if peak is not None else "  peak gamma     -")
+    print(f"  regime         {profile.regime}")
+    print(f"  because        {profile.reason}")
+    print(f"  would          {intent}\n")
+    print(profile.table())
     return 0
 
 
@@ -134,7 +201,11 @@ def cmd_config(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deltahedger",
-        description="Delta-hedged short volatility on ES futures options.",
+        description=(
+            "GEX-directed, delta-hedged 0DTE straddles on ES futures options. "
+            "Dealer gamma exposure picks the side; a fixed delta band holds it "
+            "neutral."
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
 
@@ -154,6 +225,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     bt = sub.add_parser("backtest", parents=[common], help="run a historical simulation")
     bt.add_argument("--source", choices=["ibkr", "csv", "synthetic"])
+    bt.add_argument(
+        "--open-interest", choices=["synthetic", "csv"],
+        help="where the open interest driving GEX comes from",
+    )
     bt.add_argument("--bar-size", help='e.g. "5 mins"')
     bt.add_argument("-o", "--out", help="directory to write results into")
     bt.add_argument("--show-events", action="store_true", help="print the event log")
@@ -177,11 +252,23 @@ def build_parser() -> argparse.ArgumentParser:
         "sweep", parents=[common], help="compare backtests across band widths"
     )
     sweep.add_argument("--source", choices=["ibkr", "csv", "synthetic"])
+    sweep.add_argument("--open-interest", choices=["synthetic", "csv"])
     sweep.add_argument("--bar-size", help='e.g. "5 mins"')
     sweep.add_argument(
-        "--bands", default="1,2,3,5,10,20", help="comma-separated band half-widths",
+        "--bands", default="5,10,15,20,40", help="comma-separated band half-widths",
     )
     sweep.set_defaults(func=cmd_sweep)
+
+    gex = sub.add_parser(
+        "gex", parents=[common], help="print the GEX profile and the side it implies"
+    )
+    gex.add_argument(
+        "--price", type=float, required=True, help="spot level to profile at",
+    )
+    gex.add_argument("--iv", type=float, default=0.15, help="ATM implied vol")
+    gex.add_argument("--at", help="timestamp to profile at, ISO-8601 (default: now)")
+    gex.add_argument("--open-interest", choices=["synthetic", "csv"])
+    gex.set_defaults(func=cmd_gex, source=None, bar_size=None)
 
     conf = sub.add_parser("config", help="write a default config file")
     conf.add_argument("-o", "--out", default="config.yaml")

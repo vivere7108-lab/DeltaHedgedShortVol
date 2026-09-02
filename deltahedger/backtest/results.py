@@ -1,24 +1,29 @@
 """Backtest metrics and reporting.
 
-Two things get measured here that a generic backtest report would not
+Three things get measured here that a generic backtest report would not
 bother with, because they are the whole question for this strategy:
 
+  * **regime attribution** -- what the long-gamma (negative GEX) trades made
+    versus the short-gamma (positive GEX) ones.  A headline number that nets
+    a working branch against a broken one says nothing; these two say
+    whether reading GEX paid, and on which side.
+  * **P&L attribution by leg** -- what the straddle did versus what hedging
+    it did.  For a long straddle those two numbers *are* the strategy: the
+    option leg is premium bled to theta, the hedge leg is the gamma scalped
+    back, and the sum is the bet on realised vol.
   * **hedge quality** -- what fraction of bars sat inside the delta band, and
     how far from target the position actually ran.  With MES granularity
     coarser than the band, "in band" is an outcome, not a given.
-  * **P&L attribution** -- premium captured on the short put versus what the
-    hedging cost.  A short-vol book that makes money on the option and gives
-    it all back on the hedge is worth knowing about.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date
 
 import pandas as pd
 
+from ..gex import NEGATIVE, NEUTRAL, POSITIVE
 from ..strategy import BarState, StrategyEvent
 
 TRADING_DAYS = 252
@@ -41,6 +46,18 @@ class Metrics:
     option_pnl: float
     hedge_pnl: float
     fees_paid: float
+    # Regime attribution: position P&L (straddle + its hedge, net of fees)
+    # booked against the GEX regime that opened the trade.
+    long_gamma_pnl: float
+    short_gamma_pnl: float
+    long_gamma_trades: int
+    short_gamma_trades: int
+    neutral_skips: int
+    pct_bars_negative_gex: float
+    pct_bars_positive_gex: float
+    pct_bars_neutral_gex: float
+    pct_bars_above_flip: float
+    mean_abs_gex: float
     hedges: int
     hedge_contracts_traded: int
     bars_in_band: int
@@ -71,10 +88,25 @@ class Metrics:
                 f"  Sortino              {self.sortino:,.2f}",
                 f"  trading days         {self.trading_days}",
                 "",
-                "Attribution",
-                f"  short put P&L        {usd(self.option_pnl)}",
+                "Attribution by leg",
+                f"  straddle P&L         {usd(self.option_pnl)}",
                 f"  hedge P&L            {usd(self.hedge_pnl)}",
                 f"  fees & commissions   {usd(-self.fees_paid)}",
+                "",
+                "GEX regime",
+                f"  bars negative / positive / neutral  "
+                f"{pct(self.pct_bars_negative_gex)} / "
+                f"{pct(self.pct_bars_positive_gex)} / "
+                f"{pct(self.pct_bars_neutral_gex)}",
+                f"  bars above the gamma flip          {pct(self.pct_bars_above_flip)}",
+                f"  mean |GEX|                         "
+                f"${self.mean_abs_gex / 1e6:,.1f}M per 1% move",
+                f"  long-gamma  (negative GEX) {self.long_gamma_trades:>3} trades"
+                f"  {usd(self.long_gamma_pnl)}",
+                f"  short-gamma (positive GEX) {self.short_gamma_trades:>3} trades"
+                f"  {usd(self.short_gamma_pnl)}",
+                f"  entries skipped as neutral {self.neutral_skips:>3}",
+                self._regime_note(),
                 "",
                 "Trading",
                 f"  entries              {self.entries}",
@@ -100,6 +132,30 @@ class Metrics:
                 self._granularity_note(),
                 self._feasibility_note(),
             ]
+        )
+
+    def _regime_note(self) -> str:
+        """Say plainly whether the two branches were both exercised.
+
+        A run that only ever saw one regime has not tested the strategy --
+        it has tested half of it -- and the headline return would invite
+        exactly the wrong conclusion.
+        """
+        if self.long_gamma_trades == 0 and self.short_gamma_trades == 0:
+            return "  -> no trade was taken: every bar read as neutral."
+        if self.long_gamma_trades == 0:
+            return (
+                "  -> only the SHORT-gamma branch traded. The long side is\n"
+                "     untested here; do not read the headline as evidence for it."
+            )
+        if self.short_gamma_trades == 0:
+            return (
+                "  -> only the LONG-gamma branch traded. The short side is\n"
+                "     untested here; do not read the headline as evidence for it."
+            )
+        return (
+            "  -> both branches traded; the split above is the result that\n"
+            "     matters, not the net."
         )
 
     def _granularity_note(self) -> str:
@@ -165,23 +221,30 @@ class BacktestResult:
 def bars_to_frame(states: list[BarState], target: float) -> pd.DataFrame:
     rows = []
     for s in states:
-        greeks = s.option_greeks
         rows.append(
             {
                 "timestamp": s.timestamp,
                 "future": s.future,
                 "atm_iv": s.atm_iv,
                 "hours_to_expiry": s.time_to_expiry * 365 * 24,
+                "gex_total": s.gex_total,
+                "gex_flip": s.gex_flip,
+                "gex_regime": s.gex_regime,
+                "distance_to_flip": s.distance_to_flip,
                 "strike": s.strike,
-                "option_contracts": s.option_contracts,
-                "option_mark": s.option_mark,
-                "option_delta": greeks.delta if greeks else None,
+                "straddle_contracts": s.straddle_contracts,
+                "direction": s.direction,
+                "straddle_mark": s.straddle_mark,
+                "call_mark": s.call_mark,
+                "put_mark": s.put_mark,
                 "option_delta_units": s.option_delta_units,
                 "hedge_contracts": s.hedge_contracts,
                 "hedge_delta_units": s.hedge_delta_units,
                 "net_delta_units": s.net_delta_units,
                 "delta_error": s.net_delta_units - target,
                 "gamma_units": s.gamma_units,
+                "vega_dollars": s.vega_dollars,
+                "theta_dollars": s.theta_dollars,
                 "in_band": s.in_band,
                 "equity": s.equity,
                 "realised_pnl": s.realised_pnl,
@@ -197,6 +260,7 @@ def events_to_frame(events: list[StrategyEvent]) -> pd.DataFrame:
             {
                 "timestamp": e.timestamp,
                 "kind": e.kind,
+                "regime": e.regime,
                 "detail": e.detail,
                 "net_delta": e.net_delta,
                 "equity": e.equity,
@@ -263,15 +327,29 @@ def compute_metrics(
     hedge_pnl: float,
     fees_paid: float,
     target: float,
+    regime_pnl: dict[str, float] | None = None,
+    regime_trades: dict[str, int] | None = None,
     band_width: float = 0.0,
     hedge_tick: float = 0.25,
     hedge_quantum: float = 0.0,
 ) -> Metrics:
+    regime_pnl = regime_pnl or {}
+    regime_trades = regime_trades or {}
     if bars.empty:
         return Metrics(
-            starting_equity, starting_equity, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0,
-            0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            starting_equity=starting_equity, final_equity=starting_equity,
+            total_return=0.0, max_drawdown=0.0, max_drawdown_pct=0.0, sharpe=0.0,
+            sortino=0.0, trading_days=0, entries=0, winning_days=0, losing_days=0,
+            win_rate=0.0, option_pnl=0.0, hedge_pnl=0.0, fees_paid=0.0,
+            long_gamma_pnl=0.0, short_gamma_pnl=0.0, long_gamma_trades=0,
+            short_gamma_trades=0, neutral_skips=0, pct_bars_negative_gex=0.0,
+            pct_bars_positive_gex=0.0, pct_bars_neutral_gex=0.0,
+            pct_bars_above_flip=0.0, mean_abs_gex=0.0, hedges=0,
+            hedge_contracts_traded=0, bars_in_band=0, bars_with_position=0,
+            pct_bars_in_band=0.0, mean_abs_delta_error=0.0, max_abs_delta_error=0.0,
+            mean_net_delta=0.0, median_gamma_units=0.0, band_width_points=0.0,
+            pct_bars_band_below_tick=0.0, hedge_tick_points=hedge_tick,
+            hedge_quantum=hedge_quantum, band_half_width=band_width / 2.0,
         )
 
     final_equity = float(bars["equity"].iloc[-1])
@@ -280,13 +358,37 @@ def compute_metrics(
     max_dd = float(drawdown.max())
     max_dd_pct = float((drawdown / peak).max()) if (peak > 0).all() else 0.0
 
-    held = bars[bars["option_contracts"] != 0]
+    held = bars[bars["straddle_contracts"] != 0]
     hedge_fills = fills[fills["instrument"] == "hedge"] if not fills.empty else fills
     entries = int((events["kind"] == "entry").sum()) if not events.empty else 0
     hedge_events = int((events["kind"] == "hedge").sum()) if not events.empty else 0
 
     wins = int((daily["pnl"] > 0).sum()) if not daily.empty else 0
     losses = int((daily["pnl"] < 0).sum()) if not daily.empty else 0
+
+    # -- GEX regime -----------------------------------------------------
+    # A bar with no profile (no 0DTE listed, or no open interest) is not a
+    # neutral read; it is an absent one, and counting it as neutral would
+    # overstate how often dealers were flat.
+    scored = bars[bars["gex_total"].notna()]
+    total_scored = len(scored)
+    share = lambda name: (  # noqa: E731
+        float((scored["gex_regime"] == name).sum() / total_scored)
+        if total_scored
+        else 0.0
+    )
+    with_flip = scored[scored["gex_flip"].notna()]
+    pct_above_flip = (
+        float((with_flip["future"] > with_flip["gex_flip"]).sum() / len(with_flip))
+        if len(with_flip)
+        else 0.0
+    )
+    mean_abs_gex = float(scored["gex_total"].abs().mean()) if total_scored else 0.0
+    neutral_skips = (
+        int(((events["kind"] == "entry_skipped") & (events["regime"] == NEUTRAL)).sum())
+        if not events.empty
+        else 0
+    )
 
     if held.empty:
         in_band = mean_err = max_err = mean_delta = 0.0
@@ -334,6 +436,16 @@ def compute_metrics(
         option_pnl=option_pnl,
         hedge_pnl=hedge_pnl,
         fees_paid=fees_paid,
+        long_gamma_pnl=regime_pnl.get(NEGATIVE, 0.0),
+        short_gamma_pnl=regime_pnl.get(POSITIVE, 0.0),
+        long_gamma_trades=regime_trades.get(NEGATIVE, 0),
+        short_gamma_trades=regime_trades.get(POSITIVE, 0),
+        neutral_skips=neutral_skips,
+        pct_bars_negative_gex=share(NEGATIVE),
+        pct_bars_positive_gex=share(POSITIVE),
+        pct_bars_neutral_gex=share(NEUTRAL),
+        pct_bars_above_flip=pct_above_flip,
+        mean_abs_gex=mean_abs_gex,
         hedges=hedge_events,
         hedge_contracts_traded=(
             int(hedge_fills["quantity"].abs().sum()) if not hedge_fills.empty else 0

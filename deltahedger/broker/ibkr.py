@@ -1,9 +1,10 @@
 """Live execution against IBKR (TWS or IB Gateway).
 
 This is the forward-testing path.  It implements the same
-``ExecutionHandler`` interface the backtest uses, so ``ShortVolStrategy``
+``ExecutionHandler`` interface the backtest uses, so ``GexStraddleStrategy``
 runs unchanged -- what differs is that fills come back from the exchange
-rather than from a slippage model.
+rather than from a slippage model, and that open interest is the exchange's
+rather than a generated surface.
 
 Safety
 ------
@@ -27,8 +28,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
-from ..chain import OptionQuote
+from ..chain import OptionQuote, StraddleQuote, atm_strike
 from ..config import Config
+from ..gex import StrikeOpenInterest
 from ..instruments import ContractSpec, RiskSource
 from ..pricing import black76, implied_vol
 from ..volsurface import VolSurface
@@ -214,35 +216,70 @@ class IbkrChainProvider:
         self.cfg = cfg
         self.surface = VolSurface(cfg.vol)
 
-    def put_chain(
+    def chain(
         self,
         future_price: float,
         expiry: date,
         time_to_expiry: float,
         width_pct: float = 0.05,
+        right: str = "P",
     ) -> list[OptionQuote]:
+        """Quotes for one right across the listed strikes near the money."""
         from ..chain import strike_grid
 
-        strikes = strike_grid(future_price, self.conn.source, width_pct)
         contracts = []
-        for strike in strikes:
+        for strike in strike_grid(future_price, self.conn.source, width_pct):
             try:
-                contracts.append((strike, self.conn.option_contract(expiry, strike, "P")))
+                contracts.append(
+                    (strike, self.conn.option_contract(expiry, strike, right))
+                )
             except ExecutionError:
                 continue  # strike isn't listed; skip it rather than abort
         if not contracts:
-            raise ExecutionError(f"no listed put strikes for {expiry}")
+            raise ExecutionError(f"no listed {right} strikes for {expiry}")
 
         tickers = self.conn.ib.reqTickers(*[c for _, c in contracts])
         quotes: list[OptionQuote] = []
         for (strike, _), ticker in zip(contracts, tickers):
-            quote = self._to_quote(ticker, strike, expiry, time_to_expiry, future_price)
+            quote = self._to_quote(
+                ticker, strike, right, expiry, time_to_expiry, future_price
+            )
             if quote is not None:
                 quotes.append(quote)
         return quotes
 
+    def straddle(
+        self,
+        future_price: float,
+        expiry: date,
+        time_to_expiry: float,
+    ) -> StraddleQuote | None:
+        """The live ATM straddle, on the same strike the backtest would pick.
+
+        Strike selection goes through ``chain.atm_strike`` rather than being
+        reimplemented here, so a forward test trades the strike the
+        historical study measured.
+        """
+        strike = atm_strike(future_price, self.conn.source)
+        legs: dict[str, OptionQuote] = {}
+        for right in ("C", "P"):
+            contract = self.conn.option_contract(expiry, strike, right)
+            ticker = self.conn.ib.reqTickers(contract)[0]
+            quote = self._to_quote(
+                ticker, strike, right, expiry, time_to_expiry, future_price
+            )
+            if quote is None:
+                log.warning("no usable %s%s quote for %s", strike, right, expiry)
+                return None
+            legs[right] = quote
+        return StraddleQuote(
+            strike=strike, expiry=expiry, call=legs["C"], put=legs["P"],
+            time_to_expiry=time_to_expiry,
+        )
+
     def _to_quote(
-        self, ticker: Any, strike: float, expiry: date, t: float, future: float
+        self, ticker: Any, strike: float, right: str, expiry: date, t: float,
+        future: float,
     ) -> OptionQuote | None:
         price = _pick_price(ticker)
         greeks_source = getattr(ticker, "modelGreeks", None)
@@ -250,23 +287,109 @@ class IbkrChainProvider:
         if greeks_source is not None and _valid(getattr(greeks_source, "impliedVol", None)):
             iv = float(greeks_source.impliedVol)
         elif price is not None:
-            fitted = implied_vol(price, future, strike, t, self.cfg.risk_free_rate, "P")
+            fitted = implied_vol(price, future, strike, t, self.cfg.risk_free_rate, right)
             iv = fitted if fitted is not None else self.surface.iv(future, strike, 0.0, t)
         else:
             return None
 
         # Greeks are always recomputed with Black-76 so that the delta driving
         # the hedge band is defined identically in live and in backtest.
-        greeks = black76(future, strike, t, iv, self.cfg.risk_free_rate, "P")
+        greeks = black76(future, strike, t, iv, self.cfg.risk_free_rate, right)
         return OptionQuote(
             strike=strike,
-            right="P",
+            right=right,
             expiry=expiry,
             price=price if price is not None else greeks.price,
             iv=iv,
             greeks=greeks,
             time_to_expiry=t,
         )
+
+
+class IbkrOpenInterestProvider:
+    """Reads open interest off the live chain, for the GEX profile.
+
+    IBKR delivers open interest on generic tick 101, and it arrives
+    asynchronously after the subscription rather than in the first snapshot,
+    so each request is given a short settling window before the tickers are
+    read.
+
+    What comes back is the *exchange's* open interest, which is an
+    end-of-previous-day figure.  That is the honest input -- same-day 0DTE
+    flow is not in it and cannot be -- and it is why the strategy treats a
+    GEX read as a regime classification rather than a precise level.
+    """
+
+    #: Generic tick 101 is option open interest.
+    GENERIC_TICKS = "101"
+
+    def __init__(
+        self, connection: IbkrConnection, cfg: Config, settle_seconds: float = 3.0
+    ):
+        self.conn = connection
+        self.cfg = cfg
+        self.settle_seconds = settle_seconds
+
+    def open_interest(
+        self, moment: datetime, future_price: float, expiry: date
+    ) -> list[StrikeOpenInterest]:
+        from ..chain import strike_grid
+
+        strikes = strike_grid(future_price, self.conn.source, self.cfg.gex.strike_width_pct)
+        subscriptions: dict[float, dict[str, Any]] = {}
+        for strike in strikes:
+            legs: dict[str, Any] = {}
+            for right in ("C", "P"):
+                try:
+                    contract = self.conn.option_contract(expiry, strike, right)
+                except ExecutionError:
+                    continue  # not listed; a missing strike is not an error
+                legs[right] = self.conn.ib.reqMktData(
+                    contract, self.GENERIC_TICKS, False, False
+                )
+            if legs:
+                subscriptions[strike] = legs
+
+        if not subscriptions:
+            log.warning("no listed strikes near %.2f for %s", future_price, expiry)
+            return []
+
+        # Open interest arrives on its own tick, after the snapshot.
+        self.conn.ib.sleep(self.settle_seconds)
+
+        rows: list[StrikeOpenInterest] = []
+        try:
+            for strike, legs in subscriptions.items():
+                call_oi = _open_interest(legs.get("C"), "C")
+                put_oi = _open_interest(legs.get("P"), "P")
+                if call_oi or put_oi:
+                    rows.append(
+                        StrikeOpenInterest(strike=strike, call_oi=call_oi, put_oi=put_oi)
+                    )
+        finally:
+            for legs in subscriptions.values():
+                for ticker in legs.values():
+                    self.conn.ib.cancelMktData(ticker.contract)
+
+        if not rows:
+            log.warning(
+                "IBKR returned no open interest for %s. The account may not carry "
+                "the market-data permission for it; GEX cannot be computed and the "
+                "strategy will stand aside.", expiry,
+            )
+        return rows
+
+
+def _open_interest(ticker: Any, right: str) -> float:
+    """Open interest off a ticker, whichever field the API populated."""
+    if ticker is None:
+        return 0.0
+    preferred = "callOpenInterest" if right == "C" else "putOpenInterest"
+    for field_name in (preferred, "openInterest"):
+        value = getattr(ticker, field_name, None)
+        if value is not None and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+            return float(value)
+    return 0.0
 
 
 @dataclass
@@ -276,32 +399,72 @@ class WhatIfMarginModel:
     Preferred over the heuristics in ``sizing`` for anything live: it is the
     number the account will actually be charged.  Falls back to the supplied
     model if IBKR does not return a margin figure.
+
+    A long straddle is not probed at all.  There is no margin on it -- the
+    debit is paid in full and is the whole requirement -- and asking IBKR
+    for a margin change on a purchase would return zero, which the sizing
+    would read as "free" and size without limit.
     """
 
     connection: IbkrConnection
     fallback: Any
     probe_quantity: int = 1
 
-    def short_option_margin(
-        self, quote: OptionQuote, future_price: float, source: RiskSource
+    def straddle_requirement(
+        self, quote: StraddleQuote, future_price: float, source: RiskSource,
+        direction: int,
     ) -> float:
-        from ib_async import MarketOrder
-
+        if direction > 0:
+            return self.fallback.straddle_requirement(
+                quote, future_price, source, direction
+            )
         try:
-            contract = self.connection.option_contract(quote.expiry, quote.strike, quote.right)
-            order = MarketOrder("SELL", self.probe_quantity)
-            order.account = self.connection.account
-            state = self.connection.ib.whatIfOrder(contract, order)
-            change = float(getattr(state, "initMarginChange", "") or 0.0)
-            if change > 0:
-                return change / self.probe_quantity
+            margin = self._probe_short(quote)
+            if margin is not None:
+                return margin
             log.warning("whatIf returned no margin change; using the fallback model")
         except Exception as exc:  # noqa: BLE001 - never block sizing on a probe
             log.warning("whatIf margin probe failed (%s); using the fallback model", exc)
-        return self.fallback.short_option_margin(quote, future_price, source)
+        return self.fallback.straddle_requirement(quote, future_price, source, direction)
+
+    def _probe_short(self, quote: StraddleQuote) -> float | None:
+        """Margin for selling both legs together, as one combined position.
+
+        The legs are probed as a pair rather than separately because that is
+        how they will be margined: SPAN nets them, and summing two
+        independent single-leg probes would overstate the requirement and
+        size the position too small.
+        """
+        from ib_async import Contract, MarketOrder
+
+        contracts = [
+            self.connection.option_contract(quote.expiry, leg.strike, leg.right)
+            for leg in quote.legs()
+        ]
+        combo = Contract(
+            secType="BAG",
+            symbol=self.connection.source.option.symbol,
+            exchange=self.connection.source.option.exchange,
+            currency=self.connection.source.option.currency,
+            comboLegs=[_combo_leg(c, "SELL", self.connection.source.option.exchange)
+                       for c in contracts],
+        )
+        order = MarketOrder("BUY", self.probe_quantity)  # the legs carry the sell side
+        order.account = self.connection.account
+        state = self.connection.ib.whatIfOrder(combo, order)
+        change = float(getattr(state, "initMarginChange", "") or 0.0)
+        if change > 0:
+            return change / self.probe_quantity
+        return None
 
     def hedge_margin(self, source: RiskSource) -> float:
         return self.fallback.hedge_margin(source)
+
+
+def _combo_leg(contract: Any, action: str, exchange: str) -> Any:
+    from ib_async import ComboLeg
+
+    return ComboLeg(conId=contract.conId, ratio=1, action=action, exchange=exchange)
 
 
 @dataclass

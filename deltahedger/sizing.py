@@ -1,12 +1,24 @@
-"""Margin models and buying-power based position sizing.
+"""Capital requirements and buying-power based position sizing.
 
-The number of puts we sell is driven by buying power, not by the delta
-target: ``buying_power_pct`` (15% by default) of portfolio equity is the
-margin budget, part of it is reserved for the hedge leg, and the remainder
-divided by per-contract margin gives the contract count.  The delta band
-then absorbs whatever delta that position happens to carry.
+The number of straddles is driven by buying power, not by the delta target:
+``buying_power_pct`` (15% by default) of portfolio equity is the budget,
+part of it is reserved for the hedge leg, and the remainder divided by the
+per-straddle requirement gives the count.  The delta band then absorbs
+whatever delta that position happens to carry.
 
-Three margin models ship here.
+The requirement means different things in the two regimes, and conflating
+them would misstate the risk in both directions:
+
+* **short straddle** (positive GEX) -- the requirement is *margin*.  Loss is
+  unbounded, the broker holds collateral against it, and SPAN is what
+  decides how much.
+* **long straddle** (negative GEX) -- the requirement is the *debit*.  There
+  is no margin: the premium is paid in full and is also the entire maximum
+  loss on the option leg.  Charging a scenario margin on top would size the
+  long branch smaller than the risk justifies, and charging nothing would
+  ignore that the cash actually leaves the account.
+
+Three models ship here.
 
 ``SpanScanMarginModel`` is the default and the only one appropriate for
 futures options.  It reproduces CME SPAN's risk-array method: reprice the
@@ -27,10 +39,10 @@ impact of the actual order before it is sent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
-from .chain import OptionQuote
+from .chain import OptionQuote, StraddleQuote
 from .config import SizingConfig
 from .instruments import RiskSource
 from .pricing import black76
@@ -59,26 +71,35 @@ SPAN_SCENARIOS: tuple[tuple[float, float, float], ...] = (
 
 
 class MarginModel(Protocol):
-    """Initial margin required to carry a position, in USD."""
+    """Capital required to carry one straddle, in USD."""
 
-    def short_option_margin(
-        self, quote: OptionQuote, future_price: float, source: RiskSource
+    def straddle_requirement(
+        self, quote: StraddleQuote, future_price: float, source: RiskSource,
+        direction: int,
     ) -> float: ...
 
     def hedge_margin(self, source: RiskSource) -> float: ...
 
 
+def straddle_debit(quote: StraddleQuote, source: RiskSource) -> float:
+    """Cash paid for one long straddle -- and its maximum loss."""
+    return quote.price * source.option.multiplier
+
+
 @dataclass
 class FixedMarginModel:
-    """Flat margin per contract. Simple, and easy to stress."""
+    """Flat margin per short leg. Simple, and easy to stress."""
 
     per_option_contract: float
     per_hedge_contract: float
 
-    def short_option_margin(
-        self, quote: OptionQuote, future_price: float, source: RiskSource
+    def straddle_requirement(
+        self, quote: StraddleQuote, future_price: float, source: RiskSource,
+        direction: int,
     ) -> float:
-        return self.per_option_contract
+        if direction > 0:
+            return straddle_debit(quote, source)
+        return 2.0 * self.per_option_contract
 
     def hedge_margin(self, source: RiskSource) -> float:
         return self.per_hedge_contract
@@ -106,28 +127,38 @@ class SpanScanMarginModel:
             source.future_initial_margin / source.future.multiplier
         ) * self.scan_multiplier
 
-    def short_option_margin(
-        self, quote: OptionQuote, future_price: float, source: RiskSource
+    def straddle_requirement(
+        self, quote: StraddleQuote, future_price: float, source: RiskSource,
+        direction: int,
     ) -> float:
+        if direction > 0:
+            return straddle_debit(quote, source)
+
         scan = self.price_scan_range(source)
         mult = source.option.multiplier
-        # We are short, so a scenario that raises the option's value is a loss.
+        # We are short, so a scenario that raises the pair's value is a loss.
+        # Both legs are repriced in the same scenario and netted before the
+        # worst case is taken: a straddle is one position, and charging each
+        # leg its own worst case would double-count a move that cannot hurt
+        # both at once.
         entry_value = quote.price
         worst_loss = 0.0
         for price_frac, vol_frac, weight in SPAN_SCENARIOS:
             scenario_future = max(future_price + price_frac * scan, 1e-9)
-            scenario_vol = max(quote.iv * (1.0 + vol_frac * self.vol_scan_pct), 1e-6)
-            scenario_value = black76(
-                scenario_future,
-                quote.strike,
-                quote.time_to_expiry,
-                scenario_vol,
-                self.risk_free_rate,
-                quote.right,
-            ).price
+            scenario_value = 0.0
+            for leg in quote.legs():
+                scenario_vol = max(leg.iv * (1.0 + vol_frac * self.vol_scan_pct), 1e-6)
+                scenario_value += black76(
+                    scenario_future,
+                    leg.strike,
+                    quote.time_to_expiry,
+                    scenario_vol,
+                    self.risk_free_rate,
+                    leg.right,
+                ).price
             loss = (scenario_value - entry_value) * mult * weight
             worst_loss = max(worst_loss, loss)
-        return max(worst_loss, self.short_option_minimum)
+        return max(worst_loss, 2.0 * self.short_option_minimum)
 
     def hedge_margin(self, source: RiskSource) -> float:
         return source.hedge_initial_margin
@@ -143,7 +174,7 @@ class RegTMarginModel:
     a: float = 0.15
     b: float = 0.10
 
-    def short_option_margin(
+    def leg_margin(
         self, quote: OptionQuote, future_price: float, source: RiskSource
     ) -> float:
         mult = source.option.multiplier
@@ -156,6 +187,21 @@ class RegTMarginModel:
             self.a * future_price * mult - out_of_the_money,
             self.b * quote.strike * mult,
         )
+
+    def straddle_requirement(
+        self, quote: StraddleQuote, future_price: float, source: RiskSource,
+        direction: int,
+    ) -> float:
+        if direction > 0:
+            return straddle_debit(quote, source)
+        # The Reg-T short-straddle rule: margin the losing side in full and
+        # add the other side's premium. Only one leg can finish in the money.
+        mult = source.option.multiplier
+        legs = quote.legs()
+        margins = [self.leg_margin(leg, future_price, source) for leg in legs]
+        worst = max(range(len(legs)), key=lambda i: margins[i])
+        other = 1 - worst
+        return margins[worst] + legs[other].price * mult
 
     def hedge_margin(self, source: RiskSource) -> float:
         return source.hedge_initial_margin
@@ -186,39 +232,56 @@ class SizingResult:
     total_margin: float
     budget: float
     option_budget: float
+    direction: int = 0
     reason: str = ""
 
     @property
     def ok(self) -> bool:
         return self.contracts > 0
 
+    @property
+    def requirement_kind(self) -> str:
+        return "debit" if self.direction > 0 else "margin"
 
-def size_short_puts(
+
+def size_straddles(
     equity: float,
-    quote: OptionQuote,
+    quote: StraddleQuote,
     future_price: float,
+    direction: int,
     cfg: SizingConfig,
     source: RiskSource,
     model: MarginModel,
 ) -> SizingResult:
-    """How many puts the buying-power allocation supports."""
+    """How many straddles the buying-power allocation supports.
+
+    ``direction`` is the sign the GEX regime asked for: +1 buys the
+    straddle, -1 sells it.  It changes what is being budgeted -- a debit
+    against cash or margin against collateral -- but not how the budget is
+    carved up, so the same reserve still stands behind the hedge leg in
+    both cases.
+    """
+    if direction == 0:
+        return SizingResult(0, 0.0, 0.0, 0.0, 0.0, 0, "no direction to size")
+
     budget = max(equity, 0.0) * cfg.buying_power_pct
     option_budget = budget * (1.0 - cfg.hedge_margin_reserve_pct)
-    per_contract = model.short_option_margin(quote, future_price, source)
+    per_contract = model.straddle_requirement(quote, future_price, source, direction)
+    kind = "debit" if direction > 0 else "margin"
 
     if per_contract <= 0.0:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget,
-            "margin model returned a non-positive requirement",
+            0, per_contract, 0.0, budget, option_budget, direction,
+            f"the {kind} model returned a non-positive requirement",
         )
 
     raw = int(option_budget // per_contract)
-    contracts = min(raw, cfg.max_short_contracts)
-    if contracts < cfg.min_short_contracts:
+    contracts = min(raw, cfg.max_straddles)
+    if contracts < cfg.min_straddles:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget,
-            f"buying power supports {raw} contracts, minimum is "
-            f"{cfg.min_short_contracts} (${per_contract:,.0f} margin each vs "
+            0, per_contract, 0.0, budget, option_budget, direction,
+            f"buying power supports {raw} straddles, minimum is "
+            f"{cfg.min_straddles} (${per_contract:,.0f} {kind} each vs "
             f"${option_budget:,.0f} available)",
         )
     return SizingResult(
@@ -227,5 +290,6 @@ def size_short_puts(
         total_margin=contracts * per_contract,
         budget=budget,
         option_budget=option_budget,
-        reason="capped by max_short_contracts" if raw > contracts else "",
+        direction=direction,
+        reason="capped by max_straddles" if raw > contracts else "",
     )
