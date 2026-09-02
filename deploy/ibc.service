@@ -24,9 +24,17 @@ EnvironmentFile=/etc/ibc/ibc.env
 # under a virtual display. xvfb-run --auto-servernum picks a free display
 # number and exports DISPLAY itself; setting DISPLAY here as well would
 # only override it with a guess.
+#
+# -inline matters more than it looks: without it, gatewaystart.sh opens an
+# xterm and backgrounds it with `&`, then the script itself returns -- so
+# systemd sees a clean, instant exit and, with Restart=always, loops
+# forever starting and immediately reaping it. -inline makes it exec
+# straight into displaybannerandlaunch.sh instead, which backgrounds only
+# the java process and blocks on `wait`, giving systemd an actual
+# long-running PID to track. It also sidesteps needing xterm at all.
 ExecStartPre=/usr/bin/install -d -o @SERVICE_USER@ -g @SERVICE_USER@ /home/@SERVICE_USER@/ibc-logs
 ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
-    /opt/ibc/gatewaystart.sh
+    /opt/ibc/gatewaystart.sh -inline
 
 # The gateway restarts itself once a day (AutoRestartTime in config.ini). If
 # it exits outright instead, bring it back -- but slowly, because a login
