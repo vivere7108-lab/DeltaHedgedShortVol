@@ -96,11 +96,13 @@ trap 'rm -rf "${workdir}"' EXIT
 log "IB Gateway"
 
 # IBC locates the gateway as $TWS_PATH/ibgateway/$TWS_MAJOR_VRSN/jars, so the
-# install has to land in that exact shape. Passing -dir put the jars flat in
-# Jts/ibgateway/ instead, which IBC cannot find -- it fails to launch, nothing
-# ever listens on the API port, and the only symptom is a connection refused
-# from a component three steps downstream. So: let the installer use its own
-# default location, then DETECT what it produced rather than assuming.
+# install has to land in that exact shape. The current stable-standalone
+# installer no longer produces it under any invocation this script has
+# tried -- with or without -dir, it lays the gateway out flat (jars/
+# directly under the target directory, no version component) -- so rather
+# than trust the installer's own layout, force a known -dir and restructure
+# the result into the version directory IBC needs ourselves, naming it from
+# the launcher jar the installer just wrote (twslaunch-1045.jar -> "1045").
 GATEWAY_ROOT="/home/${SERVICE_USER}/Jts/ibgateway"
 
 detect_version() {
@@ -112,18 +114,18 @@ detect_version() {
     basename "$(dirname "${jars}")"
 }
 
-# A flat install is what the earlier version of this script produced. It is
-# unusable by IBC and there is no reliable way to read the version back out
-# of it, so clear it and let the installer lay itself out properly.
-if [[ -d "${GATEWAY_ROOT}/jars" ]]; then
-    log "removing an unusable flat gateway install at ${GATEWAY_ROOT}"
-    echo "  (IBC needs ibgateway/<version>/jars; this has ibgateway/jars)"
-    mv "${GATEWAY_ROOT}" "${GATEWAY_ROOT}.flat.$(date +%s)"
-fi
-
 if TWS_MAJOR_VRSN="$(detect_version)"; then
     echo "already installed: version ${TWS_MAJOR_VRSN}"
 else
+    # A flat install from an earlier run of this script, or from the
+    # installer itself, is unusable by IBC as-is -- move it aside so -dir
+    # below starts from an empty directory instead of merging into it.
+    if [[ -d "${GATEWAY_ROOT}" && -n "$(ls -A "${GATEWAY_ROOT}" 2>/dev/null)" ]]; then
+        log "moving aside an existing unversioned install at ${GATEWAY_ROOT}"
+        mv "${GATEWAY_ROOT}" "${GATEWAY_ROOT}.flat.$(date +%s)"
+    fi
+    sudo -u "${SERVICE_USER}" mkdir -p "${GATEWAY_ROOT}"
+
     curl -fsSL "${GATEWAY_URL}" -o "${workdir}/ibgateway.sh"
     make_runnable "${workdir}/ibgateway.sh"
     assert_runnable "${workdir}/ibgateway.sh" "The IB Gateway installer"
@@ -142,12 +144,30 @@ else
     # install already succeeded by that point. workdir is 0755 and owned by
     # the service user, so both sides of the sudo can reach it.
     #
-    # -q is unattended mode. No -dir: the default is the layout IBC expects.
+    # -q is unattended mode; -dir pins the flat layout to a known place so
+    # the restructuring below doesn't have to go hunting for it.
     cd "${workdir}"
     sudo -u "${SERVICE_USER}" env \
         HOME="/home/${SERVICE_USER}" \
         TMPDIR="${workdir}" \
-        "${workdir}/ibgateway.sh" -q
+        "${workdir}/ibgateway.sh" -q -dir "${GATEWAY_ROOT}"
+
+    if [[ -d "${GATEWAY_ROOT}/jars" ]]; then
+        launcher="$(ls "${GATEWAY_ROOT}"/jars/twslaunch-*.jar 2>/dev/null | head -1)"
+        version="$(basename "${launcher:-}" .jar | sed -nE 's/^twslaunch-([0-9]+)$/\1/p')"
+        if [[ -n "${version}" ]]; then
+            versioned_dir="${GATEWAY_ROOT}/${version}"
+            mkdir "${versioned_dir}"
+            (
+                shopt -s dotglob
+                for entry in "${GATEWAY_ROOT}"/*; do
+                    [[ "${entry}" == "${versioned_dir}" ]] && continue
+                    mv "${entry}" "${versioned_dir}/"
+                done
+            )
+            chown -R "${SERVICE_USER}:${SERVICE_USER}" "${versioned_dir}"
+        fi
+    fi
 
     if ! TWS_MAJOR_VRSN="$(detect_version)"; then
         cat >&2 <<EOF
