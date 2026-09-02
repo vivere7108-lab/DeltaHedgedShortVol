@@ -80,6 +80,40 @@ First login usually triggers **two-factor on your phone**. Approve it. IBKR
 re-prompts periodically (roughly weekly); when the walk goes quiet, this is
 the first thing to check.
 
+### If git says "detected dubious ownership"
+
+```
+fatal: detected dubious ownership in repository at '/opt/deltahedger'
+```
+
+Git refuses to act on a repository owned by someone else, and `bootstrap.sh`
+deliberately hands `/opt/deltahedger` to the service user — so a bare
+`sudo git pull` as root hits this every time.
+
+**Use `bootstrap.sh` to update, not `git pull`.** It runs git as the repo's
+owner and prints the commit it landed on:
+
+```bash
+sudo /opt/deltahedger/deploy/bootstrap.sh
+#   now at ea7ccf3 Fix IB Gateway and IBC install failing with Permission denied
+```
+
+The trap to know about: a failed pull leaves the checkout *silently stale*,
+and a stale script fails in exactly the same way as an unpatched one. If a
+fix does not appear to have worked, check what you are actually running
+before re-diagnosing the bug — `install-ibc.sh` prints its own commit on
+every run for this reason:
+
+```
+install-ibc.sh from ea7ccf3 2026-09-02 Fix IB Gateway and IBC install ...
+```
+
+If you must use git directly, run it as the owner:
+
+```bash
+sudo -u deltahedger git -C /opt/deltahedger pull
+```
+
 ### If the installer says "Permission denied"
 
 ```
@@ -233,9 +267,13 @@ events = read_journal("runs/live", "events")
 ## Updating
 
 ```bash
-sudo /opt/deltahedger/deploy/bootstrap.sh     # pulls, reinstalls
+sudo /opt/deltahedger/deploy/bootstrap.sh     # pulls as the owner, reinstalls
 sudo systemctl restart deltahedger
 ```
+
+Not `git pull` as root — see "detected dubious ownership" above. Bootstrap
+prints the commit it landed on, so a stale checkout is visible rather than
+inferred.
 
 Do it outside market hours. A restart mid-session is safe — positions are
 re-read from the broker — but it drops the in-memory session P&L baselines

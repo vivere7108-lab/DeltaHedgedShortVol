@@ -43,15 +43,36 @@ else
 fi
 
 log "repository: ${INSTALL_DIR} (${BRANCH})"
+
+# Git refuses to operate on a repository owned by someone else ("detected
+# dubious ownership"), which is exactly what this script creates: it clones,
+# then chowns to the service user. Running the update as root would then
+# fail on every re-run -- so run git AS the owner, and pass safe.directory
+# inline (not into anyone's global config) to survive a tree whose ownership
+# is already mixed from an earlier root pull.
+as_owner() {
+    sudo -u "${SERVICE_USER}" env HOME="/home/${SERVICE_USER}" \
+        git -c safe.directory="${INSTALL_DIR}" "$@"
+}
+
+mkdir -p "${INSTALL_DIR}"
+# Normalise ownership before touching git, so the service user can act on
+# whatever a previous run (or a manual root pull) left behind.
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
+
 if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    git -C "${INSTALL_DIR}" fetch --quiet origin "${BRANCH}"
-    git -C "${INSTALL_DIR}" checkout --quiet "${BRANCH}"
-    git -C "${INSTALL_DIR}" reset --hard --quiet "origin/${BRANCH}"
+    as_owner -C "${INSTALL_DIR}" fetch --quiet origin "${BRANCH}"
+    as_owner -C "${INSTALL_DIR}" checkout --quiet "${BRANCH}"
+    as_owner -C "${INSTALL_DIR}" reset --hard --quiet "origin/${BRANCH}"
 else
-    mkdir -p "$(dirname "${INSTALL_DIR}")"
-    git clone --quiet --branch "${BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"
+    as_owner clone --quiet --branch "${BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"
 fi
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
+
+# Say what actually landed. "Did the patch reach the box?" is otherwise only
+# answerable by reading the script, and a silently-stale checkout looks
+# identical to a fixed one until it fails the same way twice.
+echo "  now at $(as_owner -C "${INSTALL_DIR}" log -1 --format='%h %s')"
 
 log "python environment"
 sudo -u "${SERVICE_USER}" python3 -m venv "${INSTALL_DIR}/.venv"

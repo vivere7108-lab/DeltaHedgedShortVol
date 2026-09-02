@@ -71,6 +71,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Which version of this script is actually running. A stale checkout fails
+# in exactly the same way as an unfixed one, so say the commit up front
+# rather than leaving "did the pull land?" to be inferred from the error.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if commit=$(git -c safe.directory='*' -C "${script_dir}" \
+                log -1 --format='%h %ad %s' --date=short 2>/dev/null); then
+    echo "install-ibc.sh from ${commit}"
+fi
+
 if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
     echo "no such user: ${SERVICE_USER}. Run deploy/bootstrap.sh first." >&2
     exit 1
