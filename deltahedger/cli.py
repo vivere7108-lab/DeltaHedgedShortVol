@@ -5,6 +5,8 @@
     deltahedger live      --config configs/es_default.yaml --dry-run
     deltahedger sweep     --config configs/es_default.yaml --bands 5,10,20
     deltahedger gex       --config configs/es_default.yaml --price 5000
+    deltahedger doctor    --config configs/es_paper.yaml
+    deltahedger report    --config configs/es_paper.yaml
     deltahedger config    --out configs/mine.yaml
 """
 
@@ -96,9 +98,21 @@ def cmd_live(args: argparse.Namespace) -> int:
         )
         return 2
     strategy = run_live(cfg, dry_run=args.dry_run, max_cycles=args.max_cycles)
-    print(f"\n{len(strategy.events)} events, {len(strategy.fills)} fills")
+
+    # What is in memory is only the session since the last reconnect -- the
+    # runner rebuilds the strategy each time it reconnects, because the book
+    # has to come from the broker rather than from a stale process. The
+    # journal is the record that spans the whole walk, so point at it rather
+    # than printing a partial view as if it were the total.
+    print(f"\n{len(strategy.events)} events, {len(strategy.fills)} fills "
+          "since the last connection")
     for event in strategy.events:
-        print(f"  {event.timestamp:%Y-%m-%d %H:%M:%S}  {event.kind:<14} {event.detail}")
+        print(f"  {event.timestamp:%Y-%m-%d %H:%M:%S}  {event.kind:<16} {event.detail}")
+    if cfg.live.journal:
+        print(
+            f"\nThe full record is journalled under {Path(cfg.live.journal_dir).resolve()}.\n"
+            f"  deltahedger report -c {args.config or '<config>'} --show-events"
+        )
     return 0
 
 
@@ -190,6 +204,221 @@ def cmd_gex(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check everything the live runner needs, before it needs it.
+
+    Every failure here is one you would otherwise discover at 09:35 as the
+    strategy quietly standing aside, which is indistinguishable in a log
+    from the market simply reading neutral. Run it once before a walk and
+    once after any gateway restart.
+    """
+    from datetime import datetime
+
+    from .broker.ibkr import (
+        IbkrChainProvider,
+        IbkrConnection,
+        IbkrOpenInterestProvider,
+        _is_paper_account,
+    )
+    from .gex import GexCalculator
+    from .session import SessionClock
+    from .volsurface import VolSurface
+
+    cfg = _load(args)
+    source = cfg.source
+    clock = SessionClock(source)
+    checks: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> bool:
+        checks.append((name, ok, detail))
+        return ok
+
+    try:
+        connection = IbkrConnection(cfg, source)
+        connection.connect()
+    except Exception as exc:  # noqa: BLE001 - this is the report
+        check("connect to IBKR", False, str(exc))
+        _print_checks(checks)
+        print(
+            "\nCannot continue without a connection. Is TWS or IB Gateway running "
+            f"on {cfg.ibkr.host}:{cfg.ibkr.port}, with the API enabled and this "
+            "host in its trusted list?"
+        )
+        return 1
+
+    try:
+        check("connect to IBKR", True, f"{cfg.ibkr.host}:{cfg.ibkr.port}")
+        paper = _is_paper_account(connection.account)
+        check(
+            "account is paper",
+            paper or cfg.ibkr.allow_live_trading,
+            f"{connection.account} ({'paper' if paper else 'LIVE'})",
+        )
+        if not paper:
+            print(
+                "\n!! This is not a paper account. A forward walk belongs on "
+                "one.\n",
+            )
+
+        check("qualified the future", connection.future_contract is not None,
+              getattr(connection.future_contract, "localSymbol", ""))
+        check("qualified the hedge", connection.hedge_contract is not None,
+              getattr(connection.hedge_contract, "localSymbol", ""))
+
+        try:
+            price = connection.future_price()
+            check("future price", True, f"{price:,.2f}")
+        except Exception as exc:  # noqa: BLE001
+            check("future price", False, str(exc))
+            price = None
+
+        now = clock.localize(datetime.now())
+        expiries = clock.candidate_expiries(now, cfg.strategy.max_days_to_expiry)
+        expiry = expiries[0] if expiries else None
+        check(
+            "a 0DTE series is listed", expiry is not None,
+            str(expiry) if expiry else "none today -- the strategy stands aside",
+        )
+
+        if price is None or expiry is None:
+            _print_checks(checks)
+            return 1 if any(not ok for _, ok, _ in checks) else 0
+
+        t = clock.time_to_expiry(now, expiry)
+        chain = IbkrChainProvider(connection, cfg)
+        try:
+            straddle = chain.straddle(price, expiry, t)
+        except Exception as exc:  # noqa: BLE001
+            straddle = None
+            check("ATM straddle quote", False, str(exc))
+        if straddle is not None:
+            check(
+                "ATM straddle quote", True,
+                f"{straddle.strike:g} @ {straddle.price:.2f} (IV {straddle.iv:.3f})",
+            )
+
+        provider = IbkrOpenInterestProvider(connection, cfg)
+        rows = provider.open_interest(now, price, expiry)
+        total = sum(r.call_oi + r.put_oi for r in rows)
+        check(
+            "open interest (generic tick 101)", bool(rows) and total > 0,
+            f"{len(rows)} strikes, {total:,.0f} contracts" if rows
+            else "none returned -- GEX cannot be computed and the strategy "
+                 "will stand aside on every bar",
+        )
+
+        if rows and total > 0:
+            atm_iv = straddle.iv if straddle else cfg.data.default_atm_iv
+            calculator = GexCalculator(
+                cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate
+            )
+            profile = calculator.profile(price, rows, t, atm_iv)
+            print()
+            print(profile.describe())
+            intent = {
+                1: "LONG the ATM straddle and scalp gamma",
+                -1: "SHORT the ATM straddle and collect theta",
+                0: "stand aside",
+            }[profile.direction]
+            print(f"  right now it would: {intent}")
+            print(f"  because: {profile.reason}")
+
+        journal_dir = Path(cfg.live.journal_dir)
+        try:
+            journal_dir.mkdir(parents=True, exist_ok=True)
+            probe = journal_dir / ".write-probe"
+            probe.write_text("ok")
+            probe.unlink()
+            check("journal directory is writable", True, str(journal_dir.resolve()))
+        except OSError as exc:
+            check("journal directory is writable", False, str(exc))
+    finally:
+        connection.disconnect()
+
+    failed = _print_checks(checks)
+    if failed:
+        return 1
+    print(
+        "\nReady. Start the walk with:\n"
+        f"  deltahedger live -c {args.config or '<config>'} --dry-run   "
+        "# decides, places nothing\n"
+        f"  deltahedger live -c {args.config or '<config>'}             "
+        "# routes to the paper account"
+    )
+    return 0
+
+
+def _print_checks(checks: list[tuple[str, bool, str]]) -> int:
+    print()
+    width = max((len(name) for name, _, _ in checks), default=0)
+    failed = 0
+    for name, ok, detail in checks:
+        mark = "ok  " if ok else "FAIL"
+        failed += 0 if ok else 1
+        print(f"  [{mark}] {name.ljust(width)}  {detail}")
+    if failed:
+        print(f"\n{failed} check(s) failed.")
+    return failed
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Summarise a live session from its journal.
+
+    The forward walk's equivalent of the backtest summary, read back off
+    disk so it works on a run that is still going, or one that died.
+    """
+    from datetime import date as date_type
+
+    from .live.journal import read_journal
+
+    cfg = _load(args)
+    directory = Path(args.journal_dir or cfg.live.journal_dir)
+    day = date_type.fromisoformat(args.day) if args.day else None
+
+    bars = read_journal(directory, "bars", day)
+    events = read_journal(directory, "events", day)
+    fills = read_journal(directory, "fills", day)
+
+    if bars.empty and events.empty:
+        print(f"no journal records under {directory.resolve()}")
+        return 1
+
+    print(f"\nLive session journal: {directory.resolve()}")
+    if not bars.empty:
+        span = f"{bars['timestamp'].min():%Y-%m-%d %H:%M} to {bars['timestamp'].max():%Y-%m-%d %H:%M}"
+        sessions = bars["timestamp"].dt.date.nunique()
+        print(f"  {len(bars):,} polls over {sessions} session(s): {span}")
+        print(f"  equity {bars['equity'].iloc[0]:,.0f} -> {bars['equity'].iloc[-1]:,.0f}")
+        held = bars[bars["straddle_contracts"] != 0]
+        if not held.empty:
+            print(
+                f"  held a position on {len(held):,} polls "
+                f"({len(held) / len(bars):.0%}); "
+                f"net delta mean {held['net_delta_units'].mean():+.1f}, "
+                f"max |error| {held['net_delta_units'].abs().max():.1f}"
+            )
+        scored = bars[bars["gex_regime"].notna()]
+        if not scored.empty:
+            split = scored["gex_regime"].value_counts(normalize=True)
+            print(
+                "  GEX regime: "
+                + ", ".join(f"{name} {share:.0%}" for name, share in split.items())
+            )
+    if not events.empty:
+        print("\n  events by kind:")
+        for kind, count in events["kind"].value_counts().items():
+            print(f"    {kind:<16} {count}")
+    if not fills.empty:
+        print(f"\n  {len(fills)} fills, ${fills['fees'].sum():,.2f} in fees")
+
+    if args.show_events and not events.empty:
+        print("\nEvents")
+        for row in events.itertuples(index=False):
+            print(f"  {row.timestamp:%Y-%m-%d %H:%M:%S}  {row.kind:<16} {row.detail}")
+    print()
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     cfg = Config()
     path = Path(args.out)
@@ -269,6 +498,21 @@ def build_parser() -> argparse.ArgumentParser:
     gex.add_argument("--at", help="timestamp to profile at, ISO-8601 (default: now)")
     gex.add_argument("--open-interest", choices=["synthetic", "csv"])
     gex.set_defaults(func=cmd_gex, source=None, bar_size=None)
+
+    doctor = sub.add_parser(
+        "doctor", parents=[common],
+        help="preflight the live path: connection, data, open interest, GEX",
+    )
+    doctor.set_defaults(func=cmd_doctor, source=None, bar_size=None)
+
+    report = sub.add_parser(
+        "report", parents=[common],
+        help="summarise a live session from its journal",
+    )
+    report.add_argument("--journal-dir", help="defaults to live.journal_dir")
+    report.add_argument("--day", help="one session, YYYY-MM-DD (default: all)")
+    report.add_argument("--show-events", action="store_true")
+    report.set_defaults(func=cmd_report, source=None, bar_size=None)
 
     conf = sub.add_parser("config", help="write a default config file")
     conf.add_argument("-o", "--out", default="config.yaml")

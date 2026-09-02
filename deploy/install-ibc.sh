@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# IB Gateway + IBC, headless.
+#
+#   sudo ./deploy/install-ibc.sh
+#
+# Why IBC: IB Gateway is a desktop application that expects a human to type
+# a password and to click through the restart it forces on itself every day.
+# IBC drives both. Without it an unattended walk dies at the first daily
+# restart, and there is nothing in the strategy's log to say why.
+#
+# This script downloads from Interactive Brokers and from the IBC project.
+# Versions move; if a download 404s, check the two URLs below rather than
+# assuming the script is broken.
+
+set -euo pipefail
+
+SERVICE_USER="${SERVICE_USER:-deltahedger}"
+IBC_VERSION="${IBC_VERSION:-3.20.0}"
+IBC_DIR="${IBC_DIR:-/opt/ibc}"
+IBC_CONFIG_DIR="${IBC_CONFIG_DIR:-/etc/ibc}"
+TWS_SETTINGS_DIR="${TWS_SETTINGS_DIR:-/home/${SERVICE_USER}/Jts}"
+
+GATEWAY_URL="${GATEWAY_URL:-https://download2.interactivebrokers.com/installers/ibgateway/stable-standalone/ibgateway-stable-standalone-linux-x64.sh}"
+IBC_URL="${IBC_URL:-https://github.com/IbcAlpha/IBC/releases/download/${IBC_VERSION}/IBCLinux-${IBC_VERSION}.zip}"
+
+log() { printf '\n== %s\n' "$*"; }
+
+if [[ $EUID -ne 0 ]]; then
+    echo "run as root: sudo $0" >&2
+    exit 1
+fi
+
+workdir="$(mktemp -d)"
+trap 'rm -rf "${workdir}"' EXIT
+
+log "IB Gateway"
+if [[ -d /opt/ibgateway ]] || compgen -G "/home/${SERVICE_USER}/Jts/ibgateway" >/dev/null; then
+    echo "already installed; skipping download"
+else
+    curl -fsSL "${GATEWAY_URL}" -o "${workdir}/ibgateway.sh"
+    chmod +x "${workdir}/ibgateway.sh"
+    # -q is the installer's unattended mode; -dir chooses the target.
+    sudo -u "${SERVICE_USER}" "${workdir}/ibgateway.sh" -q \
+        -dir "/home/${SERVICE_USER}/Jts/ibgateway"
+fi
+
+log "IBC ${IBC_VERSION}"
+if [[ -f "${IBC_DIR}/gatewaystart.sh" ]]; then
+    echo "already installed; skipping download"
+else
+    curl -fsSL "${IBC_URL}" -o "${workdir}/ibc.zip"
+    mkdir -p "${IBC_DIR}"
+    unzip -oq "${workdir}/ibc.zip" -d "${IBC_DIR}"
+    chmod -R u+x "${IBC_DIR}"/*.sh "${IBC_DIR}/scripts"/*.sh 2>/dev/null || true
+fi
+
+log "configuration"
+mkdir -p "${IBC_CONFIG_DIR}"
+if [[ -f "${IBC_CONFIG_DIR}/config.ini" ]]; then
+    echo "${IBC_CONFIG_DIR}/config.ini exists; left alone"
+else
+    cp "${IBC_DIR}/config.ini" "${IBC_CONFIG_DIR}/config.ini"
+    # Sane defaults for an unattended paper walk. Credentials are NOT set
+    # here -- you type them in once, below.
+    python3 - "${IBC_CONFIG_DIR}/config.ini" <<'PY'
+import re, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+settings = {
+    # Paper, always. Flip this deliberately or not at all.
+    "TradingMode": "paper",
+    # Accept the API connection from localhost without a dialog.
+    "AcceptIncomingConnectionAction": "accept",
+    "AllowBlindTrading": "yes",
+    # The forced daily restart: let IBC drive it rather than a human.
+    # 02:00 is after the CME close and before the next session.
+    "AutoRestartTime": "02:00 AM",
+    # Do not let the gateway close itself on a schedule; the restart above
+    # is the only interruption we want.
+    "ClosedownAt": "",
+    "ExistingSessionDetectedAction": "primary",
+    # Read-only would block every order, including paper ones.
+    "ReadOnlyApi": "no",
+}
+for key, value in settings.items():
+    pattern = rf"(?m)^{re.escape(key)}=.*$"
+    if re.search(pattern, text):
+        text = re.sub(pattern, f"{key}={value}", text)
+    else:
+        text += f"\n{key}={value}\n"
+path.write_text(text)
+print("applied unattended defaults to", path)
+PY
+fi
+
+# The config holds a password. Treat it accordingly.
+chown root:"${SERVICE_USER}" "${IBC_CONFIG_DIR}/config.ini"
+chmod 640 "${IBC_CONFIG_DIR}/config.ini"
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${TWS_SETTINGS_DIR}"
+
+cat <<EOF
+
+IB Gateway and IBC are installed. Two things left, and both are yours:
+
+  1. Credentials. Edit ${IBC_CONFIG_DIR}/config.ini and set:
+
+         IbLoginId=<your paper username>
+         IbPassword=<your paper password>
+         TradingMode=paper
+
+     The file is already root:${SERVICE_USER} 0640 so it is not world
+     readable. It is NOT in git and must not go there.
+
+  2. Start it:
+
+         sudo systemctl enable --now ibc
+         sudo journalctl -u ibc -f
+
+     First login may trigger a two-factor prompt on your phone. Once the
+     gateway is up, paper API is on port 4002.
+
+Then: deltahedger doctor -c configs/es_paper.yaml
+EOF
