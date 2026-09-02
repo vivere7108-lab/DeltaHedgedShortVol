@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/vivere7108-lab/DeltaHedgedShortVol.git}"
-BRANCH="${BRANCH:-claude/gex-trading-strategy-1mlv0s}"
+BRANCH="${BRANCH:-main}"
 SERVICE_USER="${SERVICE_USER:-deltahedger}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/deltahedger}"
 
