@@ -228,6 +228,11 @@ settings = {
     "ExistingSessionDetectedAction": "primary",
     # Read-only would block every order, including paper ones.
     "ReadOnlyApi": "no",
+    # A first-ever paper login shows this as a modal dialog that blocks
+    # everything behind it, API included -- "no" leaves the account unable
+    # to place any API order until a human clicks through it once. There is
+    # no unattended path here other than accepting it up front.
+    "AcceptNonBrokerageAccountWarning": "yes",
 }
 for key, value in settings.items():
     pattern = rf"(?m)^{re.escape(key)}=.*$"
