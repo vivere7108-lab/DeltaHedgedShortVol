@@ -1,8 +1,13 @@
-# Delta-hedged short volatility on ES futures options.
+# GEX-directed, delta-hedged 0DTE straddles on ES futures options.
 #
-# Defaults as specified: sell the shortest-dated (0DTE) ~20-delta put, hold
-# net delta at 20 +/- 3 delta units by trading MES, and commit 15% of equity
-# as margin buying power.
+# Read dealer gamma exposure off the 0DTE chain, find the gamma flip point,
+# and take the side dealer hedging is forced to supply:
+#
+#   negative GEX -> dealers amplify moves -> LONG the ATM straddle, scalp gamma
+#   positive GEX -> dealers damp moves    -> SHORT the ATM straddle, hold theta
+#   near the flip                         -> stand aside
+#
+# The delta band is a fixed heuristic for the initial forward walk.
 #
 # Generate a fresh copy of this file with:  deltahedger config -o my.yaml
 
@@ -13,46 +18,73 @@ risk_free_rate: 0.04
 hedge:
   # Delta units: 1 unit == 1% of one ES contract.
   #   long 1 ES  = +100      long 1 MES = +10
-  #   short 1 put at -0.20 delta = +20
-  target: 20.0
-  band: 3.0
-  # NOTE: one MES moves net delta by 10 units, so any band narrower than 5
-  # is inert -- the hedger only trades when a whole contract gets it closer
-  # to target, which needs an error above 5. The backtest summary says so
-  # explicitly under "Band feasibility". Widen this to ~10 to make it bind.
+  # The position is a straddle, so the target is delta-neutral.
+  target: 0.0
+  # THE FIXED HEURISTIC THRESHOLD for the paper test. One MES moves net
+  # delta by 10 units, so anything below 5 cannot bind at all (the hedger
+  # only trades when a whole contract lands closer to target). 10 is the
+  # smallest value that both binds and leaves room to land inside the band.
+  #
+  # One number is used in both regimes, which is a simplification: hedging
+  # a long straddle realises a gamma scalp, hedging a short one locks in a
+  # loss against theta. `deltahedger sweep` breaks the result out by regime
+  # so the cost of that simplification is visible before it is fixed.
+  band: 10.0
   min_hedge_contracts: 1
   max_hedge_contracts: 200
   min_seconds_between_hedges: 0.0
   flatten_hedge_on_exit: true
 
+gex:
+  enabled: true
+  # Dealers long the calls, short the puts. This is the standard assumption
+  # and it is the load-bearing one -- open interest does not say who is on
+  # which side. Flip these to test how much of the result depends on it.
+  call_sign: 1.0
+  put_sign: -1.0
+  strike_width_pct: 0.02      # strikes within 2% carry essentially all 0DTE gamma
+  flip_search_pct: 0.03       # hypothetical-spot grid for the flip search
+  flip_search_steps: 61
+  neutral_gex_fraction: 0.05  # |net| below 5% of gross reads as "dealers flat"
+  flip_proximity_pct: 0.0015  # right at the flip, the sign is about to change
+  min_hours_to_expiry: 0.5    # keeps the late-session profile legible
+  refresh_seconds: 900.0      # OI is an end-of-day figure; the profile is
+                              # still recomputed at the live spot every bar
+
 sizing:
-  buying_power_pct: 0.15      # the parameter you asked to be tunable
+  buying_power_pct: 0.15      # margin for a short straddle, debit for a long one
   hedge_margin_reserve_pct: 0.30
-  min_short_contracts: 1
-  max_short_contracts: 50
+  min_straddles: 1
+  max_straddles: 25
   margin_model: span_scan     # span_scan | reg_t | fixed
   span_scan_multiplier: 1.0
   span_vol_scan_pct: 0.30
   span_short_option_minimum: 250.0
 
 strategy:
-  min_days_to_expiry: 0       # 0 == take the 0DTE series when it is listed
-  max_days_to_expiry: 1
-  short_put_delta: 0.20
-  short_put_delta_tolerance: 0.10
-  strike_mode: delta          # delta | moneyness
+  min_days_to_expiry: 0       # 0DTE only, both ends
+  max_days_to_expiry: 0
   entry_time: '09:35'
-  entry_cutoff_time: '11:00'
+  entry_cutoff_time: '14:30'
   close_before_expiry_minutes: 5
-  stop_loss_premium_multiple: 3.0
-  take_profit_pct: null
+  # Short straddle: judged on the premium, which is what runs away.
+  short_stop_loss_premium_multiple: 2.5
+  short_take_profit_pct: 0.60
+  # Long straddle: judged on position P&L (straddle + the gamma the hedge
+  # scalped back), as a fraction of the debit. A premium-decay stop would be
+  # wrong -- a long 0DTE straddle is supposed to bleed on the mark.
+  long_stop_loss_pct: 0.50
+  long_take_profit_pct: 1.00
   daily_loss_limit_pct: 0.05
-  reenter_after_exit: false
+  exit_on_regime_flip: true   # the whole premise: hold the side dealers must take
+  reenter_after_exit: true
+  max_entries_per_session: 3
 
 vol:
   # iv(K) = atm_iv + slope*ln(K/F) + curvature*ln(K/F)^2
   # Negative slope puts more vol on lower strikes, as ES trades. This is an
-  # assumption, and it sets the credit the strategy collects -- see README.
+  # assumption, and it prices both the straddle and the GEX profile -- see
+  # the README's "Known approximations".
   skew_slope: -1.5
   skew_curvature: 0.0
   iv_multiplier: 1.0
@@ -72,6 +104,11 @@ data:
   bar_size: 5 mins
   cache_dir: data_cache
   default_atm_iv: 0.15
+  # Where open interest comes from. `ibkr` is only available in
+  # `deltahedger live`; a backtest needs `csv` for real OI, or `synthetic`
+  # to exercise the machinery.
+  open_interest: synthetic
+  oi_csv_path: null
 
 ibkr:
   host: 127.0.0.1

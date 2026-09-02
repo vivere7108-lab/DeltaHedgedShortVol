@@ -1,0 +1,49 @@
+# The correctness control: a market with no edge of any kind in it.
+#
+#   deltahedger backtest -c configs/es_zero_edge.yaml
+#
+# Two things are switched off relative to es_synthetic.yaml, and both matter:
+#
+#   1. costs, so the result is the strategy's arithmetic rather than its
+#      commission bill;
+#   2. the implied-vol dynamics, so realised vol equals implied vol exactly
+#      and stays there.
+#
+# (2) is the one that is easy to miss. The default generator lets IV wander
+# after entry. A straddle is a large vega position, so that wandering shows
+# up as a systematic P&L which is a property of the generator, not of the
+# strategy -- and it is big enough to swamp what you were trying to measure.
+#
+# With both off, a correctly delta-hedged straddle must break even. It will
+# not do so on any single run: an ATM straddle carries several times the
+# gamma of an out-of-the-money put, so rebalancing once per 5-minute bar
+# leaves a path-dependent residual of a few percent. That residual is
+# discrete-time hedging error, it has mean zero, and it shrinks when you
+# hedge more often. Average across seeds before concluding anything --
+# tests/test_backtest.py::TestCorrectness does exactly that.
+
+risk_source: ES
+starting_equity: 250000.0
+
+hedge:
+  target: 0.0
+  band: 10.0
+
+sizing:
+  buying_power_pct: 0.15
+
+costs:
+  enabled: false
+
+data:
+  source: synthetic
+  open_interest: synthetic
+  bar_size: 5 mins
+  synthetic_days: 20
+  synthetic_start_price: 5000.0
+  synthetic_annual_vol: 0.16
+  synthetic_seed: 7
+  # The control: implied vol is pinned, so realised == implied exactly.
+  synthetic_vol_of_vol: 0.0
+  synthetic_vol_mean_reversion: 0.0
+  synthetic_vol_return_beta: 0.0

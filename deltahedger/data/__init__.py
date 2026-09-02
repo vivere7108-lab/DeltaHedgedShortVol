@@ -2,6 +2,11 @@
 
 from .base import DataSource, MarketBar, ensure_sorted
 from .csv_source import CsvSource
+from .openinterest import (
+    CsvOpenInterest,
+    SyntheticOpenInterest,
+    build_open_interest_provider,
+)
 from .synthetic import SyntheticSource, bar_seconds
 
 __all__ = [
@@ -9,7 +14,10 @@ __all__ = [
     "MarketBar",
     "ensure_sorted",
     "CsvSource",
+    "CsvOpenInterest",
+    "SyntheticOpenInterest",
     "SyntheticSource",
+    "build_open_interest_provider",
     "bar_seconds",
     "build_source",
 ]

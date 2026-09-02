@@ -6,20 +6,32 @@ the band logic is directly testable and identical in backtest and live.
 
 Granularity
 -----------
-The band is ``20 +/- 3`` delta units by default, but one MES contract moves
-net delta by 10 units.  A 6-unit-wide band is therefore narrower than the
-smallest trade available, and no sequence of hedges can guarantee landing
-inside it.  The rule this module implements is:
+The band is ``0 +/- 10`` delta units by default -- hold the straddle
+delta-neutral -- and one MES contract moves net delta by 10 units.  The band
+is therefore exactly one contract wide, which is the narrowest it can be and
+still bind: the rule below only trades when a whole contract lands closer to
+target, so any half-width under 5 fires on precisely the same bars as 5 and
+is an inert parameter.  The rule this module implements is:
 
   * do nothing while net delta is inside the band;
   * once it leaves, trade the whole-contract quantity that lands *closest*
     to the target and stop.
 
-That leaves a residual of up to half a contract (5 units), which may still
-sit outside the band -- so the decision is additionally gated on *strict
-improvement*: a hedge is only issued if it moves net delta closer to the
-target than it already is.  Without that gate, a breach that no whole-
-contract trade can fix would re-fire on every bar and churn commissions.
+That leaves a residual of up to half a contract (5 units) -- so the decision
+is additionally gated on *strict improvement*: a hedge is only issued if it
+moves net delta closer to the target than it already is.  Without that gate,
+a breach that no whole-contract trade can fix would re-fire on every bar and
+churn commissions.
+
+Which of the two bounds actually binds depends on the width.  With the
+shipped ``+/-10`` the band is wider than half a contract, so the band is what
+caps the residual; with a half-width under 5 the contract size caps it
+instead.  Both bounds are asserted in the tests.
+
+The band is target-agnostic and symmetric, which matters here more than it
+looks: the same width is applied whether the book is long gamma or short it,
+so a comparison between the two regimes measures the signal rather than the
+hedger.
 """
 
 from __future__ import annotations

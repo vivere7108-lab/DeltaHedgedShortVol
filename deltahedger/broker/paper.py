@@ -5,9 +5,12 @@ per-contract fees.  Slippage is charged in the direction that hurts -- sells
 fill below the mark, buys above -- so a strategy that trades more pays more,
 which is the property that matters when tuning a hedge band.
 
-This is an optimistic model in one important way: it assumes the order fills
-at all, in full, at that price.  A 0DTE short put during a fast selloff is
-exactly when that assumption is worst.
+This is an optimistic model in two ways worth naming.  It assumes the order
+fills at all, in full, at that price -- and a 0DTE option during a fast move
+is exactly when that assumption is worst.  It also fills both legs of a
+straddle unconditionally, so the backtest never exercises the half-filled
+case the live path is written to survive (see
+``GexStraddleStrategy._open_legs``).
 """
 
 from __future__ import annotations

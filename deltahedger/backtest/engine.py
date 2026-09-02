@@ -1,7 +1,8 @@
 """Backtest driver.
 
-Walks the bar stream, hands each bar to ``ShortVolStrategy`` with a
-simulated execution handler, and turns what comes out into a
+Walks the bar stream, hands each bar to ``GexStraddleStrategy`` with a
+simulated execution handler and an open-interest provider, and turns what
+comes out into a
 ``BacktestResult``.  All the decision logic lives in the strategy; this file
 is a loop and a reporting step, which is deliberate -- it is what makes the
 live runner a drop-in replacement rather than a parallel implementation.
@@ -15,9 +16,10 @@ from zoneinfo import ZoneInfo
 
 from ..broker.paper import SimulatedExecution
 from ..config import Config
-from ..data import build_source
+from ..data import build_open_interest_provider, build_source
 from ..data.base import DataSource, ensure_sorted
-from ..strategy import ShortVolStrategy
+from ..gex import OpenInterestProvider
+from ..strategy import GexStraddleStrategy
 from .results import (
     BacktestResult,
     bars_to_frame,
@@ -42,10 +44,19 @@ def _within_window(cfg: Config, moment: datetime, tz: ZoneInfo) -> bool:
     return True
 
 
-def run_backtest(cfg: Config, source: DataSource | None = None) -> BacktestResult:
+def run_backtest(
+    cfg: Config,
+    source: DataSource | None = None,
+    open_interest: OpenInterestProvider | None = None,
+) -> BacktestResult:
     risk_source = cfg.source
     data = source if source is not None else build_source(cfg, risk_source)
-    strategy = ShortVolStrategy(cfg, risk_source)
+    oi = (
+        open_interest
+        if open_interest is not None
+        else build_open_interest_provider(cfg, risk_source)
+    )
+    strategy = GexStraddleStrategy(cfg, risk_source, open_interest=oi)
     execution = SimulatedExecution(cfg.costs, risk_source)
     tz = strategy.clock.tz
 
@@ -76,6 +87,8 @@ def run_backtest(cfg: Config, source: DataSource | None = None) -> BacktestResul
         option_pnl=strategy.portfolio.option_realised,
         hedge_pnl=strategy.portfolio.hedge_realised,
         fees_paid=strategy.portfolio.fees_paid,
+        regime_pnl=strategy.regime_pnl,
+        regime_trades=strategy.regime_trades,
         target=cfg.hedge.target,
         band_width=2.0 * cfg.hedge.band,
         hedge_tick=risk_source.hedge.tick_size,

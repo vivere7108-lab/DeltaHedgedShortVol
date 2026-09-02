@@ -2,7 +2,13 @@ import math
 
 import pytest
 
-from deltahedger.pricing import MIN_YEARS, Greeks, black76, implied_vol
+from deltahedger.pricing import (
+    MIN_YEARS,
+    Greeks,
+    black76,
+    black76_gamma,
+    implied_vol,
+)
 
 F, R = 5000.0, 0.04
 
@@ -111,3 +117,83 @@ def test_scaled_greeks_multiply_through():
     scaled = Greeks(2.0, -0.2, 0.01, 0.5, -3.0).scaled(quantity=-10, multiplier=50.0)
     assert scaled.delta == pytest.approx(2.0)  # short 10 puts is long delta
     assert scaled.price == pytest.approx(-1000.0)
+
+
+class TestVectorisedGamma:
+    """``black76_gamma`` is a fast path for the GEX flip search, which
+    reprices a whole chain across a grid of hypothetical spot levels on every
+    bar. It must agree with ``black76`` exactly -- a fast path that disagrees
+    with the model the book is marked at would put the regime and the greeks
+    on different surfaces."""
+
+    @pytest.mark.parametrize("strike", [4800.0, 4950.0, 5000.0, 5050.0, 5200.0])
+    @pytest.mark.parametrize("t", [1.0 / 24 / 365, 6.4 / 24 / 365, 1.0 / 365])
+    def test_it_matches_black76_exactly(self, strike, t):
+        expected = black76(5000.0, strike, t, 0.18, 0.04, "P").gamma
+        assert float(black76_gamma(5000.0, strike, t, 0.18, 0.04)) == pytest.approx(
+            expected, rel=1e-12
+        )
+
+    def test_calls_and_puts_share_a_gamma(self):
+        """Put-call parity: the two differ by a forward, which is linear."""
+        call = black76(5000.0, 4980.0, 0.01, 0.18, 0.04, "C").gamma
+        put = black76(5000.0, 4980.0, 0.01, 0.18, 0.04, "P").gamma
+        assert call == pytest.approx(put, rel=1e-12)
+
+    def test_it_broadcasts_over_a_spot_and_strike_grid(self):
+        import numpy as np
+
+        spots = np.array([[4950.0], [5000.0], [5050.0]])
+        strikes = np.array([4975.0, 5000.0, 5025.0])
+        grid = black76_gamma(spots, strikes, 0.01, 0.18, 0.04)
+        assert grid.shape == (3, 3)
+        for i, spot in enumerate(spots[:, 0]):
+            for j, strike in enumerate(strikes):
+                assert grid[i, j] == pytest.approx(
+                    black76(spot, strike, 0.01, 0.18, 0.04, "P").gamma, rel=1e-12
+                )
+
+    def test_it_is_zero_at_the_expiry_floor(self):
+        """Matching ``black76``: at expiry the delta is a step and gamma is a
+        spike of zero width, which is not a number a hedger can act on."""
+        assert float(black76_gamma(5000.0, 5000.0, 0.0, 0.18)) == 0.0
+        assert black76(5000.0, 5000.0, 0.0, 0.18).gamma == 0.0
+
+    def test_it_is_zero_at_the_volatility_floor(self):
+        assert float(black76_gamma(5000.0, 4980.0, 0.01, 0.0)) == 0.0
+
+
+class TestVectorisedVolSurface:
+    """``iv_array`` feeds the same flip search and must agree with ``iv``."""
+
+    def test_it_matches_the_scalar_surface(self):
+        import numpy as np
+
+        from deltahedger.config import VolConfig
+        from deltahedger.volsurface import VolSurface
+
+        surface = VolSurface(VolConfig())
+        strikes = np.array([4800.0, 4950.0, 5000.0, 5100.0])
+        vectorised = surface.iv_array(5000.0, strikes, 0.15)
+        for strike, value in zip(strikes, vectorised):
+            assert value == pytest.approx(surface.iv(5000.0, strike, 0.15), rel=1e-12)
+
+    def test_moving_spot_recentres_the_skew(self):
+        """The flip search moves spot across a grid; the ATM level must stay
+        put while the log-moneyness re-anchors."""
+        from deltahedger.config import VolConfig
+        from deltahedger.volsurface import VolSurface
+
+        surface = VolSurface(VolConfig())
+        assert surface.iv_array(5000.0, 5000.0, 0.15) == pytest.approx(0.15)
+        assert surface.iv_array(5100.0, 5100.0, 0.15) == pytest.approx(0.15)
+
+    def test_the_flat_surface_ignores_the_strike(self):
+        import numpy as np
+
+        from deltahedger.config import VolConfig
+        from deltahedger.volsurface import FlatVolSurface
+
+        surface = FlatVolSurface(VolConfig())
+        values = surface.iv_array(5000.0, np.array([4500.0, 5500.0]), 0.15)
+        assert values[0] == values[1] == pytest.approx(0.15)

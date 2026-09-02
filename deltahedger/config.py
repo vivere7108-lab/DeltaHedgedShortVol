@@ -1,4 +1,4 @@
-"""Configuration for the delta-hedged short-vol system.
+"""Configuration for the GEX-directed delta-hedged straddle system.
 
 One ``Config`` object drives both the backtest and the live runner, so a
 forward test routes the same parameters that were validated historically.
@@ -31,29 +31,42 @@ def _parse_time(value: Any) -> time:
 
 @dataclass
 class HedgeConfig:
-    """The delta band.
+    """The delta band -- a fixed, heuristic threshold.
 
     ``target`` and ``band`` are in delta units (1 unit == 1% of one ES
-    contract), so the default below is the ``20 +/- 3`` the strategy is
-    specified against: hold net delta at +20, and hedge whenever it leaves
-    [17, 23].
+    contract).  The position is an ATM straddle, so the target is 0: hold
+    the book delta-neutral and let the straddle express the gamma view.
 
-    Note on granularity: one MES contract moves net delta by 10 units, which
-    is wider than the 6-unit band.  The hedger therefore trades to the whole
-    contract count that lands *closest* to ``target`` and stops -- it cannot
-    always finish inside the band, and it deliberately does not keep trading
-    trying to.  ``residual_delta`` in the results shows what was left over.
+    ``band`` is deliberately a *fixed heuristic* for the initial forward
+    walk.  One MES contract moves net delta by 10 units, so a band narrower
+    than 5 cannot bind (see ``hedger.py``); 10 is the smallest value that
+    both binds and leaves room for a whole contract to land inside it.  A
+    band that scales with gamma, realised vol or time-of-day is the obvious
+    next step and is deliberately *not* in this version -- the paper test is
+    meant to measure one threshold, not a fitted schedule.
+
+    Note that the band means opposite things in the two regimes.  Long the
+    straddle (negative GEX) each hedge realises a gamma scalp, so a tighter
+    band scalps more and pays more commission; short the straddle (positive
+    GEX) each hedge locks in a loss against theta, so a tighter band bleeds
+    faster.  One number for both is a simplification, and the results
+    report is written to make its cost visible.
     """
 
-    target: float = 20.0
-    band: float = 3.0
+    target: float = 0.0
+    band: float = 10.0
     #: Don't send a hedge smaller than this many contracts.
     min_hedge_contracts: int = 1
     #: Cap on a single hedge order, as a guard against a data glitch.
     max_hedge_contracts: int = 200
     #: Seconds to wait between hedges; suppresses churn on noisy quotes.
     min_seconds_between_hedges: float = 0.0
-    #: Flatten the hedge when the short option position is closed.
+    #: Flatten the hedge in the same order as the straddle, rather than
+    #: leaving it for the band. Against a neutral target this is a smaller
+    #: switch than it looks: an orphaned hedge is a naked directional
+    #: position, so the band closes anything larger than itself on the very
+    #: next pass either way. What the flag actually governs is whether a
+    #: sub-band residual -- under one hedge contract -- is left behind.
     flatten_hedge_on_exit: bool = True
 
     @property
@@ -78,23 +91,24 @@ class HedgeConfig:
 
 @dataclass
 class SizingConfig:
-    """How much of the account to commit as margin."""
+    """How much of the account to commit to the straddle."""
 
-    #: Fraction of portfolio equity to allocate as buying power for margin.
+    #: Fraction of portfolio equity to allocate as buying power. It covers
+    #: margin for a short straddle and the debit for a long one.
     buying_power_pct: float = 0.15
-    #: Hard cap on short option contracts regardless of buying power.
-    max_short_contracts: int = 50
+    #: Hard cap on straddles regardless of buying power.
+    max_straddles: int = 25
     #: Never open a position smaller than this.
-    min_short_contracts: int = 1
+    min_straddles: int = 1
     #: Fraction of the buying-power budget held back for hedge margin and
-    #: variation margin. The short-put sizing sees the remainder.
+    #: variation margin. The straddle sizing sees the remainder.
     hedge_margin_reserve_pct: float = 0.30
     #: Margin model: "span_scan", "reg_t" or "fixed". See ``sizing.py`` --
     #: "span_scan" reproduces CME SPAN methodology and is the right default
     #: for futures options; "reg_t" is the equity-option rule and will
     #: badly overstate futures margin.
     margin_model: str = "span_scan"
-    #: Used when margin_model == "fixed": USD initial margin per short put.
+    #: Used when margin_model == "fixed": USD initial margin per short leg.
     fixed_margin_per_contract: float = 2000.0
     #: span_scan: scale the price scan range derived from the risk source's
     #: outright future margin. 1.0 means "scan the move CME scans".
@@ -116,52 +130,124 @@ class SizingConfig:
             raise ValueError(
                 "sizing.margin_model must be one of 'span_scan', 'reg_t', 'fixed'"
             )
-        if self.max_short_contracts < self.min_short_contracts:
-            raise ValueError("sizing.max_short_contracts < min_short_contracts")
+        if self.max_straddles < self.min_straddles:
+            raise ValueError("sizing.max_straddles < min_straddles")
+
+
+@dataclass
+class GexConfig:
+    """Dealer gamma exposure: the flip point and the regime it implies.
+
+    GEX is a *positioning* estimate, not an observable.  It assumes the
+    dealer is on the other side of the public's option book -- long the
+    calls, short the puts -- and asks what that inventory forces them to do
+    when spot moves.  Short gamma (negative GEX) means dealers hedge with
+    the move and amplify it; long gamma (positive GEX) means they hedge
+    against it and suppress it.  The strategy trades alongside that
+    mechanic: buy the straddle when dealers must chase, sell it when they
+    must dampen.
+
+    The sign convention is a modelling choice, so it is a parameter rather
+    than a constant.  ``call_sign``/``put_sign`` of ``+1``/``-1`` is the
+    standard assumption and what every published GEX print uses.
+    """
+
+    enabled: bool = True
+    #: Dealer inventory signs applied to open interest at each strike.
+    call_sign: float = 1.0
+    put_sign: float = -1.0
+    #: Strikes included in the profile, as +/- a fraction of spot. Real 0DTE
+    #: open interest outside ~2% carries almost no gamma.
+    strike_width_pct: float = 0.02
+    #: Hypothetical-spot grid for the flip search: half-width and resolution.
+    flip_search_pct: float = 0.03
+    flip_search_steps: int = 61
+    #: |net GEX| below this fraction of gross GEX reads as no clear regime.
+    neutral_gex_fraction: float = 0.05
+    #: Spot within this fraction of the flip point reads as no clear regime:
+    #: right at the flip the sign is about to change and the classification
+    #: is not information.
+    flip_proximity_pct: float = 0.0015
+    #: Floor on the time-to-expiry used for the profile, in hours. 0DTE
+    #: gamma collapses to a zero-width spike at the bell, which would make
+    #: every late-session profile read as neutral; the floor keeps the
+    #: shape of the surface visible. It affects classification only, never
+    #: the greeks the hedger acts on.
+    min_hours_to_expiry: float = 0.5
+    #: How often to re-read open interest, in seconds. OI is an end-of-day
+    #: figure intraday, so re-reading it every bar buys nothing; the profile
+    #: itself is recomputed at the live spot on every bar regardless.
+    refresh_seconds: float = 900.0
+
+    def validate(self) -> None:
+        if self.strike_width_pct <= 0.0:
+            raise ValueError("gex.strike_width_pct must be > 0")
+        if self.flip_search_steps < 3:
+            raise ValueError("gex.flip_search_steps must be >= 3")
+        if self.flip_search_pct <= 0.0:
+            raise ValueError("gex.flip_search_pct must be > 0")
+        if not 0.0 <= self.neutral_gex_fraction < 1.0:
+            raise ValueError("gex.neutral_gex_fraction must be in [0, 1)")
+        if self.min_hours_to_expiry < 0.0:
+            raise ValueError("gex.min_hours_to_expiry must be >= 0")
 
 
 @dataclass
 class StrategyConfig:
-    """Entry, strike selection and exit rules for the short put."""
+    """Entry, strike selection and exit rules for the GEX straddle.
 
-    #: Prefer the shortest-dated expiry; 0 means "0DTE if one is listed".
+    The position is always an at-the-money straddle on the 0DTE series.
+    Its *direction* is not a parameter -- it is whatever the GEX regime
+    says: long when dealers are short gamma, short when they are long it.
+    """
+
+    #: 0DTE only. Both default to 0, which means "today's expiry or
+    #: nothing"; the strategy stands aside on a day with no daily series
+    #: rather than reaching out the curve.
     min_days_to_expiry: int = 0
-    max_days_to_expiry: int = 1
-    #: Target absolute delta of the put we sell (0.20 == the 20-delta put).
-    short_put_delta: float = 0.20
-    #: Accept a strike whose delta is within this of the target.
-    short_put_delta_tolerance: float = 0.10
-    #: Alternative selection: fixed % out of the money. Used when
-    #: strike_mode == "moneyness".
-    strike_mode: str = "delta"  # "delta" | "moneyness"
-    short_put_otm_pct: float = 0.01
+    max_days_to_expiry: int = 0
     #: Earliest time of day to open a position (exchange local time).
     entry_time: time = time(9, 35)
     #: Latest time of day to open a position.
-    entry_cutoff_time: time = time(11, 0)
-    #: Close the short option this many minutes before it expires.
+    entry_cutoff_time: time = time(14, 30)
+    #: Close the straddle this many minutes before it expires.
     close_before_expiry_minutes: int = 5
-    #: Buy the put back if its price reaches this multiple of the entry
-    #: credit. ``None`` disables the stop.
-    stop_loss_premium_multiple: float | None = 3.0
-    #: Buy the put back once this fraction of the credit has been captured.
-    #: ``None`` holds to the timed exit.
-    take_profit_pct: float | None = None
+    #: SHORT straddle (positive GEX): buy it back if the premium reaches
+    #: this multiple of the entry credit. ``None`` disables the stop.
+    short_stop_loss_premium_multiple: float | None = 2.5
+    #: SHORT straddle: buy it back once this fraction of the credit has
+    #: decayed away. ``None`` holds to the timed exit.
+    short_take_profit_pct: float | None = 0.60
+    #: LONG straddle (negative GEX): exits are measured on *position* P&L --
+    #: the straddle mark plus the gamma scalped by the hedge -- as a
+    #: fraction of the debit paid. A premium-decay stop would be wrong here:
+    #: a long 0DTE straddle is supposed to bleed on the mark and make it
+    #: back on the hedge.
+    long_stop_loss_pct: float | None = 0.50
+    long_take_profit_pct: float | None = 1.00
     #: Stop trading for the day after a loss this large, as a fraction of
-    #: starting equity. ``None`` disables.
+    #: the session's opening equity. ``None`` disables.
     daily_loss_limit_pct: float | None = 0.05
-    #: Allow more than one entry per session.
-    reenter_after_exit: bool = False
+    #: Close the position when the GEX regime flips against it. This is the
+    #: whole premise of the strategy -- we hold the side dealers are forced
+    #: to take -- so it defaults on.
+    exit_on_regime_flip: bool = True
+    #: Allow another entry after an exit, so a regime flip can be traded
+    #: rather than just closed out.
+    reenter_after_exit: bool = True
+    #: Ceiling on entries per session, so a spot level oscillating across
+    #: the flip point cannot churn the book all day.
+    max_entries_per_session: int = 3
 
     def validate(self) -> None:
-        if self.strike_mode not in ("delta", "moneyness"):
-            raise ValueError("strategy.strike_mode must be 'delta' or 'moneyness'")
-        if not 0.0 < self.short_put_delta < 1.0:
-            raise ValueError("strategy.short_put_delta must be in (0, 1)")
+        if self.min_days_to_expiry < 0:
+            raise ValueError("strategy.min_days_to_expiry must be >= 0")
         if self.min_days_to_expiry > self.max_days_to_expiry:
             raise ValueError("strategy.min_days_to_expiry > max_days_to_expiry")
         if self.entry_cutoff_time < self.entry_time:
             raise ValueError("strategy.entry_cutoff_time is before entry_time")
+        if self.max_entries_per_session < 1:
+            raise ValueError("strategy.max_entries_per_session must be >= 1")
 
 
 @dataclass
@@ -220,8 +306,42 @@ class DataConfig:
     synthetic_annual_vol: float = 0.16
     synthetic_annual_drift: float = 0.0
     synthetic_seed: int = 7
+    #: Dynamics of the generated implied-vol series. The defaults make IV
+    #: wander and lean against returns, which is realistic and is also why a
+    #: generated run is NOT zero-edge for a straddle: entry vol is marked
+    #: away afterwards, and that vega P&L has nothing to do with the
+    #: strategy. Set all three to 0 for a genuinely neutral control -- see
+    #: configs/es_zero_edge.yaml.
+    synthetic_vol_of_vol: float = 2.0
+    synthetic_vol_mean_reversion: float = 0.08
+    synthetic_vol_return_beta: float = -8.0
     #: Use this ATM IV when the source has no IV column.
     default_atm_iv: float = 0.15
+
+    # -- open interest, which is what GEX is computed from ---------------
+    #: "synthetic" | "csv" | "ibkr". The bar source and the open-interest
+    #: source are separate on purpose: real ES bars with modelled OI is a
+    #: legitimate study, and pretending otherwise would hide which half of
+    #: the result is assumed.
+    open_interest: str = "synthetic"
+    #: CSV open interest: a file with date,strike,call_oi,put_oi.
+    oi_csv_path: str | None = None
+    #: Synthetic OI: total contracts spread across the surface.
+    oi_total_contracts: float = 40_000.0
+    #: Synthetic OI: Gaussian width of the strike distribution, as a
+    #: fraction of the anchor price.
+    oi_width_pct: float = 0.010
+    #: Synthetic OI: where call and put mass sits relative to the anchor.
+    #: Calls above and puts below is the shape a real index chain has, and
+    #: it is what puts the gamma flip point between the two.
+    oi_call_center_pct: float = 0.005
+    oi_put_center_pct: float = -0.007
+    #: Synthetic OI: mean share of open interest that is calls, and the
+    #: day-to-day swing around it. The swing is what makes the generated
+    #: sessions span both GEX regimes instead of only one.
+    oi_call_share_mean: float = 0.50
+    oi_call_share_swing: float = 0.16
+    oi_seed: int = 11
 
 
 @dataclass
@@ -258,6 +378,7 @@ class Config:
     risk_free_rate: float = 0.04
     hedge: HedgeConfig = field(default_factory=HedgeConfig)
     sizing: SizingConfig = field(default_factory=SizingConfig)
+    gex: GexConfig = field(default_factory=GexConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     vol: VolConfig = field(default_factory=VolConfig)
     costs: CostsConfig = field(default_factory=CostsConfig)
@@ -280,7 +401,7 @@ class Config:
         if self.starting_equity <= 0:
             raise ValueError("starting_equity must be positive")
         get_risk_source(self.risk_source)  # raises on an unknown symbol
-        for section in (self.hedge, self.sizing, self.strategy):
+        for section in (self.hedge, self.sizing, self.gex, self.strategy):
             section.validate()
 
     # -- serialisation -------------------------------------------------
@@ -307,6 +428,7 @@ class Config:
             target = {
                 "hedge": HedgeConfig,
                 "sizing": SizingConfig,
+                "gex": GexConfig,
                 "strategy": StrategyConfig,
                 "vol": VolConfig,
                 "costs": CostsConfig,

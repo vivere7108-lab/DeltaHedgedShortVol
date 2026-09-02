@@ -6,9 +6,21 @@ market model: results from synthetic data say the machinery works, never
 that the strategy works.
 
 The price path is GBM.  Implied vol is a mean-reverting series with a
-negative return correlation, because short volatility with a flat vol
-assumption would hide the exact risk the strategy carries -- vol rising as
-the market falls.
+negative return correlation, because trading volatility against a flat vol
+assumption would hide the exact risk the position carries -- vol moving
+while the book is long or short vega.
+
+That realism has a consequence worth stating loudly, because it changes how
+a generated result should be read.  Instantaneously the generator draws
+returns at the vol it reports as implied, so it has no *gamma* edge.  Over a
+holding period it is a different matter: implied vol wanders after entry, so
+a straddle -- which is a large vega position, unlike the single
+out-of-the-money put this system used to trade -- picks up a systematic
+vega P&L that has nothing to do with the strategy.  Set
+``synthetic_vol_of_vol``, ``synthetic_vol_mean_reversion`` and
+``synthetic_vol_return_beta`` to zero for a genuinely neutral control; that
+is what the correctness tests use, and what ``configs/es_zero_edge.yaml``
+ships.
 """
 
 from __future__ import annotations
@@ -46,17 +58,27 @@ class SyntheticSource:
         cfg: DataConfig,
         source: RiskSource,
         start: date | None = None,
-        vol_of_vol: float = 2.0,
-        vol_mean_reversion: float = 0.08,
-        vol_return_beta: float = -8.0,
+        vol_of_vol: float | None = None,
+        vol_mean_reversion: float | None = None,
+        vol_return_beta: float | None = None,
     ):
         self.cfg = cfg
         self.source = source
         self.tz = ZoneInfo(source.timezone)
         self.start = start or date(2025, 1, 2)
-        self.vol_of_vol = vol_of_vol
-        self.vol_mean_reversion = vol_mean_reversion
-        self.vol_return_beta = vol_return_beta
+        # Config supplies these; the arguments stay for tests that want to
+        # vary them without building a whole Config.
+        self.vol_of_vol = (
+            cfg.synthetic_vol_of_vol if vol_of_vol is None else vol_of_vol
+        )
+        self.vol_mean_reversion = (
+            cfg.synthetic_vol_mean_reversion
+            if vol_mean_reversion is None
+            else vol_mean_reversion
+        )
+        self.vol_return_beta = (
+            cfg.synthetic_vol_return_beta if vol_return_beta is None else vol_return_beta
+        )
 
     def bars(self) -> Iterator[MarketBar]:
         rng = np.random.default_rng(self.cfg.synthetic_seed)

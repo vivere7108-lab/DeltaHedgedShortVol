@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 from scipy.stats import norm
 
 #: Floor on time-to-expiry, in years. ~30 seconds. Below this we use the
@@ -26,6 +27,8 @@ MIN_YEARS = 30.0 / (365.0 * 24.0 * 60.0 * 60.0)
 MIN_VOL = 1e-6
 
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
+
+_SQRT_TWO_PI = math.sqrt(2.0 * math.pi)
 
 
 @dataclass(frozen=True)
@@ -180,3 +183,39 @@ def implied_vol(
 def year_fraction(seconds: float) -> float:
     """Convert a duration in seconds to a year fraction, floored at MIN_YEARS."""
     return max(seconds / SECONDS_PER_YEAR, 0.0)
+
+
+def black76_gamma(
+    f: "float | np.ndarray",
+    k: "float | np.ndarray",
+    t: float,
+    sigma: "float | np.ndarray",
+    r: float = 0.0,
+) -> "np.ndarray":
+    """Gamma alone, vectorised over ``f``, ``k`` and ``sigma``.
+
+    Gamma is identical for a call and a put on the same strike and expiry
+    (put-call parity differs by a forward, which is linear in F), so the GEX
+    profile needs one number per strike rather than two option prices.  This
+    exists because a gamma-flip search reprices a whole chain across a grid
+    of hypothetical spot levels on every bar -- doing that through
+    ``black76`` and ``scipy.stats.norm`` is two orders of magnitude slower
+    than it needs to be.
+
+    Returns 0 where ``t`` or ``sigma`` is below the model floors, matching
+    ``_expiry_limit``: at expiry the delta is a step and gamma is a spike of
+    zero width, which is not a number a hedger can act on.
+    """
+    f_arr = np.asarray(f, dtype=float)
+    k_arr = np.asarray(k, dtype=float)
+    sigma_arr = np.asarray(sigma, dtype=float)
+    if t <= MIN_YEARS:
+        return np.zeros(np.broadcast(f_arr, k_arr, sigma_arr).shape)
+
+    safe_sigma = np.maximum(sigma_arr, MIN_VOL)
+    sqrt_t = math.sqrt(t)
+    vol_sqrt_t = safe_sigma * sqrt_t
+    d1 = (np.log(f_arr / k_arr) + 0.5 * safe_sigma * safe_sigma * t) / vol_sqrt_t
+    pdf = np.exp(-0.5 * d1 * d1) / _SQRT_TWO_PI
+    gamma = math.exp(-r * t) * pdf / (f_arr * vol_sqrt_t)
+    return np.where(sigma_arr <= MIN_VOL, 0.0, gamma)

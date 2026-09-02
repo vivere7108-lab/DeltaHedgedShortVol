@@ -3,14 +3,22 @@ from datetime import time
 import pytest
 import yaml
 
-from deltahedger.config import Config, HedgeConfig, SizingConfig, StrategyConfig
+from deltahedger.config import (
+    Config,
+    GexConfig,
+    HedgeConfig,
+    SizingConfig,
+    StrategyConfig,
+)
 
 
 class TestDefaults:
-    def test_the_band_is_twenty_plus_or_minus_three(self):
+    def test_the_band_is_neutral_plus_or_minus_ten(self):
+        """The fixed heuristic threshold for the forward walk: hold the
+        straddle delta-neutral, one whole MES contract either side."""
         hedge = Config().hedge
-        assert hedge.target == 20.0 and hedge.band == 3.0
-        assert (hedge.lower, hedge.upper) == (17.0, 23.0)
+        assert hedge.target == 0.0 and hedge.band == 10.0
+        assert (hedge.lower, hedge.upper) == (-10.0, 10.0)
 
     def test_buying_power_defaults_to_fifteen_percent(self):
         assert Config().sizing.buying_power_pct == 0.15
@@ -18,11 +26,22 @@ class TestDefaults:
     def test_the_default_risk_source_is_es(self):
         assert Config().source.name == "ES"
 
-    def test_zero_dte_is_the_default_target(self):
-        assert Config().strategy.min_days_to_expiry == 0
+    def test_zero_dte_at_both_ends_is_the_default(self):
+        strategy = Config().strategy
+        assert strategy.min_days_to_expiry == 0
+        assert strategy.max_days_to_expiry == 0
+
+    def test_gex_is_on_with_the_standard_dealer_convention(self):
+        gex = Config().gex
+        assert gex.enabled
+        assert (gex.call_sign, gex.put_sign) == (1.0, -1.0)
+
+    def test_open_interest_defaults_to_the_generated_surface(self):
+        """A backtest must never silently reach for a live connection."""
+        assert Config().data.open_interest == "synthetic"
 
     @pytest.mark.parametrize("value,expected", [
-        (17.0, True), (20.0, True), (23.0, True), (16.9, False), (23.1, False),
+        (-10.0, True), (0.0, True), (10.0, True), (-10.1, False), (10.1, False),
     ])
     def test_in_band(self, value, expected):
         assert Config().hedge.in_band(value) is expected
@@ -47,13 +66,13 @@ class TestSerialisation:
         path.write_text(yaml.safe_dump({"hedge": {"band": 8.0}}))
         cfg = Config.from_yaml(path)
         assert cfg.hedge.band == 8.0
-        assert cfg.hedge.target == 20.0
+        assert cfg.hedge.target == 0.0
         assert cfg.sizing.buying_power_pct == 0.15
 
     def test_an_empty_file_gives_the_defaults(self, tmp_path):
         path = tmp_path / "empty.yaml"
         path.write_text("")
-        assert Config.from_yaml(path).hedge.target == 20.0
+        assert Config.from_yaml(path).hedge.band == 10.0
 
     def test_a_typo_is_rejected_rather_than_ignored(self, tmp_path):
         path = tmp_path / "typo.yaml"
@@ -92,9 +111,13 @@ class TestValidation:
         with pytest.raises(ValueError, match="margin_model"):
             SizingConfig(margin_model="vibes").validate()
 
-    def test_rejects_an_out_of_range_delta_target(self):
-        with pytest.raises(ValueError, match="short_put_delta"):
-            StrategyConfig(short_put_delta=1.5).validate()
+    def test_rejects_an_inverted_dte_window(self):
+        with pytest.raises(ValueError, match="min_days_to_expiry"):
+            StrategyConfig(min_days_to_expiry=2, max_days_to_expiry=0).validate()
+
+    def test_rejects_a_session_entry_cap_below_one(self):
+        with pytest.raises(ValueError, match="max_entries_per_session"):
+            StrategyConfig(max_entries_per_session=0).validate()
 
     def test_rejects_an_entry_window_that_closes_before_it_opens(self):
         with pytest.raises(ValueError, match="entry_cutoff_time"):
@@ -105,5 +128,28 @@ class TestValidation:
             Config(starting_equity=-1.0)
 
     def test_rejects_inverted_contract_limits(self):
-        with pytest.raises(ValueError, match="max_short_contracts"):
-            SizingConfig(min_short_contracts=5, max_short_contracts=2).validate()
+        with pytest.raises(ValueError, match="max_straddles"):
+            SizingConfig(min_straddles=5, max_straddles=2).validate()
+
+    @pytest.mark.parametrize("kwargs,message", [
+        ({"strike_width_pct": 0.0}, "strike_width_pct"),
+        ({"flip_search_steps": 2}, "flip_search_steps"),
+        ({"flip_search_pct": -0.1}, "flip_search_pct"),
+        ({"neutral_gex_fraction": 1.0}, "neutral_gex_fraction"),
+        ({"min_hours_to_expiry": -1.0}, "min_hours_to_expiry"),
+    ])
+    def test_rejects_impossible_gex_settings(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            GexConfig(**kwargs).validate()
+
+    def test_a_gex_section_round_trips_through_yaml(self, tmp_path):
+        path = tmp_path / "g.yaml"
+        path.write_text(yaml.safe_dump({"gex": {"call_sign": -1.0, "put_sign": 1.0}}))
+        cfg = Config.from_yaml(path)
+        assert (cfg.gex.call_sign, cfg.gex.put_sign) == (-1.0, 1.0)
+
+    def test_a_gex_typo_is_rejected_rather_than_ignored(self, tmp_path):
+        path = tmp_path / "g.yaml"
+        path.write_text(yaml.safe_dump({"gex": {"call_signn": 1.0}}))
+        with pytest.raises(ValueError, match="call_signn"):
+            Config.from_yaml(path)

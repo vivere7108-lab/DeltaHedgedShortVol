@@ -1,8 +1,8 @@
 """Live / forward-testing runner.
 
 Polls IBKR, synthesises a ``MarketBar`` from the current market, and hands
-it to the same ``ShortVolStrategy`` the backtest drives.  The strategy does
-not know which runner it is under; that is what makes a forward test
+it to the same ``GexStraddleStrategy`` the backtest drives.  The strategy
+does not know which runner it is under; that is what makes a forward test
 evidence about the validated logic rather than about a second
 implementation of it.
 
@@ -13,21 +13,30 @@ Differences from the backtest that are worth being explicit about:
   * fills come from the exchange and can be partial or missing entirely, so
     the position is reconciled against IBKR on every cycle;
   * the ATM implied vol comes from the live chain rather than a historical
-    series.
+    series;
+  * open interest is the exchange's, read through
+    ``IbkrOpenInterestProvider``, rather than generated.  A forward test
+    with a generated OI surface would be measuring the generator, so the
+    live path refuses to fall back to one.
 """
 
 from __future__ import annotations
 
 import logging
 import signal
-import time
 from datetime import datetime
 
-from ..broker.ibkr import IbkrChainProvider, IbkrConnection, IbkrExecution, WhatIfMarginModel
+from ..broker.ibkr import (
+    IbkrChainProvider,
+    IbkrConnection,
+    IbkrExecution,
+    IbkrOpenInterestProvider,
+    WhatIfMarginModel,
+)
 from ..config import Config
 from ..data.base import MarketBar
 from ..sizing import build_margin_model
-from ..strategy import ShortVolStrategy
+from ..strategy import GexStraddleStrategy
 
 log = logging.getLogger(__name__)
 
@@ -38,14 +47,14 @@ class LiveRunner:
         self.dry_run = dry_run
         self.source = cfg.source
         self.connection = IbkrConnection(cfg, self.source)
-        self.strategy: ShortVolStrategy | None = None
+        self.strategy: GexStraddleStrategy | None = None
         self._stop = False
 
     def request_stop(self, *_: object) -> None:
         log.info("stop requested; finishing the current cycle")
         self._stop = True
 
-    def run(self, max_cycles: int | None = None) -> ShortVolStrategy:
+    def run(self, max_cycles: int | None = None) -> GexStraddleStrategy:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
@@ -58,7 +67,12 @@ class LiveRunner:
                 if self.cfg.ibkr.use_whatif_margin
                 else fallback
             )
-            self.strategy = ShortVolStrategy(self.cfg, self.source, margin_model)
+            self.strategy = GexStraddleStrategy(
+                self.cfg,
+                self.source,
+                margin_model,
+                open_interest=IbkrOpenInterestProvider(conn, self.cfg),
+            )
             execution = IbkrExecution(conn, self.cfg, dry_run=self.dry_run)
             chain_provider = IbkrChainProvider(conn, self.cfg)
             self._reconcile(conn)
@@ -105,33 +119,40 @@ class LiveRunner:
             atm_iv=atm_iv,
         )
         state = self.strategy.on_bar(bar, execution)
+        gex = (
+            f"{state.gex_total / 1e6:+,.0f}M" if state.gex_total is not None else "n/a"
+        )
+        flip = f"{state.gex_flip:,.1f}" if state.gex_flip is not None else "-"
         log.info(
-            "%s F=%.2f IV=%.3f | opt=%d @ %s hedge=%+d | net delta %+.1f "
-            "(target %.1f) | equity %s",
+            "%s F=%.2f IV=%.3f | GEX %s (%s, flip %s) | straddle=%+d @ %s "
+            "hedge=%+d | net delta %+.1f (target %.1f) | equity %s",
             now.strftime("%H:%M:%S"), state.future, state.atm_iv,
-            state.option_contracts,
-            f"{state.strike:g}P" if state.strike else "-",
+            gex, state.gex_regime, flip,
+            state.straddle_contracts,
+            f"{state.strike:g}" if state.strike else "-",
             state.hedge_contracts, state.net_delta_units, self.cfg.hedge.target,
             f"${state.equity:,.0f}",
         )
 
     def _atm_iv(self, conn, chain_provider, future_price: float, now: datetime) -> float:
-        """Read ATM implied vol off the live chain."""
-        expiries = self.strategy.clock.candidate_expiries(
-            now, self.cfg.strategy.max_days_to_expiry
-        )
-        if not expiries:
+        """Read ATM implied vol off the live chain.
+
+        Averaged across the call and the put at the money rather than taken
+        from one right: at 0DTE a single stale leg moves the level enough to
+        change what the whole book is marked at.
+        """
+        expiry = self.strategy._todays_expiry(now)
+        if expiry is None:
             return self.cfg.data.default_atm_iv
-        t = self.strategy.clock.time_to_expiry(now, expiries[0])
+        t = self.strategy.clock.time_to_expiry(now, expiry)
         try:
-            quotes = chain_provider.put_chain(future_price, expiries[0], t, width_pct=0.005)
+            straddle = chain_provider.straddle(future_price, expiry, t)
         except Exception as exc:  # noqa: BLE001
             log.warning("could not read ATM vol from the chain (%s); using default", exc)
             return self.cfg.data.default_atm_iv
-        if not quotes:
+        if straddle is None:
             return self.cfg.data.default_atm_iv
-        atm = min(quotes, key=lambda q: abs(q.strike - future_price))
-        return atm.iv
+        return straddle.iv
 
     def _reconcile(self, conn) -> None:
         """Adopt whatever positions IBKR already reports for our contracts.
@@ -161,7 +182,9 @@ class LiveRunner:
                 log.error(
                     "an existing %s option position is open (%+d %s %g%s). This "
                     "runner will not adopt option legs it did not open -- close it "
-                    "or restart once flat.",
+                    "or restart once flat. Adopting a half-known straddle is how a "
+                    "book ends up long gamma while the strategy believes it is "
+                    "short it.",
                     contract.symbol, int(position.position),
                     contract.lastTradeDateOrContractMonth, contract.strike, contract.right,
                 )
