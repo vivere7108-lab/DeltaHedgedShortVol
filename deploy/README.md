@@ -146,6 +146,35 @@ namei -l /opt/ibc/gatewaystart.sh        # every directory on the path
 mount | grep -E ' /tmp | /home '         # noexec?
 ```
 
+### If nothing is listening on port 4002
+
+`doctor` now tells you which case you are in, because "connection refused"
+does not distinguish a gateway still starting from one that died at launch:
+
+```bash
+systemctl status ibc --no-pager -l
+journalctl -u ibc -n 80 --no-pager
+```
+
+- **Service active, port closed.** The gateway takes 30–90 seconds to
+  launch, log in and open the API port — longer if two-factor is waiting on
+  your phone. Watch `journalctl -u ibc -f` and re-run `doctor`.
+- **Service failed or inactive.** Usually credentials not set in
+  `/etc/ibc/config.ini`, or an unapproved 2FA prompt on first login.
+- **Version mismatch.** IBC locates the gateway at
+  `$TWS_PATH/ibgateway/$TWS_MAJOR_VRSN/jars`. That version is *detected* by
+  `install-ibc.sh` and written to `/etc/ibc/ibc.env`; re-run the installer
+  after a gateway upgrade. Check what it found:
+
+  ```bash
+  cat /etc/ibc/ibc.env
+  ls /home/deltahedger/Jts/ibgateway/        # should be a version number
+  ```
+
+  If that lists `jars` rather than a version number like `1030`, the install
+  is in the flat layout IBC cannot use — re-run `install-ibc.sh`, which
+  moves it aside and reinstalls correctly.
+
 ## 3. Preflight — the important step
 
 ```bash

@@ -239,11 +239,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - this is the report
         check("connect to IBKR", False, str(exc))
         _print_checks(checks)
-        print(
-            "\nCannot continue without a connection. Is TWS or IB Gateway running "
-            f"on {cfg.ibkr.host}:{cfg.ibkr.port}, with the API enabled and this "
-            "host in its trusted list?"
-        )
+        print(_connection_help(cfg))
         return 1
 
     try:
@@ -346,6 +342,88 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "# routes to the paper account"
     )
     return 0
+
+
+def _connection_help(cfg) -> str:
+    """What to look at when nothing is listening on the API port.
+
+    "Connection refused" only says the gateway is not there. It does not
+    distinguish a gateway still starting from one that died at launch, and
+    guessing between those wastes the most time -- so look, and say.
+    """
+    import shutil
+    import socket
+    import subprocess
+
+    lines = [
+        f"\nNothing is listening on {cfg.ibkr.host}:{cfg.ibkr.port}.",
+    ]
+
+    status = None
+    if shutil.which("systemctl"):
+        probe = subprocess.run(
+            ["systemctl", "is-active", "ibc"],
+            capture_output=True, text=True, check=False,
+        )
+        status = probe.stdout.strip() or probe.stderr.strip()
+
+    if status == "active":
+        lines += [
+            "",
+            "The ibc service IS running, so the gateway is probably still",
+            "starting -- it takes 30-90s to launch, log in and open the API",
+            "port, and longer if two-factor is waiting on your phone. Watch it:",
+            "",
+            "  journalctl -u ibc -f",
+            "",
+            "then re-run this. If it never opens the port, the login is the",
+            "usual reason: check IbLoginId/IbPassword in /etc/ibc/config.ini,",
+            "and approve any 2FA prompt.",
+        ]
+    elif status in {"inactive", "failed", "activating"}:
+        lines += [
+            "",
+            f"The ibc service is {status} -- the gateway is not up. Look at why:",
+            "",
+            "  systemctl status ibc --no-pager -l",
+            "  journalctl -u ibc -n 80 --no-pager",
+            "",
+            "Common causes, in the order they bite:",
+            "  * credentials not set in /etc/ibc/config.ini",
+            "  * TWS_MAJOR_VRSN in /etc/ibc/ibc.env not matching the installed",
+            "    gateway -- re-run deploy/install-ibc.sh, which detects it",
+            "  * two-factor never approved on first login",
+        ]
+    else:
+        lines += [
+            "",
+            "Is TWS or IB Gateway running, with the API enabled and this host",
+            "in its trusted list? Under the deploy scripts that is the ibc",
+            "service:",
+            "",
+            "  systemctl status ibc --no-pager -l",
+            "  journalctl -u ibc -n 80 --no-pager",
+        ]
+
+    # A port open on a different interface is a config mismatch, not a dead
+    # gateway, and the fix is entirely different.
+    for candidate in (4001, 4002, 7496, 7497):
+        if candidate == cfg.ibkr.port:
+            continue
+        probe = socket.socket()
+        probe.settimeout(0.4)
+        try:
+            if probe.connect_ex((cfg.ibkr.host, candidate)) == 0:
+                lines += [
+                    "",
+                    f"NOTE: something IS listening on port {candidate}. "
+                    f"Your config says {cfg.ibkr.port}.",
+                    "  4002 = Gateway paper, 4001 = Gateway live,",
+                    "  7497 = TWS paper,     7496 = TWS live.",
+                ]
+        finally:
+            probe.close()
+    return "\n".join(lines)
 
 
 def _print_checks(checks: list[tuple[str, bool, str]]) -> int:
