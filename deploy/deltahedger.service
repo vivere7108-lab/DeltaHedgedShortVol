@@ -1,0 +1,45 @@
+[Unit]
+Description=DeltaHedgedShortVol -- GEX-directed 0DTE straddle forward walk
+After=network-online.target ibc.service
+Wants=network-online.target
+# Ordered after ibc but deliberately not Requires= or BindsTo=: the runner
+# is built to survive the gateway going away and coming back, and binding
+# them would restart the strategy on every daily gateway restart -- throwing
+# away the session for the one event it already handles.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_USER@
+WorkingDirectory=@INSTALL_DIR@
+
+# DELTAHEDGER_ARGS lives here so switching out of --dry-run is an edit to
+# one file plus a restart, not an edit to a unit.
+EnvironmentFile=/etc/deltahedger.env
+
+ExecStart=@INSTALL_DIR@/.venv/bin/deltahedger $DELTAHEDGER_ARGS
+
+# The runner reconnects internally, so a process exit means something the
+# strategy could not handle. Come back, but not in a tight loop.
+Restart=always
+RestartSec=30
+
+# SIGTERM is handled: the runner finishes its cycle and stops cleanly. Give
+# it room rather than killing it mid-order.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deltahedger
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@INSTALL_DIR@/runs
+
+[Install]
+WantedBy=multi-user.target

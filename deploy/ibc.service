@@ -1,0 +1,48 @@
+[Unit]
+Description=IB Gateway (via IBC)
+Documentation=https://github.com/IbcAlpha/IBC
+After=network-online.target
+Wants=network-online.target
+# A login loop against IBKR gets the account locked, which is far worse than
+# being down. Cap the retries rather than hammering it.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_USER@
+
+# IB Gateway is a Java GUI application with no headless mode, so it gets a
+# virtual display. :99 is arbitrary and matches DISPLAY below.
+Environment=DISPLAY=:99
+Environment=TWS_MAJOR_VRSN=1030
+Environment=IBC_INI=/etc/ibc/config.ini
+Environment=IBC_PATH=/opt/ibc
+Environment=TWS_PATH=/home/@SERVICE_USER@/Jts
+Environment=TWS_SETTINGS_PATH=/home/@SERVICE_USER@/Jts
+Environment=LOG_PATH=/home/@SERVICE_USER@/ibc-logs
+
+ExecStartPre=/usr/bin/install -d -o @SERVICE_USER@ -g @SERVICE_USER@ /home/@SERVICE_USER@/ibc-logs
+ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
+    /opt/ibc/gatewaystart.sh
+
+# The gateway restarts itself once a day (AutoRestartTime in config.ini). If
+# it exits outright instead, bring it back -- but slowly, because a login
+# loop against IBKR gets the account locked, which is far worse than being
+# down for a minute.
+Restart=always
+RestartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ibc
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/@SERVICE_USER@
+
+[Install]
+WantedBy=multi-user.target

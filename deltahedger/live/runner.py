@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import time
 from datetime import datetime
 
 from ..broker.ibkr import (
@@ -37,6 +38,7 @@ from ..config import Config
 from ..data.base import MarketBar
 from ..sizing import build_margin_model
 from ..strategy import GexStraddleStrategy
+from .journal import JournallingStrategy, SessionJournal
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +50,11 @@ class LiveRunner:
         self.source = cfg.source
         self.connection = IbkrConnection(cfg, self.source)
         self.strategy: GexStraddleStrategy | None = None
+        self.journal = (
+            SessionJournal(cfg.live.journal_dir) if cfg.live.journal else None
+        )
+        self._driver = None
+        self._cycles = 0
         self._stop = False
 
     def request_stop(self, *_: object) -> None:
@@ -55,9 +62,77 @@ class LiveRunner:
         self._stop = True
 
     def run(self, max_cycles: int | None = None) -> GexStraddleStrategy:
+        """Poll until stopped, surviving disconnections.
+
+        The outer loop exists because IBKR force-restarts the gateway once a
+        day and drops every API connection with it.  Without it a forward
+        walk goes quiet after its first night and keeps logging exceptions
+        into a dead socket, which looks exactly like a working run until you
+        read the log.
+
+        Each reconnection rebuilds the strategy and re-reconciles against
+        the broker's positions rather than resuming the in-memory book: the
+        book may be minutes or hours stale by then, and the broker is the
+        only thing that knows what is actually open.  The journal is what
+        carries the record across the gap.
+        """
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
+        backoff = self.cfg.live.reconnect_backoff_seconds
+        attempts = 0
+
+        while not self._stop:
+            cycles_before = self._cycles
+            try:
+                self._run_connected(max_cycles)
+                backoff = self.cfg.live.reconnect_backoff_seconds
+                attempts = 0
+            except Exception as exc:  # noqa: BLE001 - the point is to survive it
+                if self._stop:
+                    break
+                if not self.cfg.live.reconnect:
+                    raise
+                # A session that actually polled before dropping was a
+                # healthy one, so the failure budget starts over. Without
+                # this, a walk that reconnects cleanly every night still
+                # exhausts max_reconnect_attempts after that many days and
+                # dies for having worked.
+                if self._cycles > cycles_before:
+                    attempts = 0
+                    backoff = self.cfg.live.reconnect_backoff_seconds
+                attempts += 1
+                limit = self.cfg.live.max_reconnect_attempts
+                if limit is not None and attempts >= limit:
+                    log.error(
+                        "giving up after %d consecutive connection failures: %s",
+                        attempts, exc,
+                    )
+                    raise
+                log.warning(
+                    "connection lost (%s); reconnecting in %.0fs (attempt %d%s)",
+                    exc, backoff, attempts,
+                    f" of {limit}" if limit else "",
+                )
+                self._sleep(backoff)
+                backoff = min(
+                    backoff * 2.0, self.cfg.live.max_reconnect_backoff_seconds
+                )
+                continue
+
+            # A clean return means the cycle budget ran out or we were asked
+            # to stop -- neither is a reason to reconnect.
+            break
+
+        if self.strategy is None:
+            raise RuntimeError("the runner never established a session")
+        if self.journal is not None:
+            log.info("journal written to %s (%s)", self.journal.directory,
+                     ", ".join(f"{n} {k}" for k, n in self.journal.counts().items()))
+        return self.strategy
+
+    def _run_connected(self, max_cycles: int | None) -> None:
+        """One connected session: connect, reconcile, poll until it ends."""
         with self.connection as conn:
             fallback = build_margin_model(
                 self.cfg.sizing, self.source, self.cfg.risk_free_rate
@@ -67,12 +142,18 @@ class LiveRunner:
                 if self.cfg.ibkr.use_whatif_margin
                 else fallback
             )
-            self.strategy = GexStraddleStrategy(
+            strategy = GexStraddleStrategy(
                 self.cfg,
                 self.source,
                 margin_model,
                 open_interest=IbkrOpenInterestProvider(conn, self.cfg),
             )
+            self.strategy = strategy
+            driver = strategy
+            if self.journal is not None:
+                driver = JournallingStrategy(strategy, self.journal)
+            self._driver = driver
+
             execution = IbkrExecution(conn, self.cfg, dry_run=self.dry_run)
             chain_provider = IbkrChainProvider(conn, self.cfg)
             self._reconcile(conn)
@@ -85,29 +166,58 @@ class LiveRunner:
                 " [DRY RUN]" if self.dry_run else "",
             )
 
-            cycles = 0
-            while not self._stop and (max_cycles is None or cycles < max_cycles):
-                try:
-                    self._cycle(conn, chain_provider, execution)
-                except Exception:  # noqa: BLE001 - a bad poll must not kill the run
-                    log.exception("cycle failed; continuing")
-                cycles += 1
+            last_heartbeat = time.monotonic()
+            while not self._stop and (
+                max_cycles is None or self._cycles < max_cycles
+            ):
+                if not conn.ib.isConnected():
+                    raise ConnectionError("the IBKR API connection dropped")
+                self._cycle(conn, chain_provider, execution)
+                self._cycles += 1
                 if self._stop:
                     break
+
+                now = time.monotonic()
+                if now - last_heartbeat >= self.cfg.live.heartbeat_seconds:
+                    log.info(
+                        "alive: %d cycles, %d events, %d fills",
+                        self._cycles, len(strategy.events), len(strategy.fills),
+                    )
+                    last_heartbeat = now
                 conn.ib.sleep(self.cfg.ibkr.poll_seconds)
 
-            log.info("live runner stopped after %d cycles", cycles)
-        return self.strategy
+            log.info("live runner stopped after %d cycles", self._cycles)
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep in slices so a stop signal is not swallowed by a backoff."""
+        deadline = time.monotonic() + seconds
+        while not self._stop and time.monotonic() < deadline:
+            time.sleep(min(1.0, deadline - time.monotonic()))
 
     # -- internals ------------------------------------------------------
 
     def _cycle(self, conn, chain_provider, execution) -> None:
+        """One poll. Raises only when the connection itself is gone.
+
+        A bad tick, a missing strike or a chain that will not qualify are
+        all ordinary and must not end the run -- but they are logged rather
+        than swallowed silently, because a poll that fails every time is
+        indistinguishable from a working one in an empty log.
+        """
         assert self.strategy is not None
         now = datetime.now(self.strategy.clock.tz)
         if not self.strategy.clock.in_session(now):
             log.debug("outside the session at %s; idling", now)
             return
 
+        try:
+            self._poll(conn, chain_provider, execution, now)
+        except Exception:  # noqa: BLE001 - a bad poll must not kill the run
+            if not conn.ib.isConnected():
+                raise  # the outer loop reconnects
+            log.exception("poll failed; continuing")
+
+    def _poll(self, conn, chain_provider, execution, now: datetime) -> None:
         future_price = conn.future_price()
         atm_iv = self._atm_iv(conn, chain_provider, future_price, now)
         bar = MarketBar(
@@ -118,7 +228,7 @@ class LiveRunner:
             close=future_price,
             atm_iv=atm_iv,
         )
-        state = self.strategy.on_bar(bar, execution)
+        state = self._driver.on_bar(bar, execution)
         gex = (
             f"{state.gex_total / 1e6:+,.0f}M" if state.gex_total is not None else "n/a"
         )

@@ -43,9 +43,22 @@ data:
 
 ibkr:
   host: 127.0.0.1
-  port: 7497
+  port: 4002                       # IB Gateway paper. TWS paper is 7497.
   client_id: 17
-  allow_live_trading: false
+  allow_live_trading: false        # the gate between this file and real money
   poll_seconds: 5.0
   use_whatif_margin: true
   hedge_order_type: MKT
+
+live:
+  # Write every decision to disk as it happens. A forward walk that only
+  # exists in a process's memory is not evidence.
+  journal: true
+  journal_dir: runs/live
+  # IBKR force-restarts the gateway daily; without this the walk goes quiet
+  # after its first night while still looking healthy in the log.
+  reconnect: true
+  reconnect_backoff_seconds: 15.0
+  max_reconnect_backoff_seconds: 300.0
+  max_reconnect_attempts: null     # retry forever; systemd is the backstop
+  heartbeat_seconds: 300.0

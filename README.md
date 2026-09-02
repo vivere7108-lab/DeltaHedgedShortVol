@@ -37,9 +37,18 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[ibkr,dev]'
 # Compare band widths, broken out by regime.
 .venv/bin/deltahedger sweep -c configs/es_synthetic.yaml --bands 5,10,20,40,80
 
+# Preflight the live path before letting it trade -- places no orders.
+.venv/bin/deltahedger doctor -c configs/es_paper.yaml
+
 # The forward walk. --dry-run computes and logs every decision, places nothing.
 .venv/bin/deltahedger live -c configs/es_paper.yaml --dry-run
+
+# Read back what a live session did, from its journal.
+.venv/bin/deltahedger report -c configs/es_paper.yaml --show-events
 ```
+
+To run the walk unattended on a VPS, see **[deploy/README.md](deploy/README.md)** —
+IB Gateway under IBC, systemd units, and what the runner survives.
 
 ## What GEX is, and what it is not
 
@@ -250,7 +259,7 @@ across seeds before concluding anything from a backtest of this system.**
 
 ## Correctness
 
-The suite has 386 tests. The load-bearing ones:
+The suite has 401 tests. The load-bearing ones:
 
 - **the sign convention** — a call-only chain is positive GEX, a put-only
   chain is negative, flipping the convention flips the number, and the sign
@@ -378,6 +387,32 @@ Stated plainly, because they bound what the backtest can tell you:
    than modelling exercise. This matters more than it did for a
    single out-of-the-money put: an ATM straddle at the bell has one leg
    in the money essentially by definition.
+
+## Running unattended
+
+A forward walk is not a long backtest — the process has to survive things a
+backtest never sees, and produce evidence that outlives it.
+
+- **IBKR force-restarts the gateway once a day**, dropping every API
+  connection. The runner reconnects with exponential backoff and
+  re-reconciles against the broker's positions rather than resuming a stale
+  in-memory book. Without this a walk goes quiet after its first night while
+  the log still looks healthy. The failure budget counts *consecutive*
+  failures, so a walk that reconnects cleanly every night is not eventually
+  killed for having worked.
+- **Every decision is journalled to disk as it happens** — JSON Lines,
+  flushed per record, appended rather than rewritten, under
+  `live.journal_dir`. A crash or a `systemctl restart` costs the position,
+  never the history. `deltahedger report` reads it back; a failed journal
+  write is logged loudly but never stops trading.
+- **`deltahedger doctor`** checks the connection, the account type, contract
+  qualification, the ATM quote, and — the one most likely to waste a week —
+  whether the account actually receives **generic tick 101 (option open
+  interest)**. Without it there is no GEX and the strategy stands aside on
+  every bar, which in a log is indistinguishable from the market genuinely
+  reading neutral.
+- **A heartbeat every five minutes**, so a quiet log and a stalled process
+  can be told apart.
 
 ## Live trading safety
 

@@ -370,6 +370,46 @@ class IBKRConfig:
 
 
 @dataclass
+class LiveConfig:
+    """Running unattended, for days at a time.
+
+    A forward walk is not a long backtest: the process has to survive things
+    a backtest never sees. IBKR force-restarts the gateway once a day, which
+    drops the API connection; a VPS reboots; a network blips. None of those
+    should end the test, and none of them should lose the record of what
+    happened before them.
+    """
+
+    #: Write every decision to disk as it is made. Off means a crash takes
+    #: the whole session's evidence with it, so it defaults on.
+    journal: bool = True
+    journal_dir: str = "runs/live"
+    #: Reconnect after the connection drops, rather than ending the run.
+    #: The daily gateway restart makes this mandatory for any walk longer
+    #: than a day.
+    reconnect: bool = True
+    #: Backoff between reconnect attempts, seconds. Doubles up to the max.
+    reconnect_backoff_seconds: float = 15.0
+    max_reconnect_backoff_seconds: float = 300.0
+    #: Give up after this many consecutive failures. ``None`` retries
+    #: forever, which is usually what you want under a process supervisor.
+    max_reconnect_attempts: int | None = None
+    #: Log a heartbeat line this often even when nothing happens, so a
+    #: silent log can be told apart from a stalled process.
+    heartbeat_seconds: float = 300.0
+
+    def validate(self) -> None:
+        if self.reconnect_backoff_seconds <= 0:
+            raise ValueError("live.reconnect_backoff_seconds must be > 0")
+        if self.max_reconnect_backoff_seconds < self.reconnect_backoff_seconds:
+            raise ValueError(
+                "live.max_reconnect_backoff_seconds < reconnect_backoff_seconds"
+            )
+        if self.max_reconnect_attempts is not None and self.max_reconnect_attempts < 1:
+            raise ValueError("live.max_reconnect_attempts must be >= 1 or null")
+
+
+@dataclass
 class Config:
     """Top-level configuration."""
 
@@ -384,6 +424,7 @@ class Config:
     costs: CostsConfig = field(default_factory=CostsConfig)
     data: DataConfig = field(default_factory=DataConfig)
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     #: Backtest window, ISO dates. ``None`` means "whatever the source has".
     start_date: str | None = None
     end_date: str | None = None
@@ -401,7 +442,7 @@ class Config:
         if self.starting_equity <= 0:
             raise ValueError("starting_equity must be positive")
         get_risk_source(self.risk_source)  # raises on an unknown symbol
-        for section in (self.hedge, self.sizing, self.gex, self.strategy):
+        for section in (self.hedge, self.sizing, self.gex, self.strategy, self.live):
             section.validate()
 
     # -- serialisation -------------------------------------------------
@@ -434,6 +475,7 @@ class Config:
                 "costs": CostsConfig,
                 "data": DataConfig,
                 "ibkr": IBKRConfig,
+                "live": LiveConfig,
             }.get(key)
             kwargs[key] = build(target, value) if target else value
         return cls(**kwargs)
