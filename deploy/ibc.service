@@ -13,16 +13,17 @@ Type=simple
 User=@SERVICE_USER@
 Group=@SERVICE_USER@
 
-# IB Gateway is a Java GUI application with no headless mode, so it gets a
-# virtual display. :99 is arbitrary and matches DISPLAY below.
-Environment=DISPLAY=:99
-Environment=TWS_MAJOR_VRSN=1030
-Environment=IBC_INI=/etc/ibc/config.ini
-Environment=IBC_PATH=/opt/ibc
-Environment=TWS_PATH=/home/@SERVICE_USER@/Jts
-Environment=TWS_SETTINGS_PATH=/home/@SERVICE_USER@/Jts
-Environment=LOG_PATH=/home/@SERVICE_USER@/ibc-logs
+# TWS_MAJOR_VRSN, TWS_PATH and friends are written by install-ibc.sh from
+# the gateway install it actually produced. Hardcoding the version here made
+# the unit go stale the moment IBKR shipped a new gateway, and the only
+# symptom was a connection refused from something three steps downstream.
+# Re-run install-ibc.sh after a gateway upgrade to refresh it.
+EnvironmentFile=/etc/ibc/ibc.env
 
+# IB Gateway is a Java GUI application with no headless mode, so it runs
+# under a virtual display. xvfb-run --auto-servernum picks a free display
+# number and exports DISPLAY itself; setting DISPLAY here as well would
+# only override it with a guess.
 ExecStartPre=/usr/bin/install -d -o @SERVICE_USER@ -g @SERVICE_USER@ /home/@SERVICE_USER@/ibc-logs
 ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
     /opt/ibc/gatewaystart.sh

@@ -80,6 +80,101 @@ First login usually triggers **two-factor on your phone**. Approve it. IBKR
 re-prompts periodically (roughly weekly); when the walk goes quiet, this is
 the first thing to check.
 
+### If git says "detected dubious ownership"
+
+```
+fatal: detected dubious ownership in repository at '/opt/deltahedger'
+```
+
+Git refuses to act on a repository owned by someone else, and `bootstrap.sh`
+deliberately hands `/opt/deltahedger` to the service user — so a bare
+`sudo git pull` as root hits this every time.
+
+**Use `bootstrap.sh` to update, not `git pull`.** It runs git as the repo's
+owner and prints the commit it landed on:
+
+```bash
+sudo /opt/deltahedger/deploy/bootstrap.sh
+#   now at ea7ccf3 Fix IB Gateway and IBC install failing with Permission denied
+```
+
+The trap to know about: a failed pull leaves the checkout *silently stale*,
+and a stale script fails in exactly the same way as an unpatched one. If a
+fix does not appear to have worked, check what you are actually running
+before re-diagnosing the bug — `install-ibc.sh` prints its own commit on
+every run for this reason:
+
+```
+install-ibc.sh from ea7ccf3 2026-09-02 Fix IB Gateway and IBC install ...
+```
+
+If you must use git directly, run it as the owner:
+
+```bash
+sudo -u deltahedger git -C /opt/deltahedger pull
+```
+
+### If the installer says "Permission denied"
+
+```
+sudo: unable to execute /tmp/tmp.XXXX/ibgateway.sh: Permission denied
+```
+
+Three unrelated causes produce that exact message, which is why the script
+now handles all three rather than guessing:
+
+1. **The directory, not the file.** `mktemp -d` run as root creates a
+   `0700 root` directory. The service user cannot traverse into it, so the
+   script's own `0755` is irrelevant. Staging now happens under
+   `/home/<service-user>/.install` instead.
+2. **`chmod u+x` on a root-owned file.** `unzip` under umask 022 leaves
+   scripts `0644`; `chmod u+x` makes that `0744` — runnable by root and by
+   nobody else. IBC's launcher is now `0755`, which matters because
+   `ibc.service` runs as the service user and would otherwise have failed at
+   `ExecStart` with the same message and no context.
+3. **`/tmp` mounted `noexec`**, common on hardened VPS images. Staging off
+   `/tmp` avoids it for the download, and `TMPDIR` is pointed at the staging
+   directory so the install4j bundle unpacks somewhere it is allowed to run.
+
+`install-ibc.sh` now verifies executability as the service user and stops
+with the offending mode printed, rather than letting the failure surface
+three steps later inside systemd. If you hit it anyway:
+
+```bash
+stat -c '%a %U:%G %n' /opt/ibc/gatewaystart.sh
+namei -l /opt/ibc/gatewaystart.sh        # every directory on the path
+mount | grep -E ' /tmp | /home '         # noexec?
+```
+
+### If nothing is listening on port 4002
+
+`doctor` now tells you which case you are in, because "connection refused"
+does not distinguish a gateway still starting from one that died at launch:
+
+```bash
+systemctl status ibc --no-pager -l
+journalctl -u ibc -n 80 --no-pager
+```
+
+- **Service active, port closed.** The gateway takes 30–90 seconds to
+  launch, log in and open the API port — longer if two-factor is waiting on
+  your phone. Watch `journalctl -u ibc -f` and re-run `doctor`.
+- **Service failed or inactive.** Usually credentials not set in
+  `/etc/ibc/config.ini`, or an unapproved 2FA prompt on first login.
+- **Version mismatch.** IBC locates the gateway at
+  `$TWS_PATH/ibgateway/$TWS_MAJOR_VRSN/jars`. That version is *detected* by
+  `install-ibc.sh` and written to `/etc/ibc/ibc.env`; re-run the installer
+  after a gateway upgrade. Check what it found:
+
+  ```bash
+  cat /etc/ibc/ibc.env
+  ls /home/deltahedger/Jts/ibgateway/        # should be a version number
+  ```
+
+  If that lists `jars` rather than a version number like `1030`, the install
+  is in the flat layout IBC cannot use — re-run `install-ibc.sh`, which
+  moves it aside and reinstalls correctly.
+
 ## 3. Preflight — the important step
 
 ```bash
@@ -201,9 +296,13 @@ events = read_journal("runs/live", "events")
 ## Updating
 
 ```bash
-sudo /opt/deltahedger/deploy/bootstrap.sh     # pulls, reinstalls
+sudo /opt/deltahedger/deploy/bootstrap.sh     # pulls as the owner, reinstalls
 sudo systemctl restart deltahedger
 ```
+
+Not `git pull` as root — see "detected dubious ownership" above. Bootstrap
+prints the commit it landed on, so a stale checkout is visible rather than
+inferred.
 
 Do it outside market hours. A restart mid-session is safe — positions are
 re-read from the broker — but it drops the in-memory session P&L baselines
