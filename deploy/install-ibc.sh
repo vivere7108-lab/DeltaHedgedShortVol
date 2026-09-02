@@ -134,7 +134,16 @@ else
     # sudo does not reliably hand the target user its own HOME, which is
     # where the installer puts ~/Jts.
     #
+    # sudo -u also does not change the working directory: the installer
+    # inherits whatever directory this script's caller was in, typically
+    # /root, and shells back into it with a bare `cd` right before exit.
+    # The service user can't traverse /root, so that cd fails and the
+    # installer aborts having written nothing -- silently, since the actual
+    # install already succeeded by that point. workdir is 0755 and owned by
+    # the service user, so both sides of the sudo can reach it.
+    #
     # -q is unattended mode. No -dir: the default is the layout IBC expects.
+    cd "${workdir}"
     sudo -u "${SERVICE_USER}" env \
         HOME="/home/${SERVICE_USER}" \
         TMPDIR="${workdir}" \
