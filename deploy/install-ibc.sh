@@ -256,6 +256,23 @@ EOF
 chmod 0644 "${IBC_CONFIG_DIR}/ibc.env"
 echo "  wrote ${IBC_CONFIG_DIR}/ibc.env (gateway version ${TWS_MAJOR_VRSN})"
 
+# ibc.env above is for the systemd unit; gatewaystart.sh itself never reads
+# it. Its header says as much -- "the following lines are the only ones
+# you may need to change" -- these are plain assignments at the top of the
+# file, not environment-variable fallbacks, so EnvironmentFile is silently
+# a no-op for TWS_MAJOR_VRSN, TWS_PATH, TWS_SETTINGS_PATH, IBC_INI and
+# LOG_PATH. Patch the file itself with the values just resolved above.
+# Idempotent, and re-run on every install so a gateway upgrade's new
+# TWS_MAJOR_VRSN actually takes effect here too, not just in ibc.env.
+sed -i \
+    -e "s|^TWS_MAJOR_VRSN=.*|TWS_MAJOR_VRSN=${TWS_MAJOR_VRSN}|" \
+    -e "s|^IBC_INI=.*|IBC_INI=${IBC_CONFIG_DIR}/config.ini|" \
+    -e "s|^TWS_PATH=.*|TWS_PATH=/home/${SERVICE_USER}/Jts|" \
+    -e "s|^TWS_SETTINGS_PATH=.*|TWS_SETTINGS_PATH=${TWS_SETTINGS_DIR}|" \
+    -e "s|^LOG_PATH=.*|LOG_PATH=/home/${SERVICE_USER}/ibc-logs|" \
+    "${IBC_DIR}/gatewaystart.sh"
+echo "  patched ${IBC_DIR}/gatewaystart.sh with the resolved paths"
+
 # Prove the path IBC will actually construct exists, here, rather than
 # letting it fail inside systemd with no context.
 gateway_jars="/home/${SERVICE_USER}/Jts/ibgateway/${TWS_MAJOR_VRSN}/jars"
