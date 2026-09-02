@@ -80,6 +80,38 @@ First login usually triggers **two-factor on your phone**. Approve it. IBKR
 re-prompts periodically (roughly weekly); when the walk goes quiet, this is
 the first thing to check.
 
+### If the installer says "Permission denied"
+
+```
+sudo: unable to execute /tmp/tmp.XXXX/ibgateway.sh: Permission denied
+```
+
+Three unrelated causes produce that exact message, which is why the script
+now handles all three rather than guessing:
+
+1. **The directory, not the file.** `mktemp -d` run as root creates a
+   `0700 root` directory. The service user cannot traverse into it, so the
+   script's own `0755` is irrelevant. Staging now happens under
+   `/home/<service-user>/.install` instead.
+2. **`chmod u+x` on a root-owned file.** `unzip` under umask 022 leaves
+   scripts `0644`; `chmod u+x` makes that `0744` — runnable by root and by
+   nobody else. IBC's launcher is now `0755`, which matters because
+   `ibc.service` runs as the service user and would otherwise have failed at
+   `ExecStart` with the same message and no context.
+3. **`/tmp` mounted `noexec`**, common on hardened VPS images. Staging off
+   `/tmp` avoids it for the download, and `TMPDIR` is pointed at the staging
+   directory so the install4j bundle unpacks somewhere it is allowed to run.
+
+`install-ibc.sh` now verifies executability as the service user and stops
+with the offending mode printed, rather than letting the failure surface
+three steps later inside systemd. If you hit it anyway:
+
+```bash
+stat -c '%a %U:%G %n' /opt/ibc/gatewaystart.sh
+namei -l /opt/ibc/gatewaystart.sh        # every directory on the path
+mount | grep -E ' /tmp | /home '         # noexec?
+```
+
 ## 3. Preflight — the important step
 
 ```bash
