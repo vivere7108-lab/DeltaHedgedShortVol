@@ -420,7 +420,10 @@ Routing real orders is the one irreversible thing here, so:
 
 - `ibkr.allow_live_trading` must be explicitly `true`. Without it the broker
   refuses to connect to anything that is not an IBKR paper account (paper
-  account ids begin with `D`).
+  account ids begin with `D`) -- and separately, `live` refuses to route
+  any non-dry-run order at all, paper included, unless it is `true`. Which
+  account it actually reaches is decided by which account the Gateway
+  session is logged into, not by this flag.
 - `--dry-run` computes and logs every decision and places nothing.
 - Every order is size-checked before it is sent, against both the config
   limits and a hard `MAX_ORDER_CONTRACTS` backstop.
