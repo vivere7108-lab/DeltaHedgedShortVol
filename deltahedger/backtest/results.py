@@ -14,6 +14,19 @@ bother with, because they are the whole question for this strategy:
   * **hedge quality** -- what fraction of bars sat inside the delta band, and
     how far from target the position actually ran.  With MES granularity
     coarser than the band, "in band" is an outcome, not a given.
+  * **gate attribution** -- how many would-be entries and would-be flip
+    exits each gate blocked.  Four gates that each look reasonable can
+    between them leave a strategy that never trades, and a headline of zero
+    trades does not say which one did it.  ``deltahedger sweep --gates``
+    prices them one at a time against this count.
+
+Band feasibility is reported per *branch* as well as in aggregate.  At a
+multi-session tenor the two sides no longer carry comparable gamma: the
+short branch is sized by SPAN margin, which barely moves with tenor, while
+the long branch is sized by the debit, which roughly quadruples between
+0DTE and 3DTE.  The same +/-10 band therefore covers a different number of
+ES points on each side, and a regime comparison that did not know that
+would be reading the sizing rule as if it were the signal.
 """
 
 from __future__ import annotations
@@ -73,6 +86,16 @@ class Metrics:
     hedge_tick_points: float
     hedge_quantum: float
     band_half_width: float
+    # Per branch, because the two are sized by different constraints.
+    median_gamma_units_long: float = 0.0
+    median_gamma_units_short: float = 0.0
+    band_width_points_long: float = 0.0
+    band_width_points_short: float = 0.0
+    # Tenor actually traded, in trading days, over bars holding a position.
+    median_days_to_expiry: float = 0.0
+    # Gate attribution: blocked entries and blocked flip exits by gate.
+    gate_blocks: dict[str, int] = field(default_factory=dict)
+    gate_blocked_exits: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
         pct = lambda x: f"{x * 100:,.2f}%"  # noqa: E731
@@ -108,8 +131,12 @@ class Metrics:
                 f"  entries skipped as neutral {self.neutral_skips:>3}",
                 self._regime_note(),
                 "",
+                "Gates",
+                self._gate_lines(),
+                "",
                 "Trading",
                 f"  entries              {self.entries}",
+                f"  median tenor traded  {self.median_days_to_expiry:,.1f} DTE",
                 f"  winning / losing days {self.winning_days} / {self.losing_days}"
                 f"  ({pct(self.win_rate)})",
                 f"  hedge trades         {self.hedges}"
@@ -126,12 +153,63 @@ class Metrics:
                 f"  median position gamma {self.median_gamma_units:,.1f} delta units per point",
                 f"  band width in points  {self.band_width_points:,.3f}"
                 f"  (hedge tick {self.hedge_tick_points:g})",
+                f"    long-gamma branch   {self.band_width_points_long:,.3f} points"
+                f"  (gamma {self.median_gamma_units_long:,.1f})",
+                f"    short-gamma branch  {self.band_width_points_short:,.3f} points"
+                f"  (gamma {self.median_gamma_units_short:,.1f})",
                 f"  band finer than a tick on {pct(self.pct_bars_band_below_tick)} of held bars",
                 f"  hedge quantum         {self.hedge_quantum:,.0f} delta units"
                 f" per contract",
                 self._granularity_note(),
                 self._feasibility_note(),
+                self._branch_note(),
             ]
+        )
+
+    def _gate_lines(self) -> str:
+        """Which gate stopped what, or a plain statement that none did."""
+        if not self.gate_blocks and not self.gate_blocked_exits:
+            return "  no entry or flip was blocked by a gate"
+        names = sorted(set(self.gate_blocks) | set(self.gate_blocked_exits))
+        width = max(len(name) for name in names)
+        lines = [f"  {'gate':<{width}}  {'entries blocked':>15}  {'flips held':>10}"]
+        for name in names:
+            lines.append(
+                f"  {name:<{width}}  {self.gate_blocks.get(name, 0):>15}"
+                f"  {self.gate_blocked_exits.get(name, 0):>10}"
+            )
+        return "\n".join(lines)
+
+    def _branch_note(self) -> str:
+        """Whether the two branches were held to comparable exposure.
+
+        The band is one number, but what it costs to hold depends on the
+        gamma underneath it, and the two branches are sized by different
+        constraints. If they differ by much, a difference in their P&L is
+        partly a difference in position size rather than in signal quality.
+        """
+        wide, narrow = (
+            max(self.median_gamma_units_long, self.median_gamma_units_short),
+            min(self.median_gamma_units_long, self.median_gamma_units_short),
+        )
+        if narrow <= 1e-9:
+            return "  (only one branch held a position; no comparison to make)"
+        ratio = wide / narrow
+        if ratio < 1.5:
+            return (
+                f"  -> the two branches carried comparable gamma ({ratio:.1f}x "
+                "apart), so\n     the regime comparison is about the signal."
+            )
+        heavier = (
+            "long-gamma"
+            if self.median_gamma_units_long > self.median_gamma_units_short
+            else "short-gamma"
+        )
+        return (
+            f"  -> the {heavier} branch carried {ratio:.1f}x the gamma of the "
+            "other, because\n     the two are sized by different constraints "
+            "(debit vs SPAN margin). Some\n     of any P&L difference between "
+            "them is position size, not signal."
         )
 
     def _regime_note(self) -> str:
@@ -231,6 +309,11 @@ def bars_to_frame(states: list[BarState], target: float) -> pd.DataFrame:
                 "gex_flip": s.gex_flip,
                 "gex_regime": s.gex_regime,
                 "distance_to_flip": s.distance_to_flip,
+                "gex_confidence": s.gex_confidence,
+                "gex_gate": s.gex_gate,
+                "confirmed_regime": s.confirmed_regime,
+                "days_to_expiry": s.days_to_expiry,
+                "in_session": s.in_session,
                 "strike": s.strike,
                 "straddle_contracts": s.straddle_contracts,
                 "direction": s.direction,
@@ -261,6 +344,7 @@ def events_to_frame(events: list[StrategyEvent]) -> pd.DataFrame:
                 "timestamp": e.timestamp,
                 "kind": e.kind,
                 "regime": e.regime,
+                "gate": e.gate,
                 "detail": e.detail,
                 "net_delta": e.net_delta,
                 "equity": e.equity,
@@ -389,7 +473,12 @@ def compute_metrics(
         if not events.empty
         else 0
     )
+    gate_blocks = _gate_counts(events, "entry_skipped")
+    gate_blocked_exits = _gate_counts(events, "exit_deferred")
 
+    branch_gamma = {1: 0.0, -1: 0.0}
+    branch_points = {1: 0.0, -1: 0.0}
+    median_dte = 0.0
     if held.empty:
         in_band = mean_err = max_err = mean_delta = 0.0
         median_gamma = band_points = below_tick = 0.0
@@ -419,6 +508,22 @@ def compute_metrics(
             below_tick = float(
                 ((band_width / movable) < hedge_tick).sum() / len(held)
             )
+
+        # The same arithmetic per branch. They are sized by different
+        # constraints -- a debit on the long side, SPAN margin on the short
+        # one -- so at a multi-session tenor their gamma loads diverge and
+        # one band means two different numbers of ES points.
+        for direction in (1, -1):
+            side = held[held["direction"] == direction]["gamma_units"].abs()
+            if side.empty:
+                continue
+            value = float(side.median())
+            branch_gamma[direction] = value
+            branch_points[direction] = (
+                band_width / value if value > 1e-9 else float("inf")
+            )
+        if "days_to_expiry" in held and held["days_to_expiry"].notna().any():
+            median_dte = float(held["days_to_expiry"].dropna().median())
 
     return Metrics(
         starting_equity=starting_equity,
@@ -462,4 +567,27 @@ def compute_metrics(
         hedge_tick_points=hedge_tick,
         hedge_quantum=hedge_quantum,
         band_half_width=band_width / 2.0,
+        median_gamma_units_long=branch_gamma[1],
+        median_gamma_units_short=branch_gamma[-1],
+        band_width_points_long=branch_points[1],
+        band_width_points_short=branch_points[-1],
+        median_days_to_expiry=median_dte,
+        gate_blocks=gate_blocks,
+        gate_blocked_exits=gate_blocked_exits,
     )
+
+
+def _gate_counts(events: pd.DataFrame, kind: str) -> dict[str, int]:
+    """How many events of ``kind`` each named gate is responsible for.
+
+    Blocks with no gate attached -- no expiry listed, no open interest, no
+    buying power -- are counted under "ungated" rather than dropped, so the
+    totals here add up to the events actually recorded.
+    """
+    if events.empty or "gate" not in events or "kind" not in events:
+        return {}
+    rows = events[events["kind"] == kind]
+    if rows.empty:
+        return {}
+    named = rows["gate"].fillna("").replace("", "ungated")
+    return {str(name): int(count) for name, count in named.value_counts().items()}

@@ -41,9 +41,20 @@ class HedgeConfig:
     walk.  One MES contract moves net delta by 10 units, so a band narrower
     than 5 cannot bind (see ``hedger.py``); 10 is the smallest value that
     both binds and leaves room for a whole contract to land inside it.  A
-    band that scales with gamma, realised vol or time-of-day is the obvious
-    next step and is deliberately *not* in this version -- the paper test is
-    meant to measure one threshold, not a fitted schedule.
+    band that scales with gamma or realised vol is the obvious next step and
+    is deliberately *not* in this version -- the paper test is meant to
+    measure one threshold, not a fitted schedule.
+
+    ``overnight_band_multiplier`` is the one exception, and it is a
+    consequence of the tenor rather than a fitted schedule.  The position is
+    now carried overnight, and the hours outside the regular session are not
+    the same market: the book is quoted wider, a single MES fill costs
+    proportionally more, and the delta that a hedge would chase is as likely
+    to be reversed by the open as realised.  Outside RTH the band is
+    multiplied by this factor, so only a *larger* breach is hedged; the
+    hedge is not switched off, because an overnight gap is exactly when an
+    unhedged straddle does the most damage.  Set it to 1.0 to hedge
+    identically around the clock.
 
     Note that the band means opposite things in the two regimes.  Long the
     straddle (negative GEX) each hedge realises a gamma scalp, so a tighter
@@ -55,6 +66,9 @@ class HedgeConfig:
 
     target: float = 0.0
     band: float = 10.0
+    #: Widen the band by this factor outside the regular session. 1.0 hedges
+    #: overnight exactly as it does intraday.
+    overnight_band_multiplier: float = 2.5
     #: Don't send a hedge smaller than this many contracts.
     min_hedge_contracts: int = 1
     #: Cap on a single hedge order, as a guard against a data glitch.
@@ -69,6 +83,14 @@ class HedgeConfig:
     #: sub-band residual -- under one hedge contract -- is left behind.
     flatten_hedge_on_exit: bool = True
 
+    def effective_band(self, in_session: bool = True) -> float:
+        """The half-width that applies right now."""
+        return self.band if in_session else self.band * self.overnight_band_multiplier
+
+    def bounds(self, in_session: bool = True) -> tuple[float, float]:
+        half = self.effective_band(in_session)
+        return self.target - half, self.target + half
+
     @property
     def lower(self) -> float:
         return self.target - self.band
@@ -77,12 +99,18 @@ class HedgeConfig:
     def upper(self) -> float:
         return self.target + self.band
 
-    def in_band(self, delta_units: float) -> bool:
-        return self.lower <= delta_units <= self.upper
+    def in_band(self, delta_units: float, in_session: bool = True) -> bool:
+        low, high = self.bounds(in_session)
+        return low <= delta_units <= high
 
     def validate(self) -> None:
         if self.band < 0:
             raise ValueError("hedge.band must be >= 0")
+        if self.overnight_band_multiplier < 1.0:
+            raise ValueError(
+                "hedge.overnight_band_multiplier must be >= 1.0: hedging more "
+                "tightly overnight than intraday is churn, not risk control"
+            )
         if self.min_hedge_contracts < 1:
             raise ValueError("hedge.min_hedge_contracts must be >= 1")
         if self.max_hedge_contracts < self.min_hedge_contracts:
@@ -156,28 +184,41 @@ class GexConfig:
     #: Dealer inventory signs applied to open interest at each strike.
     call_sign: float = 1.0
     put_sign: float = -1.0
-    #: Strikes included in the profile, as +/- a fraction of spot. Real 0DTE
-    #: open interest outside ~2% carries almost no gamma.
+    #: Strikes included in the profile, as +/- a fraction of spot. Most of
+    #: the gamma in the front expiries sits inside 2%; widening it costs
+    #: live market-data lines on every expiry in the blend, which is the
+    #: binding constraint rather than the arithmetic.
     strike_width_pct: float = 0.02
     #: Hypothetical-spot grid for the flip search: half-width and resolution.
     flip_search_pct: float = 0.03
     flip_search_steps: int = 61
-    #: |net GEX| below this fraction of gross GEX reads as no clear regime.
-    neutral_gex_fraction: float = 0.05
     #: Spot within this fraction of the flip point reads as no clear regime:
     #: right at the flip the sign is about to change and the classification
-    #: is not information.
+    #: is not information. Toggled by ``gates.flip_distance``.
     flip_proximity_pct: float = 0.0015
-    #: Floor on the time-to-expiry used for the profile, in hours. 0DTE
-    #: gamma collapses to a zero-width spike at the bell, which would make
-    #: every late-session profile read as neutral; the floor keeps the
-    #: shape of the surface visible. It affects classification only, never
-    #: the greeks the hedger acts on.
+    #: Floor on the time-to-expiry used for the profile, in hours. An
+    #: expiring series' gamma collapses to a zero-width spike at the bell,
+    #: which would let the 0DTE leg of the blend dominate everything else;
+    #: the floor keeps the shape of the surface visible. It affects
+    #: classification only, never the greeks the hedger acts on.
     min_hours_to_expiry: float = 0.5
     #: How often to re-read open interest, in seconds. OI is an end-of-day
     #: figure intraday, so re-reading it every bar buys nothing; the profile
     #: itself is recomputed at the live spot on every bar regardless.
     refresh_seconds: float = 900.0
+
+    # -- the front-expiry blend ------------------------------------------
+    #: Read the regime off the aggregate of the front expiries rather than
+    #: off the traded series alone. What dealers hedge is one book, not one
+    #: series, and at a 3-4 DTE tenor the traded series is a minority of the
+    #: gamma sitting in front of it. Off means "classify on the traded
+    #: expiry only", which is what the 0DTE version did.
+    blend_front_expiries: bool = True
+    #: Cap on how many expiries enter the blend, counting from 0DTE
+    #: outwards. This bounds the live cost: every expiry in the blend is a
+    #: separate open-interest read, and each one subscribes two market-data
+    #: lines per listed strike.
+    blend_max_expiries: int = 4
 
     def validate(self) -> None:
         if self.strike_width_pct <= 0.0:
@@ -186,31 +227,147 @@ class GexConfig:
             raise ValueError("gex.flip_search_steps must be >= 3")
         if self.flip_search_pct <= 0.0:
             raise ValueError("gex.flip_search_pct must be > 0")
-        if not 0.0 <= self.neutral_gex_fraction < 1.0:
-            raise ValueError("gex.neutral_gex_fraction must be in [0, 1)")
         if self.min_hours_to_expiry < 0.0:
             raise ValueError("gex.min_hours_to_expiry must be >= 0")
+        if self.blend_max_expiries < 1:
+            raise ValueError("gex.blend_max_expiries must be >= 1")
+
+
+@dataclass
+class GatesConfig:
+    """Four independent reasons to stand aside, each one switchable.
+
+    None of these makes a new statement about the market; each one refuses
+    to act on a statement the GEX read is not entitled to make.  They are
+    separate flags rather than one "be careful" switch so that a sweep can
+    price each of them on its own -- a gate that costs more in missed trades
+    than it saves in bad ones should be visible as such rather than hidden
+    inside a bundle.  ``deltahedger sweep --gates`` runs exactly that
+    comparison, and the journal records which gate blocked each would-be
+    action so the attribution survives into a live walk.
+
+    1. **confidence** -- ``|total GEX| / gross GEX`` is how *directional*
+       dealer positioning is, on a 0-1 scale.  A book with matched call and
+       put gamma nets to nothing, and its sign is then decided by noise in
+       the open-interest print.  Below ``min_confidence_ratio`` the sign is
+       not information.
+    2. **flip_distance** -- the pre-existing fixed test: spot within
+       ``gex.flip_proximity_pct`` of the gamma flip is about to change sign.
+       It is kept separate from (1) because they fail differently: a book
+       can be strongly directional *and* sitting on its flip, or flat and
+       far from one.
+    3. **ensemble** -- recompute the regime over a small grid of skew and
+       sign-convention perturbations and trade only if every member agrees.
+       This is the only gate that tests the *model* rather than the data:
+       both perturbed inputs are assumptions the README flags as
+       load-bearing, and a regime that reverses under a plausible variation
+       of either was never a reading of the market.
+    4. **persistence** -- a regime must hold ``persistence_bars``
+       consecutive bars before it is acted on.  Open interest does not move
+       intraday, so a regime that flickers bar to bar is spot crossing a
+       level rather than positioning changing, and trading it churns.
+
+    Exits on the hard rules -- the DTE floor, the stops, the daily loss
+    limit -- are never gated.  A gate can stop the system taking a position
+    or delay it changing sides; it can never stop it getting out.
+    """
+
+    #: (1) |total|/gross GEX below this reads as no usable direction.
+    confidence: bool = True
+    min_confidence_ratio: float = 0.15
+    #: (2) the fixed distance-to-flip test.
+    flip_distance: bool = True
+    #: (3) unanimity across perturbed models.
+    ensemble: bool = True
+    #: Added to ``vol.skew_slope`` to make the ensemble members. The base
+    #: surface must be in here (a 0.0 delta) or the ensemble is testing a
+    #: model the system does not trade.
+    ensemble_skew_slope_deltas: list[float] = field(
+        default_factory=lambda: [-0.5, 0.0, 0.5]
+    )
+    #: ``[call_sign, put_sign]`` pairs. These are re-weightings of the
+    #: standard convention, not inversions of it: inverting the sign
+    #: inverts the answer by construction, so unanimity across an inverted
+    #: member is unreachable and would only ever mean "never trade". What
+    #: is being tested is whether the read survives dealers being somewhat
+    #: less long the calls, or somewhat less short the puts, than assumed.
+    ensemble_sign_conventions: list[list[float]] = field(
+        default_factory=lambda: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
+    )
+    #: (4) consecutive bars a regime must hold before it is acted on.
+    persistence: bool = True
+    persistence_bars: int = 3
+    #: The entry window, ``strategy.entry_time`` to
+    #: ``strategy.entry_cutoff_time``. Off means entries may be taken at any
+    #: point in the session; the times themselves live in StrategyConfig
+    #: because they are also what the backtest reports against.
+    entry_window: bool = True
+
+    def validate(self) -> None:
+        if not 0.0 <= self.min_confidence_ratio < 1.0:
+            raise ValueError("gates.min_confidence_ratio must be in [0, 1)")
+        if self.persistence_bars < 1:
+            raise ValueError("gates.persistence_bars must be >= 1")
+        if not self.ensemble_skew_slope_deltas:
+            raise ValueError("gates.ensemble_skew_slope_deltas must not be empty")
+        if 0.0 not in [float(d) for d in self.ensemble_skew_slope_deltas]:
+            raise ValueError(
+                "gates.ensemble_skew_slope_deltas must include 0.0 -- the "
+                "traded surface has to be one of the ensemble members"
+            )
+        if not self.ensemble_sign_conventions:
+            raise ValueError("gates.ensemble_sign_conventions must not be empty")
+        for pair in self.ensemble_sign_conventions:
+            if len(pair) != 2:
+                raise ValueError(
+                    "each gates.ensemble_sign_conventions entry must be "
+                    f"[call_sign, put_sign]; got {pair!r}"
+                )
+
+    def sign_conventions(self) -> list[tuple[float, float]]:
+        return [(float(a), float(b)) for a, b in self.ensemble_sign_conventions]
 
 
 @dataclass
 class StrategyConfig:
-    """Entry, strike selection and exit rules for the GEX straddle.
+    """Tenor, entry, strike selection and exit rules for the GEX straddle.
 
-    The position is always an at-the-money straddle on the 0DTE series.
-    Its *direction* is not a parameter -- it is whatever the GEX regime
-    says: long when dealers are short gamma, short when they are long it.
+    The position is always an at-the-money straddle.  Its *direction* is not
+    a parameter -- it is whatever the GEX regime says: long when dealers are
+    short gamma, short when they are long it.
+
+    The *tenor* is a parameter, and it is the one that changed.  The system
+    traded 0DTE and now trades a listed expiry two to five sessions out,
+    closing at ``close_at_days_to_expiry``.  All four numbers are trading
+    days, not calendar days (see ``session.trading_days_between``).
     """
 
-    #: 0DTE only. Both default to 0, which means "today's expiry or
-    #: nothing"; the strategy stands aside on a day with no daily series
-    #: rather than reaching out the curve.
-    min_days_to_expiry: int = 0
-    max_days_to_expiry: int = 0
+    #: Bounds on the expiry that may be entered, in trading days.
+    min_days_to_expiry: int = 2
+    max_days_to_expiry: int = 5
+    #: Inside those bounds, prefer the expiry closest to this window. The
+    #: middle of the range is where neither failure mode bites: entering at
+    #: 2 DTE leaves one session before the close-out, and entering at 5
+    #: carries the most vega for the longest.
+    prefer_min_days_to_expiry: int = 3
+    prefer_max_days_to_expiry: int = 4
+    #: Close the position once it has decayed to this DTE, whatever it is
+    #: worth. With the default the exit lands on the first bar of the
+    #: session before expiry, so the book is never carried into the last two
+    #: sessions where an ATM straddle's gamma, its pin risk and the staleness
+    #: of the open-interest print all get worse together.
+    close_at_days_to_expiry: int = 1
     #: Earliest time of day to open a position (exchange local time).
-    entry_time: time = time(9, 35)
+    #: Defaults to a morning window that starts after the exchange has
+    #: published final open interest for the previous session -- the input
+    #: GEX is computed from. Before it lands, the profile is built on a
+    #: preliminary print. Gated by ``gates.entry_window``.
+    entry_time: time = time(10, 0)
     #: Latest time of day to open a position.
-    entry_cutoff_time: time = time(14, 30)
-    #: Close the straddle this many minutes before it expires.
+    entry_cutoff_time: time = time(11, 30)
+    #: Backstop close, this many minutes before expiry. With the DTE floor
+    #: above this should never be what closes a position; it is here so that
+    #: a config which disables the floor still cannot hold into settlement.
     close_before_expiry_minutes: int = 5
     #: SHORT straddle (positive GEX): buy it back if the premium reaches
     #: this multiple of the entry credit. ``None`` disables the stop.
@@ -221,8 +378,8 @@ class StrategyConfig:
     #: LONG straddle (negative GEX): exits are measured on *position* P&L --
     #: the straddle mark plus the gamma scalped by the hedge -- as a
     #: fraction of the debit paid. A premium-decay stop would be wrong here:
-    #: a long 0DTE straddle is supposed to bleed on the mark and make it
-    #: back on the hedge.
+    #: a long straddle is supposed to bleed on the mark and make it back on
+    #: the hedge.
     long_stop_loss_pct: float | None = 0.50
     long_take_profit_pct: float | None = 1.00
     #: Stop trading for the day after a loss this large, as a fraction of
@@ -239,11 +396,23 @@ class StrategyConfig:
     #: the flip point cannot churn the book all day.
     max_entries_per_session: int = 3
 
+    def tenor(self) -> "TenorPolicy":
+        """The tenor rule these fields describe."""
+        from .chain import TenorPolicy
+
+        return TenorPolicy(
+            min_days=self.min_days_to_expiry,
+            max_days=self.max_days_to_expiry,
+            prefer_days=(self.prefer_min_days_to_expiry, self.prefer_max_days_to_expiry),
+            close_days=self.close_at_days_to_expiry,
+        )
+
     def validate(self) -> None:
         if self.min_days_to_expiry < 0:
             raise ValueError("strategy.min_days_to_expiry must be >= 0")
         if self.min_days_to_expiry > self.max_days_to_expiry:
             raise ValueError("strategy.min_days_to_expiry > max_days_to_expiry")
+        self.tenor().validate()
         if self.entry_cutoff_time < self.entry_time:
             raise ValueError("strategy.entry_cutoff_time is before entry_time")
         if self.max_entries_per_session < 1:
@@ -341,6 +510,12 @@ class DataConfig:
     #: sessions span both GEX regimes instead of only one.
     oi_call_share_mean: float = 0.50
     oi_call_share_swing: float = 0.16
+    #: Synthetic OI: half-width, in expiry-days, of the window the call
+    #: share is smoothed over. Non-zero makes neighbouring expiries lean the
+    #: same way, which is what real positioning does and what keeps the
+    #: front-expiry blend from averaging independent draws into a flat book.
+    #: 0 restores independent per-expiry draws.
+    oi_call_share_smoothing_days: int = 2
     oi_seed: int = 11
 
 
@@ -419,6 +594,7 @@ class Config:
     hedge: HedgeConfig = field(default_factory=HedgeConfig)
     sizing: SizingConfig = field(default_factory=SizingConfig)
     gex: GexConfig = field(default_factory=GexConfig)
+    gates: GatesConfig = field(default_factory=GatesConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     vol: VolConfig = field(default_factory=VolConfig)
     costs: CostsConfig = field(default_factory=CostsConfig)
@@ -442,7 +618,9 @@ class Config:
         if self.starting_equity <= 0:
             raise ValueError("starting_equity must be positive")
         get_risk_source(self.risk_source)  # raises on an unknown symbol
-        for section in (self.hedge, self.sizing, self.gex, self.strategy, self.live):
+        for section in (
+            self.hedge, self.sizing, self.gex, self.gates, self.strategy, self.live,
+        ):
             section.validate()
 
     # -- serialisation -------------------------------------------------
@@ -470,6 +648,7 @@ class Config:
                 "hedge": HedgeConfig,
                 "sizing": SizingConfig,
                 "gex": GexConfig,
+                "gates": GatesConfig,
                 "strategy": StrategyConfig,
                 "vol": VolConfig,
                 "costs": CostsConfig,

@@ -41,6 +41,29 @@ def synthetic(days=10, **overrides) -> Config:
     return cfg
 
 
+def ungated(cfg: Config) -> Config:
+    """Switch off all four stand-aside gates.
+
+    The correctness tests below check the *arithmetic* -- the hedger, the
+    P&L accounting, the sign of the greeks -- the same way
+    ``costs.enabled = False`` isolates it from commissions and
+    ``pin_implied_vol`` isolates it from vega drift.  The gates are a
+    fourth thing that can differ between two otherwise-identical runs, and
+    one of them (``persistence``) counts *bars*, which would silently
+    confound a test that varies the bar size on purpose -- see
+    ``test_the_hedging_residual_shrinks_with_rebalance_frequency``.  With a
+    handful of gated trades over a run, a single differing entry can also
+    swing a small-sample comparison either way, which is what the other
+    three fixed here were actually catching.
+    """
+    cfg.gates.confidence = False
+    cfg.gates.flip_distance = False
+    cfg.gates.ensemble = False
+    cfg.gates.persistence = False
+    cfg.gates.entry_window = False
+    return cfg
+
+
 def pin_implied_vol(cfg):
     """Make realised vol equal implied vol exactly, and stay there.
 
@@ -59,7 +82,7 @@ def pin_implied_vol(cfg):
 
 
 def zero_edge_residual(seed, days=10):
-    cfg = synthetic(days=days, **{"costs.enabled": False})
+    cfg = ungated(synthetic(days=days, **{"costs.enabled": False}))
     cfg.data.synthetic_seed = seed
     m = run_backtest(cfg, source=pin_implied_vol(cfg)).metrics
     return (m.final_equity - m.starting_equity) / m.starting_equity
@@ -76,16 +99,28 @@ class TestEndToEnd:
         result = run_backtest(synthetic(days=7))
         assert 0 < result.metrics.entries
 
-    def test_every_entry_is_matched_by_an_exit(self):
+    def test_every_entry_is_matched_by_an_exit_or_is_still_open(self):
+        """Unlike the 0DTE version, a position now spans several sessions,
+        so a backtest window can end mid-hold -- that is an honest "not
+        finished yet", not a leak. At most one entry (the last one) may be
+        unmatched, and only if the book is still holding it."""
         result = run_backtest(synthetic(days=7))
         kinds = result.events["kind"].value_counts()
-        assert kinds.get("entry", 0) == kinds.get("exit", 0)
+        entries, exits = kinds.get("entry", 0), kinds.get("exit", 0)
+        still_open = result.bars["straddle_contracts"].iloc[-1] != 0
+        assert entries - exits == (1 if still_open else 0)
 
-    def test_it_ends_flat(self):
-        """No position may survive the last bar of the backtest."""
+    def test_it_ends_flat_unless_a_position_is_still_within_its_tenor(self):
+        """A position open at the last bar must be the one the tenor policy
+        would still hold -- not a leak, and not a hedge left unmatched to
+        it."""
         result = run_backtest(synthetic())
-        assert result.bars["straddle_contracts"].iloc[-1] == 0
-        assert result.bars["hedge_contracts"].iloc[-1] == 0
+        last = result.bars.iloc[-1]
+        if last["straddle_contracts"] == 0:
+            assert last["hedge_contracts"] == 0
+        else:
+            assert last["days_to_expiry"] >= Config().strategy.close_at_days_to_expiry
+            assert last["hedge_contracts"] != 0 or abs(last["net_delta_units"]) <= 10.0
 
     def test_both_regimes_are_exercised(self):
         """A run that only ever saw one regime has tested half the strategy;
@@ -93,14 +128,14 @@ class TestEndToEnd:
         m = run_backtest(synthetic(days=20)).metrics
         assert m.long_gamma_trades > 0 and m.short_gamma_trades > 0
 
-    def test_every_bar_inside_the_session_carries_its_gex_read(self):
-        """Every bar but the 16:00 bell, where the 0DTE series has settled
-        and there is no chain left to read. An absent profile there is the
-        right answer, not a gap."""
+    def test_every_bar_carries_its_gex_read(self):
+        """Unlike the 0DTE version, there is no bell to run out the clock
+        on: a 2-5 DTE window always has a listed expiry inside it, so every
+        bar -- including the 16:00 one -- gets a profile. A gap here would
+        mean the tenor selection or the blend broke, not that a series
+        settled."""
         result = run_backtest(synthetic(days=5))
-        missing = result.bars[result.bars["gex_total"].isna()]
-        assert (missing["timestamp"].dt.time.astype(str) == "16:00:00").all()
-        assert len(missing) == 5  # exactly one per session
+        assert result.bars["gex_total"].notna().all()
         assert set(result.bars["gex_regime"]) <= {POSITIVE, NEGATIVE, "neutral"}
 
     def test_it_is_deterministic(self):
@@ -141,11 +176,30 @@ class TestCorrectness:
 
         If it did not, the dispersion would be an accounting fault rather
         than a known property of rebalancing on a 5-minute grid.
+
+        Confined to positions that open and close same-day (``ZERO_DTE``,
+        borrowed from ``test_strategy``), which isolates *intraday*
+        discretisation from a second, much larger source of dispersion at
+        the shipped 2-5 DTE tenor: the overnight gap. A position carried
+        past the close is not rebalanced again until the next session's
+        first bar -- the backtest's bar sources are RTH-only, so there is
+        nothing to rebalance against overnight even in principle, unlike
+        the live runner, which keeps polling and hedging around the clock.
+        That gap is real risk, but it is not *discretisation* error and it
+        does not shrink by sampling the session more finely, so mixing it
+        into this comparison would test the wrong thing. See "A single run
+        does not measure the hedge" in the README for the overnight-
+        inclusive number.
         """
         def rms(bar_size):
             values = []
             for seed in (3, 7, 11, 19, 23):
-                cfg = synthetic(days=10, **{"costs.enabled": False})
+                cfg = ungated(synthetic(days=10, **{"costs.enabled": False}))
+                cfg.strategy.min_days_to_expiry = 0
+                cfg.strategy.max_days_to_expiry = 0
+                cfg.strategy.prefer_min_days_to_expiry = 0
+                cfg.strategy.prefer_max_days_to_expiry = 0
+                cfg.strategy.close_at_days_to_expiry = -1
                 cfg.data.synthetic_seed = seed
                 cfg.data.bar_size = bar_size
                 m = run_backtest(cfg, source=pin_implied_vol(cfg)).metrics
@@ -154,12 +208,34 @@ class TestCorrectness:
                 )
             return (sum(v * v for v in values) / len(values)) ** 0.5
 
-        assert rms("5 mins") < rms("15 mins")
+        # Gated, ``persistence`` counts bars rather than time, so changing
+        # the bar size changes what "3 in a row" means in wall-clock terms
+        # and would pick a different set of entries at each frequency --
+        # confounding the one thing this test varies on purpose.
+        assert rms("1 min") < rms("5 mins") < rms("15 mins")
+
+    def test_the_overnight_gap_is_unbiased_even_though_it_is_unhedged(self):
+        """The multi-day, overnight-inclusive residual is much larger than
+        the intraday-only one above -- carrying a position through nights
+        the backtest cannot rebalance against adds real dispersion -- but
+        it must still average to zero. A biased overnight step (drift
+        mismatched to the option pricer's clock) would show up here as a
+        mean the intraday-only panel would never catch, because that panel
+        never crosses a session boundary at all.
+        """
+        residuals = [zero_edge_residual(seed, days=15) for seed in range(101, 121)]
+        mean = statistics.mean(residuals)
+        standard_error = statistics.stdev(residuals) / len(residuals) ** 0.5
+        assert abs(mean) < 3.0 * standard_error, (
+            f"the overnight-inclusive zero-edge residual has a mean of "
+            f"{mean:+.3%} across {len(residuals)} seeds "
+            f"({abs(mean) / standard_error:.1f} standard errors from zero)"
+        )
 
     def test_the_option_and_hedge_legs_offset_each_other(self):
         """Delta hedging converts the straddle into a pure vol bet: the two
         legs must be strongly opposed, not independently profitable."""
-        cfg = synthetic(days=20)
+        cfg = ungated(synthetic(days=20))
         cfg.costs.enabled = False
         m = run_backtest(cfg, source=pin_implied_vol(cfg)).metrics
         assert m.option_pnl * m.hedge_pnl < 0, "legs did not offset"
@@ -176,7 +252,7 @@ class TestCorrectness:
         make an exact sign assertion false for reasons that have nothing to
         do with this strategy.
         """
-        cfg = synthetic(days=20)
+        cfg = ungated(synthetic(days=20))
         cfg.costs.enabled = False
         cfg.risk_free_rate = 0.0
         result = run_backtest(cfg, source=pin_implied_vol(cfg))
@@ -191,15 +267,20 @@ class TestCorrectness:
         assert (short_bars["theta_dollars"] > 0).all()
 
     def test_vega_follows_the_direction_too(self):
-        cfg = synthetic(days=20, **{"costs.enabled": False})
+        cfg = ungated(synthetic(days=20, **{"costs.enabled": False}))
         cfg.risk_free_rate = 0.0
         result = run_backtest(cfg, source=pin_implied_vol(cfg))
         assert (result.bars[result.bars["direction"] > 0]["vega_dollars"] > 0).all()
         assert (result.bars[result.bars["direction"] < 0]["vega_dollars"] < 0).all()
 
     def test_costs_only_ever_reduce_pnl(self):
-        without = run_backtest(synthetic(days=10, **{"costs.enabled": False}))
-        with_costs = run_backtest(synthetic(days=10))
+        """With the gates on, a fee-driven change to one stop's timing can
+        also change which entries a persistence or confidence read happens
+        to catch -- a second-order effect real money would also feel, but
+        not the one this test exists to isolate. Ungated, the only thing
+        that differs between the two runs is the cost model."""
+        without = run_backtest(ungated(synthetic(days=10, **{"costs.enabled": False})))
+        with_costs = run_backtest(ungated(synthetic(days=10)))
         assert with_costs.metrics.final_equity < without.metrics.final_equity
 
     def test_more_buying_power_means_more_contracts(self):

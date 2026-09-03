@@ -1,14 +1,23 @@
-"""Exchange calendar and time-to-expiry helpers.
+"""Exchange calendar, expiry selection and time-to-expiry helpers.
 
-0DTE is unforgiving about the time axis: an option with four hours left and
-one with forty minutes left price very differently, so time-to-expiry is
+Two different clocks live here and they must not be confused.
+
+*Pricing* runs on wall-clock time.  An option with four hours left and one
+with forty minutes left price very differently, so time-to-expiry is
 computed from an actual expiry timestamp in exchange-local time rather than
 by counting days.
+
+*Tenor selection* runs on **trading days**.  "2 DTE" means two sessions
+away, not 48 hours: a Friday expiry is 1 DTE from Thursday and also 1 DTE
+from the following Monday's point of view only if you count calendar days,
+which is wrong -- the weekend carries no session, no dealer hedging and
+almost no decay in the terms that matter here.  ``trading_days_between``
+counts sessions and is what every DTE in this codebase means.
 
 The holiday set is the CME equity-index full-holiday list (which matches the
 NYSE list, Good Friday included).  Early closes are not modelled -- on a
 half day the daily option still settles at its listed time, and the effect
-on a 0DTE backtest is that a few afternoon bars simply do not exist in the
+on the backtest is that a few afternoon bars simply do not exist in the
 data, which the engine handles by skipping.
 """
 
@@ -87,6 +96,37 @@ def next_trading_day(day: date) -> date:
     return candidate
 
 
+def trading_days_between(start: date, end: date) -> int:
+    """Sessions in the half-open interval ``(start, end]``.
+
+    This is the definition of DTE used everywhere in this codebase, and it
+    is deliberately *not* a calendar-day count.  Counted this way an expiry
+    on the same date is 0 DTE, the next session is 1, and a weekend or a
+    holiday costs nothing::
+
+        Thursday -> Friday                        1
+        Friday   -> Monday                        1
+        Thursday -> Monday (Friday a holiday)     1
+        Wednesday -> the Wednesday after          5
+
+    ``start`` itself is never counted whether or not it is a session, so a
+    Saturday reads Monday's expiry as 1 DTE rather than 0.  Returns a
+    negative count for an expiry in the past, which lets a caller tell "no
+    longer listed" from "listed today".
+    """
+    if end == start:
+        return 0
+    if end < start:
+        return -trading_days_between(end, start)
+    count = 0
+    day = start
+    while day < end:
+        day += timedelta(days=1)
+        if is_trading_day(day):
+            count += 1
+    return count
+
+
 class SessionClock:
     """Turns wall-clock timestamps into expiries and time-to-expiry."""
 
@@ -107,21 +147,64 @@ class SessionClock:
         return datetime.combine(expiry_day, self.expiry_time, tzinfo=self.tz)
 
     def candidate_expiries(self, moment: datetime, max_days: int) -> list[date]:
-        """Listed daily expiries from ``moment`` forward, soonest first.
+        """Listed daily expiries out to ``max_days`` DTE, soonest first.
+
+        ``max_days`` is counted in *trading* days (see
+        ``trading_days_between``), so ``max_days=5`` asked on a Wednesday
+        reaches the Wednesday after rather than stopping on Monday.
 
         Today counts only while its settlement is still ahead of us -- once
-        the 16:00 bell passes, the 0DTE series is gone and the next listed
-        expiry is tomorrow's.
+        the 16:00 bell passes, today's series is gone and the soonest listed
+        expiry is the next session's.
         """
         now = self.localize(moment)
         found: list[date] = []
         day = now.date()
         if not is_trading_day(day) or now >= self.expiry_datetime(day):
             day = next_trading_day(day)
-        while (day - now.date()).days <= max_days:
+        while trading_days_between(now.date(), day) <= max_days:
             found.append(day)
             day = next_trading_day(day)
         return found
+
+    def days_to_expiry(self, moment: datetime, expiry_day: date) -> int:
+        """DTE of ``expiry_day`` as of ``moment``, in trading days."""
+        return trading_days_between(self.localize(moment).date(), expiry_day)
+
+    def select_expiry(
+        self,
+        moment: datetime,
+        min_days: int,
+        max_days: int,
+        prefer_days: tuple[int, int] | None = None,
+    ) -> date | None:
+        """The listed expiry to trade, or ``None`` if none is in range.
+
+        Among the expiries whose DTE falls inside ``[min_days, max_days]``,
+        the one closest to the ``prefer_days`` window is chosen.  The
+        preference exists because the two ends of the range are not
+        equivalent: entering at the short end leaves almost no room before
+        the position has to be closed at the DTE floor, and entering at the
+        long end carries more vega for longer.  ``prefer_days`` names the
+        middle of the range where neither dominates.
+
+        Ties break toward the *longer* tenor, which is the side that keeps
+        the position away from the expiry-week gamma spike -- the reason
+        the range has a floor at all.
+        """
+        listed = [
+            (self.days_to_expiry(moment, expiry), expiry)
+            for expiry in self.candidate_expiries(moment, max_days)
+        ]
+        in_range = [(dte, expiry) for dte, expiry in listed if dte >= min_days]
+        if not in_range:
+            return None
+        if prefer_days is None:
+            return in_range[0][1]
+
+        low, high = min(prefer_days), max(prefer_days)
+        distance = lambda dte: max(low - dte, dte - high, 0)  # noqa: E731
+        return min(in_range, key=lambda row: (distance(row[0]), -row[0]))[1]
 
     def seconds_to_expiry(self, moment: datetime, expiry_day: date) -> float:
         now = self.localize(moment)

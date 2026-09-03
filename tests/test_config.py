@@ -5,6 +5,7 @@ import yaml
 
 from deltahedger.config import (
     Config,
+    GatesConfig,
     GexConfig,
     HedgeConfig,
     SizingConfig,
@@ -26,10 +27,21 @@ class TestDefaults:
     def test_the_default_risk_source_is_es(self):
         assert Config().source.name == "ES"
 
-    def test_zero_dte_at_both_ends_is_the_default(self):
+    def test_the_default_tenor_is_two_to_five_dte(self):
         strategy = Config().strategy
-        assert strategy.min_days_to_expiry == 0
-        assert strategy.max_days_to_expiry == 0
+        assert (strategy.min_days_to_expiry, strategy.max_days_to_expiry) == (2, 5)
+        assert (
+            strategy.prefer_min_days_to_expiry, strategy.prefer_max_days_to_expiry
+        ) == (3, 4)
+        assert strategy.close_at_days_to_expiry == 1
+
+    def test_all_four_gates_are_on_by_default(self):
+        gates = Config().gates
+        assert gates.confidence and gates.flip_distance
+        assert gates.ensemble and gates.persistence and gates.entry_window
+
+    def test_the_overnight_band_widens_by_default(self):
+        assert Config().hedge.overnight_band_multiplier > 1.0
 
     def test_gex_is_on_with_the_standard_dealer_convention(self):
         gex = Config().gex
@@ -115,6 +127,43 @@ class TestValidation:
         with pytest.raises(ValueError, match="min_days_to_expiry"):
             StrategyConfig(min_days_to_expiry=2, max_days_to_expiry=0).validate()
 
+    def test_rejects_a_prefer_window_outside_the_dte_bounds(self):
+        with pytest.raises(ValueError, match="prefer_days"):
+            StrategyConfig(
+                min_days_to_expiry=2, max_days_to_expiry=5,
+                prefer_min_days_to_expiry=1, prefer_max_days_to_expiry=4,
+            ).validate()
+
+    def test_rejects_a_close_floor_at_or_above_the_dte_minimum(self):
+        """A position entered at the floor would be immediately eligible to
+        close, which is not a tenor -- it is a bug that looks like one."""
+        with pytest.raises(ValueError, match="close_days"):
+            StrategyConfig(
+                min_days_to_expiry=2, max_days_to_expiry=5, close_at_days_to_expiry=2,
+            ).validate()
+
+    def test_rejects_an_overnight_band_narrower_than_the_day_band(self):
+        with pytest.raises(ValueError, match="overnight_band_multiplier"):
+            HedgeConfig(overnight_band_multiplier=0.5).validate()
+
+    def test_rejects_an_out_of_range_confidence_ratio(self):
+        with pytest.raises(ValueError, match="min_confidence_ratio"):
+            GatesConfig(min_confidence_ratio=1.0).validate()
+
+    def test_rejects_a_persistence_window_below_one_bar(self):
+        with pytest.raises(ValueError, match="persistence_bars"):
+            GatesConfig(persistence_bars=0).validate()
+
+    def test_the_ensemble_must_include_the_traded_surface(self):
+        with pytest.raises(ValueError, match="ensemble_skew_slope_deltas"):
+            GatesConfig(ensemble_skew_slope_deltas=[-0.5, 0.5]).validate()
+
+    def test_a_gates_section_round_trips_through_yaml(self, tmp_path):
+        path = tmp_path / "gates.yaml"
+        path.write_text(yaml.safe_dump({"gates": {"persistence_bars": 5}}))
+        cfg = Config.from_yaml(path)
+        assert cfg.gates.persistence_bars == 5
+
     def test_rejects_a_session_entry_cap_below_one(self):
         with pytest.raises(ValueError, match="max_entries_per_session"):
             StrategyConfig(max_entries_per_session=0).validate()
@@ -135,8 +184,8 @@ class TestValidation:
         ({"strike_width_pct": 0.0}, "strike_width_pct"),
         ({"flip_search_steps": 2}, "flip_search_steps"),
         ({"flip_search_pct": -0.1}, "flip_search_pct"),
-        ({"neutral_gex_fraction": 1.0}, "neutral_gex_fraction"),
         ({"min_hours_to_expiry": -1.0}, "min_hours_to_expiry"),
+        ({"blend_max_expiries": 0}, "blend_max_expiries"),
     ])
     def test_rejects_impossible_gex_settings(self, kwargs, message):
         with pytest.raises(ValueError, match=message):

@@ -24,6 +24,41 @@ It is found by repricing the whole chain's gamma across a grid of
 hypothetical spot levels, holding open interest fixed, and interpolating the
 crossing.  Above it dealers are long gamma, below it they are short.
 
+One book, several expiries
+--------------------------
+The regime is read off the **aggregate of the front expiries**, from the
+one expiring today out to the one being traded, rather than off the traded
+series alone.  A dealer does not hedge a series; they hedge a book, and
+their delta is the sum over everything they are carrying.  At a 3-4 DTE
+tenor the traded series is a minority of the gamma sitting in front of
+them, so classifying on it alone would be reading a corner of the book and
+calling it the book.
+
+The blend needs no weights.  GEX is already gamma-weighted by
+construction, and gamma per contract scales roughly as ``1/sqrt(T)``, so a
+near-dated expiry contributes more than a far one *because it does* -- not
+because a coefficient says so.  Summing the per-expiry contributions is the
+whole of it.  What the sum is sensitive to is the ``min_hours_to_expiry``
+floor, which stops the last hour of the 0DTE leg from swamping everything
+else with a gamma that is about to stop existing.
+
+The greeks the hedger acts on are **not** blended and never were: they come
+from the traded straddle alone, marked at its own tenor.  This is the same
+separation ``min_hours_to_expiry`` already draws -- what the profile is for
+is classification, and what the position is for is exposure.
+
+Standing aside
+--------------
+``GatesConfig`` describes four reasons to decline a read.  Two of them live
+here, because they are properties of the profile rather than of the
+strategy: the **confidence ratio** ``|total|/gross`` and the **distance to
+the flip**.  A third, the **ensemble**, is computed here too --
+``GexCalculator.ensemble`` reprices the regime over a grid of skew and
+sign-convention perturbations -- but it is invoked by the strategy only
+when a decision actually turns on it, because it costs a full profile per
+member.  Persistence and the entry window are the strategy's, not the
+calculator's.
+
 What the strategy does with it
 ------------------------------
 =================  ==================  ==============  ===================
@@ -39,30 +74,36 @@ Honest limits
 1. **Open interest is not positioning.**  Who is long and who is short is
    not in the OI print; the call/put sign convention is an assumption, and
    it is the load-bearing one.  ``call_sign``/``put_sign`` are config so it
-   can be varied rather than believed.
+   can be varied rather than believed, and the ensemble gate turns that
+   variation into a trading rule.
 2. **OI is stale intraday.**  Exchange open interest is an end-of-previous-
-   day figure.  Same-day 0DTE flow -- which is most of the flow -- is not in
-   it.  This is the largest approximation in the GEX layer.
-3. **0DTE gamma is a spike.**  As expiry approaches, gamma concentrates at
-   the money and vanishes elsewhere, so the profile becomes dominated by two
-   or three strikes and the flip point gets noisy.  ``min_hours_to_expiry``
-   floors the tenor used for classification so the shape stays legible; it
-   never touches the greeks the hedger acts on.
+   day figure.  This bites least on the series the blend weights most
+   heavily by gamma and most on the ones that have been listed longest --
+   which is the wrong way round, and is the single largest approximation
+   in the GEX layer.  The entry window exists to at least ensure the
+   figure being used is the exchange's *final* print rather than its
+   preliminary one.
+3. **Expiring gamma is a spike.**  As expiry approaches, gamma concentrates
+   at the money and vanishes elsewhere, so the 0DTE leg of the blend
+   becomes dominated by two or three strikes and the flip point gets noisy.
+   ``min_hours_to_expiry`` floors the tenor used for classification so the
+   shape stays legible; it never touches the greeks the hedger acts on.
 4. **The flip point moves with vol.**  It is computed off the same modelled
    surface used to price the book, so an error in the skew moves the flip
-   point as well as the credit.
+   point as well as the credit.  The ensemble gate measures how much.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol, Sequence
+from typing import NamedTuple, Protocol, Sequence
 
 import numpy as np
 
-from .config import GexConfig
+from .config import GatesConfig, GexConfig
 from .instruments import RiskSource
 from .pricing import black76_gamma
 from .volsurface import VolSurface
@@ -80,6 +121,22 @@ LONG_STRADDLE = 1
 SHORT_STRADDLE = -1
 STAND_ASIDE = 0
 
+#: Gate names, as they appear in the event log and the journal. Kept as
+#: constants so the report, the sweep and the tests cannot drift from what
+#: the strategy actually writes down.
+GATE_CONFIDENCE = "confidence"
+GATE_FLIP_DISTANCE = "flip_distance"
+GATE_ENSEMBLE = "ensemble"
+GATE_PERSISTENCE = "persistence"
+GATE_ENTRY_WINDOW = "entry_window"
+GATE_NAMES = (
+    GATE_CONFIDENCE,
+    GATE_FLIP_DISTANCE,
+    GATE_ENSEMBLE,
+    GATE_PERSISTENCE,
+    GATE_ENTRY_WINDOW,
+)
+
 HOURS_PER_YEAR = 365.0 * 24.0
 
 
@@ -90,6 +147,32 @@ class StrikeOpenInterest:
     strike: float
     call_oi: float
     put_oi: float
+
+
+@dataclass(frozen=True)
+class ExpiryBook:
+    """One expiry's open interest, with the tenor to price it at.
+
+    The unit the blend is built from.  ``time_to_expiry`` is the real
+    wall-clock tenor of that series; the ``min_hours_to_expiry`` floor is
+    applied by the calculator rather than baked in here, so a caller cannot
+    accidentally hand the hedger a floored tenor.
+    """
+
+    expiry: date
+    time_to_expiry: float
+    rows: tuple[StrikeOpenInterest, ...]
+    days_to_expiry: int = 0
+
+    @classmethod
+    def of(
+        cls,
+        expiry: date,
+        time_to_expiry: float,
+        rows: Sequence[StrikeOpenInterest],
+        days_to_expiry: int = 0,
+    ) -> "ExpiryBook":
+        return cls(expiry, time_to_expiry, tuple(rows), days_to_expiry)
 
 
 class OpenInterestProvider(Protocol):
@@ -108,7 +191,13 @@ class OpenInterestProvider(Protocol):
 
 @dataclass(frozen=True)
 class StrikeGex:
-    """The dealer gamma one strike contributes, split by right."""
+    """The dealer gamma one strike contributes, split by right.
+
+    In a blended profile every field is the sum over the expiries in the
+    blend, so ``gamma`` is per-contract gamma summed across tenors rather
+    than any one series' gamma.  It is a display column; nothing decides
+    anything on it.
+    """
 
     strike: float
     call_oi: float
@@ -123,6 +212,31 @@ class StrikeGex:
 
 
 @dataclass(frozen=True)
+class ExpiryGex:
+    """What one expiry contributed to the blend."""
+
+    expiry: date
+    days_to_expiry: int
+    time_to_expiry: float
+    total_gex: float
+    gross_gex: float
+
+
+@dataclass(frozen=True)
+class EnsembleResult:
+    """Whether the regime survives a plausible change of assumptions."""
+
+    unanimous: bool
+    regime: str
+    regimes: tuple[str, ...]
+    detail: str
+
+    @property
+    def members(self) -> int:
+        return len(self.regimes)
+
+
+@dataclass(frozen=True)
 class GexProfile:
     """The whole picture at one spot level: the number, the flip, the call."""
 
@@ -131,7 +245,7 @@ class GexProfile:
     total_gex: float
     #: Absolute gamma in the book, both rights summed unsigned. ``total_gex``
     #: measured against this is how *directional* dealer positioning is,
-    #: which is what the neutral threshold is written in terms of.
+    #: which is what the confidence gate is written in terms of.
     gross_gex: float
     call_gex: float
     put_gex: float
@@ -139,6 +253,13 @@ class GexProfile:
     regime: str
     reason: str
     by_strike: tuple[StrikeGex, ...] = ()
+    #: What each expiry in the blend contributed, nearest first. A single
+    #: entry means the profile was read off one series.
+    by_expiry: tuple[ExpiryGex, ...] = ()
+    #: Which gate forced a NEUTRAL read, empty when the regime is a real
+    #: one. This is what the journal records so a stand-aside can be
+    #: attributed after the fact.
+    gate: str = ""
 
     @property
     def direction(self) -> int:
@@ -152,6 +273,19 @@ class GexProfile:
         if self.regime == POSITIVE:
             return SHORT_STRADDLE
         return STAND_ASIDE
+
+    @property
+    def confidence(self) -> float:
+        """``|total| / gross``: how directional dealer positioning is.
+
+        Zero when the book's call and put gamma cancel exactly, one when it
+        is all on one side.  This is the quantity the confidence gate
+        thresholds, and it is scale-free -- a bigger book does not read as
+        a more confident one.
+        """
+        if self.gross_gex <= 0.0:
+            return 0.0
+        return abs(self.total_gex) / self.gross_gex
 
     @property
     def above_flip(self) -> bool | None:
@@ -177,7 +311,7 @@ class GexProfile:
         flip = f"{self.flip_point:,.1f}" if self.flip_point is not None else "none found"
         return (
             f"GEX {self.total_gex / 1e6:+,.1f}M/1% at {self.spot:,.2f}, "
-            f"flip {flip}, regime {self.regime}"
+            f"flip {flip}, confidence {self.confidence:.0%}, regime {self.regime}"
         )
 
     def table(self, limit: int = 15) -> str:
@@ -192,6 +326,31 @@ class GexProfile:
             )
         return "\n".join(lines)
 
+    def expiry_table(self) -> str:
+        """What each expiry in the blend contributed, nearest first."""
+        lines = [
+            f"{'expiry':>12} {'DTE':>4} {'hours':>8} "
+            f"{'net GEX ($M/1%)':>17} {'share of gross':>15}"
+        ]
+        gross = sum(row.gross_gex for row in self.by_expiry) or 1.0
+        for row in self.by_expiry:
+            lines.append(
+                f"{row.expiry.isoformat():>12} {row.days_to_expiry:>4d} "
+                f"{row.time_to_expiry * HOURS_PER_YEAR:>8.1f} "
+                f"{row.total_gex / 1e6:>17,.2f} {row.gross_gex / gross:>15.1%}"
+            )
+        return "\n".join(lines)
+
+
+class PreparedBook(NamedTuple):
+    """One expiry's open interest, windowed and arrayed, ready to price."""
+
+    book: ExpiryBook
+    strikes: np.ndarray
+    calls: np.ndarray
+    puts: np.ndarray
+    tenor: float
+
 
 class GexCalculator:
     """Turns open interest into a profile, a flip point and a regime."""
@@ -202,11 +361,13 @@ class GexCalculator:
         source: RiskSource,
         surface: VolSurface,
         risk_free_rate: float = 0.0,
+        gates: GatesConfig | None = None,
     ):
         self.cfg = cfg
         self.source = source
         self.surface = surface
         self.risk_free_rate = risk_free_rate
+        self.gates = gates if gates is not None else GatesConfig()
 
     # -- the profile -----------------------------------------------------
 
@@ -217,53 +378,98 @@ class GexCalculator:
         time_to_expiry: float,
         atm_iv: float,
     ) -> GexProfile:
-        """Total GEX at ``spot``, the flip point, and the regime they imply."""
-        strikes, calls, puts = self._arrays(spot, open_interest)
-        t = self._effective_tenor(time_to_expiry)
+        """Total GEX at ``spot`` for a single expiry's open interest."""
+        return self.blended_profile(
+            spot,
+            [ExpiryBook.of(date.min, time_to_expiry, open_interest)],
+            atm_iv,
+        )
 
-        if strikes.size == 0:
+    def blended_profile(
+        self, spot: float, books: Sequence[ExpiryBook], atm_iv: float
+    ) -> GexProfile:
+        """Total GEX at ``spot`` across every expiry in ``books``.
+
+        The books are summed, not averaged: each one contributes the dollars
+        of delta that expiry forces dealers to trade for a 1% move, and what
+        the strategy needs is the total across the book they are carrying.
+        """
+        prepared = self._prepare(spot, books)
+        floored = [
+            self._effective_tenor(book.time_to_expiry) for book in books
+        ]
+        blended_tenor = min(floored) if floored else 0.0
+
+        if not prepared:
             return GexProfile(
-                spot=spot, time_to_expiry=t, total_gex=0.0, gross_gex=0.0,
-                call_gex=0.0, put_gex=0.0, flip_point=None, regime=NEUTRAL,
+                spot=spot, time_to_expiry=blended_tenor, total_gex=0.0,
+                gross_gex=0.0, call_gex=0.0, put_gex=0.0, flip_point=None,
+                regime=NEUTRAL, gate=GATE_CONFIDENCE,
                 reason="no open interest inside the strike window",
             )
 
-        gamma = black76_gamma(spot, strikes, t, self._vols(spot, strikes, atm_iv),
-                              self.risk_free_rate)
         scale = self.source.option.multiplier * spot * spot * 0.01
-        call_gex = scale * gamma * self.cfg.call_sign * calls
-        put_gex = scale * gamma * self.cfg.put_sign * puts
-        per_strike = call_gex + put_gex
+        per_strike: dict[float, list[float]] = {}
+        by_expiry: list[ExpiryGex] = []
+        total = gross = call_total = put_total = 0.0
 
-        total = float(per_strike.sum())
-        # Gross is the gamma in the book, summed per *leg* rather than per
-        # strike. Summing net-per-strike would collapse to zero for a chain
-        # with matched call and put interest -- which is a maximally
-        # gamma-laden book, not an empty one -- and the neutral test below
-        # divides by this.
-        gross = float((np.abs(call_gex) + np.abs(put_gex)).sum())
-        flip = self._flip_point(spot, strikes, calls, puts, t, atm_iv)
-        regime, reason = self._classify(spot, total, gross, flip)
+        for book, strikes, calls, puts, tenor in prepared:
+            gamma = black76_gamma(
+                spot, strikes, tenor, self._vols(spot, strikes, atm_iv),
+                self.risk_free_rate,
+            )
+            call_gex = scale * gamma * self.cfg.call_sign * calls
+            put_gex = scale * gamma * self.cfg.put_sign * puts
+            expiry_total = float((call_gex + put_gex).sum())
+            # Gross is the gamma in the book, summed per *leg* rather than
+            # per strike. Summing net-per-strike would collapse to zero for
+            # a chain with matched call and put interest -- which is a
+            # maximally gamma-laden book, not an empty one -- and the
+            # confidence gate below divides by this.
+            expiry_gross = float((np.abs(call_gex) + np.abs(put_gex)).sum())
+            total += expiry_total
+            gross += expiry_gross
+            call_total += float(call_gex.sum())
+            put_total += float(put_gex.sum())
+            by_expiry.append(
+                ExpiryGex(
+                    expiry=book.expiry,
+                    days_to_expiry=book.days_to_expiry,
+                    time_to_expiry=tenor,
+                    total_gex=expiry_total,
+                    gross_gex=expiry_gross,
+                )
+            )
+            for k, c, p, g, cg, pg in zip(strikes, calls, puts, gamma, call_gex, put_gex):
+                row = per_strike.setdefault(float(k), [0.0, 0.0, 0.0, 0.0, 0.0])
+                row[0] += float(c)
+                row[1] += float(p)
+                row[2] += float(g)
+                row[3] += float(cg)
+                row[4] += float(pg)
+
+        flip = self._flip_point(spot, prepared, atm_iv)
+        regime, reason, gate = self._classify(spot, total, gross, flip)
 
         return GexProfile(
             spot=spot,
-            time_to_expiry=t,
+            time_to_expiry=blended_tenor,
             total_gex=total,
             gross_gex=gross,
-            call_gex=float(call_gex.sum()),
-            put_gex=float(put_gex.sum()),
+            call_gex=call_total,
+            put_gex=put_total,
             flip_point=flip,
             regime=regime,
             reason=reason,
+            gate=gate,
             by_strike=tuple(
                 StrikeGex(
-                    strike=float(k), call_oi=float(c), put_oi=float(p),
-                    gamma=float(g), call_gex=float(cg), put_gex=float(pg),
+                    strike=strike, call_oi=row[0], put_oi=row[1], gamma=row[2],
+                    call_gex=row[3], put_gex=row[4],
                 )
-                for k, c, p, g, cg, pg in zip(
-                    strikes, calls, puts, gamma, call_gex, put_gex
-                )
+                for strike, row in sorted(per_strike.items())
             ),
+            by_expiry=tuple(by_expiry),
         )
 
     def total_at(
@@ -275,19 +481,118 @@ class GexCalculator:
         atm_iv: float,
     ) -> float:
         """Total GEX the current book would carry if spot were elsewhere."""
-        strikes, calls, puts = self._arrays(spot, open_interest)
-        if strikes.size == 0:
-            return 0.0
-        t = self._effective_tenor(time_to_expiry)
-        return float(
-            self._curve(np.array([hypothetical_spot]), strikes, calls, puts, t, atm_iv)[0]
+        return self.blended_total_at(
+            hypothetical_spot,
+            spot,
+            [ExpiryBook.of(date.min, time_to_expiry, open_interest)],
+            atm_iv,
         )
+
+    def blended_total_at(
+        self,
+        hypothetical_spot: float,
+        spot: float,
+        books: Sequence[ExpiryBook],
+        atm_iv: float,
+    ) -> float:
+        prepared = self._prepare(spot, books)
+        if not prepared:
+            return 0.0
+        return float(
+            self._curve(np.array([hypothetical_spot]), prepared, atm_iv)[0]
+        )
+
+    # -- the ensemble gate ------------------------------------------------
+
+    def ensemble(
+        self, spot: float, books: Sequence[ExpiryBook], atm_iv: float
+    ) -> EnsembleResult:
+        """Recompute the regime over perturbed assumptions and check agreement.
+
+        Two inputs are varied, and they are exactly the two the README
+        flags as load-bearing: the skew slope, which prices every gamma in
+        the profile and therefore moves the flip point, and the dealer sign
+        convention, which decides what open interest *means*.  A regime
+        that reverses under a plausible change to either was a property of
+        the model rather than a reading of the market, and the strategy has
+        no business acting on it.
+
+        Unanimity is over the regime, including NEUTRAL: a member that
+        cannot make up its mind counts as dissent.  That is deliberate --
+        the gate answers "would every version of me take this trade?", and
+        "no, one of them would stand aside" is a no.
+        """
+        gates = self.gates
+        regimes: list[str] = []
+        for delta in gates.ensemble_skew_slope_deltas:
+            surface = self._perturbed_surface(float(delta))
+            for call_sign, put_sign in gates.sign_conventions():
+                member = GexCalculator(
+                    dataclasses.replace(
+                        self.cfg, call_sign=call_sign, put_sign=put_sign
+                    ),
+                    self.source,
+                    surface,
+                    self.risk_free_rate,
+                    gates,
+                )
+                regimes.append(member.blended_profile(spot, books, atm_iv).regime)
+
+        distinct = sorted(set(regimes))
+        unanimous = len(distinct) == 1
+        regime = distinct[0] if unanimous else NEUTRAL
+        if unanimous:
+            detail = (
+                f"all {len(regimes)} ensemble members read {regime}"
+            )
+        else:
+            counts = ", ".join(
+                f"{name} x{regimes.count(name)}" for name in distinct
+            )
+            detail = (
+                f"the ensemble does not agree ({counts} across {len(regimes)} "
+                "members): the regime is a property of the assumed skew or "
+                "sign convention rather than of the chain"
+            )
+        return EnsembleResult(unanimous, regime, tuple(regimes), detail)
+
+    def _perturbed_surface(self, slope_delta: float) -> VolSurface:
+        """The vol surface with its skew slope shifted, same type as ours."""
+        if slope_delta == 0.0:
+            return self.surface
+        cfg = dataclasses.replace(
+            self.surface.cfg, skew_slope=self.surface.cfg.skew_slope + slope_delta
+        )
+        return type(self.surface)(cfg)
 
     # -- internals -------------------------------------------------------
 
     def _effective_tenor(self, time_to_expiry: float) -> float:
         """Tenor used for classification, floored (see the module docstring)."""
         return max(time_to_expiry, self.cfg.min_hours_to_expiry / HOURS_PER_YEAR)
+
+    def _prepare(
+        self, spot: float, books: Sequence[ExpiryBook]
+    ) -> list["PreparedBook"]:
+        """Each book as sorted arrays, plus the tenor to price it at.
+
+        Books with nothing inside the strike window are dropped rather than
+        carried as empty arrays -- an expiry with no listed open interest
+        near the money contributes no gamma, and keeping it would only put
+        a zero row in the per-expiry attribution.
+        """
+        prepared: list[PreparedBook] = []
+        for book in books:
+            strikes, calls, puts = self._arrays(spot, book.rows)
+            if not strikes.size:
+                continue
+            prepared.append(
+                PreparedBook(
+                    book, strikes, calls, puts,
+                    self._effective_tenor(book.time_to_expiry),
+                )
+            )
+        return prepared
 
     def _arrays(
         self, spot: float, open_interest: Sequence[StrikeOpenInterest]
@@ -311,25 +616,29 @@ class GexCalculator:
         return self.surface.iv_array(spot, strikes, atm_iv)
 
     def _curve(
-        self, spots: np.ndarray, strikes: np.ndarray, calls: np.ndarray,
-        puts: np.ndarray, t: float, atm_iv: float,
+        self, spots: np.ndarray, prepared: Sequence["PreparedBook"], atm_iv: float
     ) -> np.ndarray:
         """Total GEX at each of ``spots``, holding open interest fixed.
 
-        One vectorised block rather than a loop: the flip search reprices
-        every strike at every grid point on every bar, and doing that a
-        scalar at a time dominates the whole backtest.
+        One vectorised block per expiry rather than a loop over strikes: the
+        flip search reprices every strike at every grid point on every bar,
+        and doing that a scalar at a time dominates the whole backtest.
         """
         column = spots[:, None]
-        vols = self.surface.iv_array(column, strikes[None, :], atm_iv)
-        gamma = black76_gamma(column, strikes[None, :], t, vols, self.risk_free_rate)
-        weight = self.cfg.call_sign * calls + self.cfg.put_sign * puts
         scale = self.source.option.multiplier * column * column * 0.01
-        return (scale * gamma * weight[None, :]).sum(axis=1)
+        out = np.zeros(spots.shape, dtype=float)
+        for entry in prepared:
+            strikes = entry.strikes
+            vols = self.surface.iv_array(column, strikes[None, :], atm_iv)
+            gamma = black76_gamma(
+                column, strikes[None, :], entry.tenor, vols, self.risk_free_rate
+            )
+            weight = self.cfg.call_sign * entry.calls + self.cfg.put_sign * entry.puts
+            out = out + (scale * gamma * weight[None, :]).sum(axis=1)
+        return out
 
     def _flip_point(
-        self, spot: float, strikes: np.ndarray, calls: np.ndarray,
-        puts: np.ndarray, t: float, atm_iv: float,
+        self, spot: float, prepared: Sequence["PreparedBook"], atm_iv: float
     ) -> float | None:
         """The spot level where total GEX crosses zero, nearest to ``spot``.
 
@@ -343,7 +652,7 @@ class GexCalculator:
         if grid.size < 2:
             return None
 
-        curve = self._curve(grid, strikes, calls, puts, t, atm_iv)
+        curve = self._curve(grid, prepared, atm_iv)
         crossings: list[float] = []
         for i in range(len(grid) - 1):
             lo, hi = curve[i], curve[i + 1]
@@ -360,32 +669,45 @@ class GexCalculator:
 
     def _classify(
         self, spot: float, total: float, gross: float, flip: float | None
-    ) -> tuple[str, str]:
-        """Regime, and the sentence explaining it, for the event log."""
-        if gross <= 0.0:
-            return NEUTRAL, "no gamma in the chain"
+    ) -> tuple[str, str, str]:
+        """Regime, the sentence explaining it, and the gate that forced it.
 
-        if flip is not None and abs(spot - flip) <= spot * self.cfg.flip_proximity_pct:
+        The two gates are checked in the order they can each be *right*
+        about: a book with no directional gamma has no sign to be near the
+        flip of, so confidence comes first.
+        """
+        gates = self.gates
+        if gross <= 0.0:
+            return NEUTRAL, "no gamma in the chain", GATE_CONFIDENCE
+
+        share = abs(total) / gross
+        if gates.confidence and share < gates.min_confidence_ratio:
+            return NEUTRAL, (
+                f"net GEX is only {share:.1%} of gross "
+                f"(threshold {gates.min_confidence_ratio:.0%}); dealers are "
+                "close to flat and the sign is noise in the open-interest "
+                "print rather than positioning"
+            ), GATE_CONFIDENCE
+
+        if (
+            gates.flip_distance
+            and flip is not None
+            and abs(spot - flip) <= spot * self.cfg.flip_proximity_pct
+        ):
             return NEUTRAL, (
                 f"spot {spot:,.2f} is within {self.cfg.flip_proximity_pct:.2%} of the "
                 f"gamma flip at {flip:,.2f}; the sign is about to change"
-            )
-
-        share = abs(total) / gross
-        if share < self.cfg.neutral_gex_fraction:
-            return NEUTRAL, (
-                f"net GEX is only {share:.1%} of gross "
-                f"(threshold {self.cfg.neutral_gex_fraction:.0%}); dealers are "
-                "close to flat"
-            )
+            ), GATE_FLIP_DISTANCE
 
         flip_text = f", flip {flip:,.1f}" if flip is not None else ""
         if total > 0.0:
             return POSITIVE, (
-                f"GEX {total / 1e6:+,.1f}M/1% at {spot:,.2f}{flip_text}: dealers are "
-                "long gamma and hedge against the move, damping realised vol"
-            )
+                f"GEX {total / 1e6:+,.1f}M/1% at {spot:,.2f}{flip_text} "
+                f"({share:.0%} of gross): dealers are long gamma and hedge "
+                "against the move, damping realised vol"
+            ), ""
         return NEGATIVE, (
-            f"GEX {total / 1e6:+,.1f}M/1% at {spot:,.2f}{flip_text}: dealers are "
-            "short gamma and hedge with the move, amplifying realised vol"
-        )
+            f"GEX {total / 1e6:+,.1f}M/1% at {spot:,.2f}{flip_text} "
+            f"({share:.0%} of gross): dealers are short gamma and hedge with "
+            "the move, amplifying realised vol"
+        ), ""

@@ -3,10 +3,12 @@
 One bar (or one live poll) at a time, in this order:
 
   1. mark the open straddle and recompute greeks
-  2. read GEX at the current spot -- total, flip point, regime
-  3. check exits -- time, regime flip, directional stop/target, loss limit
-  4. check entry -- if flat and inside the entry window, take the side the
-     regime implies
+  2. read GEX at the current spot -- total, flip point, regime -- across the
+     front expiries, and update the persistence streak
+  3. check exits -- the DTE floor, a *confirmed* regime flip, the
+     directional stop/target, the daily loss limit
+  4. check entry -- if flat, inside the entry window and past every gate,
+     take the side the regime implies
   5. check the delta band and hedge
 
 The direction is not a parameter.  It is whatever dealer positioning says::
@@ -25,6 +27,33 @@ Exits run before entry so a regime flip and the re-entry on the other side
 can happen on the same bar, and hedging runs last so it sees the delta the
 other two steps left behind.
 
+The tenor
+---------
+The traded series is a listed expiry two to five sessions out, chosen by
+``StrategyConfig.tenor()`` and closed once it decays to the DTE floor.  That
+has three consequences visible in this file:
+
+  * the position is carried **overnight and across sessions**, so
+    ``_roll_session`` re-marks the book at the new day's first price rather
+    than assuming it starts flat, and the hedge band is session-aware;
+  * the exit ladder is led by the **DTE floor**, not by minutes-to-expiry;
+  * the GEX read is a blend over the front expiries, so a bar reads open
+    interest for several series rather than one.
+
+The gates
+---------
+Four of them, described in ``GatesConfig``.  Two are inside the profile
+(confidence, distance to the flip), one is checked here against the
+calculator (the ensemble), and one is purely local (persistence).  The entry
+window is the fifth thing that can block an entry and is checked here as
+well, in ``_try_entry`` rather than in the bar loop -- so the backtest and
+the live runner inherit it identically instead of each deciding for itself
+which bars to offer.
+
+Every block is recorded as an event carrying the gate that caused it, which
+is what makes ``deltahedger sweep --gates`` and the live journal able to say
+*why* nothing was traded rather than only that nothing was.
+
 This class holds no market-data or broker dependency: it is handed a
 ``MarketBar``, an ``OpenInterestProvider`` and an ``ExecutionHandler``.  The
 backtest loop and the live runner both call ``on_bar`` and differ only in
@@ -38,11 +67,15 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from .broker.base import ExecutionHandler, Fill
-from .chain import StraddleQuote, price_option, select_atm_straddle
+from .chain import StraddleQuote, TenorPolicy, price_option, select_expiry, select_atm_straddle
 from .config import Config
 from .data.base import MarketBar
 from .gex import (
+    GATE_ENSEMBLE,
+    GATE_ENTRY_WINDOW,
+    GATE_PERSISTENCE,
     NEUTRAL,
+    ExpiryBook,
     GexCalculator,
     GexProfile,
     OpenInterestProvider,
@@ -60,7 +93,14 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class StrategyEvent:
-    """Something worth recording: a fill, a skipped entry, a band breach."""
+    """Something worth recording: a fill, a skipped entry, a band breach.
+
+    ``gate`` names the gate responsible when the event is a block -- an
+    entry that was not taken, or a flip that was not acted on.  It is empty
+    for everything else.  Recording it here rather than only in the prose of
+    ``detail`` is what lets the sweep and the live journal count blocks by
+    cause without parsing sentences.
+    """
 
     timestamp: datetime
     kind: str
@@ -68,6 +108,7 @@ class StrategyEvent:
     net_delta: float = 0.0
     equity: float = 0.0
     regime: str = ""
+    gate: str = ""
 
 
 @dataclass
@@ -100,6 +141,19 @@ class BarState:
     gex_flip: float | None
     gex_regime: str
     distance_to_flip: float | None
+    #: |total|/gross GEX: how directional the read was, on a 0-1 scale.
+    gex_confidence: float | None = None
+    #: The gate that forced a NEUTRAL profile, empty when the read stood.
+    gex_gate: str = ""
+    #: The regime after the persistence filter -- what the strategy is
+    #: entitled to act on, as opposed to what this bar happened to read.
+    confirmed_regime: str = NEUTRAL
+    #: Trading days to expiry of the traded series (of the series that
+    #: *would* be traded, when flat), or None when none is listed.
+    days_to_expiry: int | None = None
+    #: Whether the bar fell inside the regular session, which decides which
+    #: band width applied to it.
+    in_session: bool = True
 
 
 class GexStraddleStrategy:
@@ -119,8 +173,9 @@ class GexStraddleStrategy:
             cfg.sizing, self.source, cfg.risk_free_rate
         )
         self.gex = GexCalculator(
-            cfg.gex, self.source, self.surface, cfg.risk_free_rate
+            cfg.gex, self.source, self.surface, cfg.risk_free_rate, cfg.gates
         )
+        self.tenor: TenorPolicy = cfg.strategy.tenor()
         self.open_interest = open_interest
         self.portfolio = Portfolio(cfg.starting_equity, self.source)
 
@@ -138,12 +193,21 @@ class GexStraddleStrategy:
         self._entries_this_session = 0
         self._halted_for_session = False
         self._profile: GexProfile | None = None
-        #: Cached open interest, and when it was read. OI is an end-of-day
-        #: figure, so it is re-read on a timer while the *profile* is
-        #: recomputed at the live spot on every bar.
-        self._oi: list[StrikeOpenInterest] | None = None
+        #: Cached open interest per expiry, and when it was read. OI is an
+        #: end-of-day figure, so it is re-read on a timer while the
+        #: *profile* is recomputed at the live spot on every bar.
+        self._oi: dict[date, list[StrikeOpenInterest]] = {}
         self._oi_read_at: datetime | None = None
-        self._oi_expiry: date | None = None
+        self._oi_expiries: tuple[date, ...] = ()
+        #: The books the last profile was built from, kept so the ensemble
+        #: gate can re-price the same input without re-reading it.
+        self._books: list[ExpiryBook] = []
+        #: The persistence streak: the regime the last few bars have read,
+        #: and how many in a row. ``_confirmed_regime`` is the one the
+        #: strategy is allowed to act on.
+        self._streak_regime: str = ""
+        self._streak_bars: int = 0
+        self._confirmed_regime: str = NEUTRAL
         # Baselines for measuring one position's P&L, set at each entry.
         self._hedge_realised_at_entry = 0.0
         self._fees_at_entry = 0.0
@@ -156,6 +220,7 @@ class GexStraddleStrategy:
 
         quote = self._mark_open_straddle(bar, moment)
         profile = self._read_gex(bar, moment)
+        self._update_persistence(profile)
 
         self._check_exits(bar, moment, quote, profile, execution)
 
@@ -196,7 +261,7 @@ class GexStraddleStrategy:
 
     def _record(
         self, moment: datetime, kind: str, detail: str, net_delta: float = 0.0,
-        regime: str = "",
+        regime: str = "", gate: str = "",
     ) -> None:
         self.events.append(
             StrategyEvent(
@@ -207,27 +272,42 @@ class GexStraddleStrategy:
                 equity=self.portfolio.starting_equity + self.portfolio.realised_pnl
                 - self.portfolio.fees_paid,
                 regime=regime,
+                gate=gate,
             )
         )
         log.debug("%s | %s | %s", moment, kind, detail)
 
-    # -- the 0DTE series -------------------------------------------------
+    # -- the traded series -----------------------------------------------
 
-    def _todays_expiry(self, moment: datetime) -> date | None:
-        """The 0DTE expiry, or ``None`` when there is not one to trade.
+    def _traded_expiry(self, moment: datetime) -> date | None:
+        """The expiry the tenor policy says to trade, or ``None``.
 
-        ``max_days_to_expiry`` defaults to 0, so this is today's series
-        while it is still listed and nothing at all once it has settled.
-        Standing aside is the correct answer there -- the strategy is a
-        statement about 0DTE dealer hedging, and there is no 0DTE.
+        When a position is open this is the series it is *on*, not the one
+        that would be chosen afresh -- otherwise the exit checks would
+        measure the DTE of a series the book does not hold.
         """
-        cfg = self.cfg.strategy
-        expiries = [
-            e
-            for e in self.clock.candidate_expiries(moment, cfg.max_days_to_expiry)
-            if (e - moment.date()).days >= cfg.min_days_to_expiry
-        ]
-        return expiries[0] if expiries else None
+        position = self.portfolio.straddle
+        if position is not None:
+            return position.expiry
+        return select_expiry(self.clock, moment, self.tenor)
+
+    def _blend_expiries(self, moment: datetime, traded: date) -> list[date]:
+        """0DTE out to the traded series, nearest first.
+
+        This is the set of expiries whose gamma a dealer is carrying in
+        front of them right now.  It is capped by ``blend_max_expiries``
+        because every entry costs an open-interest read, which is a
+        subscription per listed strike per right on the live path.
+        """
+        if not self.cfg.gex.blend_front_expiries:
+            return [traded]
+        listed = self.clock.candidate_expiries(
+            moment, max(self.clock.days_to_expiry(moment, traded), 0)
+        )
+        expiries = [e for e in listed if e <= traded]
+        if traded not in expiries:
+            expiries.append(traded)
+        return sorted(expiries)[: self.cfg.gex.blend_max_expiries]
 
     # -- GEX -------------------------------------------------------------
 
@@ -239,36 +319,98 @@ class GexStraddleStrategy:
         rebuilt every bar regardless: the regime is a statement about where
         spot sits relative to the flip point, and reusing a stale spot would
         mean never seeing the crossing the strategy exists to trade.
+
+        A read that fails for one expiry does not discard the others.  The
+        blend is an aggregate, and an aggregate missing one series is a
+        worse answer than the full one but a far better answer than none --
+        the alternative is standing aside for the rest of the session
+        because one strike would not quote.
         """
         if not self.cfg.gex.enabled or self.open_interest is None:
             return None
-        expiry = self._todays_expiry(moment)
-        if expiry is None:
+        traded = self._traded_expiry(moment)
+        if traded is None:
             return None
+        expiries = self._blend_expiries(moment, traded)
 
         stale = (
-            self._oi is None
-            or self._oi_expiry != expiry
+            not self._oi
+            or self._oi_expiries != tuple(expiries)
             or self._oi_read_at is None
             or (moment - self._oi_read_at).total_seconds()
             >= self.cfg.gex.refresh_seconds
         )
         if stale:
-            try:
-                self._oi = list(
-                    self.open_interest.open_interest(moment, bar.close, expiry)
-                )
-            except Exception as exc:  # noqa: BLE001 - a bad read must not halt the run
-                log.warning("could not read open interest (%s); holding the last read", exc)
-                if self._oi is None:
-                    return None
-            else:
-                self._oi_read_at = moment
-                self._oi_expiry = expiry
+            fresh: dict[date, list[StrikeOpenInterest]] = {}
+            for expiry in expiries:
+                try:
+                    fresh[expiry] = list(
+                        self.open_interest.open_interest(moment, bar.close, expiry)
+                    )
+                except Exception as exc:  # noqa: BLE001 - a bad read must not halt the run
+                    log.warning(
+                        "could not read open interest for %s (%s); holding the "
+                        "last read for that expiry", expiry, exc,
+                    )
+                    if expiry in self._oi:
+                        fresh[expiry] = self._oi[expiry]
+            if not fresh:
+                return None
+            self._oi = fresh
+            self._oi_read_at = moment
+            self._oi_expiries = tuple(expiries)
 
-        t = self.clock.time_to_expiry(moment, expiry)
-        self._profile = self.gex.profile(bar.close, self._oi, t, bar.atm_iv)
+        self._books = [
+            ExpiryBook.of(
+                expiry,
+                self.clock.time_to_expiry(moment, expiry),
+                self._oi.get(expiry, []),
+                self.clock.days_to_expiry(moment, expiry),
+            )
+            for expiry in expiries
+        ]
+        self._profile = self.gex.blended_profile(bar.close, self._books, bar.atm_iv)
         return self._profile
+
+    # -- persistence -----------------------------------------------------
+
+    def _update_persistence(self, profile: GexProfile | None) -> None:
+        """Advance the streak, and confirm a regime once it has held.
+
+        Without the gate the confirmed regime is simply the current one, so
+        every downstream check reads the same field whether or not
+        persistence is switched on -- there is no second code path that
+        could behave differently.
+
+        A bar with no profile at all resets the streak rather than extending
+        it: a gap in the read is not evidence that the regime held through
+        it.
+        """
+        if profile is None:
+            self._streak_regime, self._streak_bars = "", 0
+            self._confirmed_regime = NEUTRAL
+            return
+        if not self.cfg.gates.persistence:
+            self._streak_regime, self._streak_bars = profile.regime, 1
+            self._confirmed_regime = profile.regime
+            return
+
+        if profile.regime == self._streak_regime:
+            self._streak_bars += 1
+        else:
+            self._streak_regime, self._streak_bars = profile.regime, 1
+        if self._streak_bars >= self.cfg.gates.persistence_bars:
+            self._confirmed_regime = profile.regime
+
+    def _confirmed_direction(self) -> int:
+        """The side the confirmed regime implies, 0 for none."""
+        from .gex import LONG_STRADDLE, NEGATIVE, POSITIVE, SHORT_STRADDLE, STAND_ASIDE
+
+        if self._confirmed_regime == NEGATIVE:
+            return LONG_STRADDLE
+        if self._confirmed_regime == POSITIVE:
+            return SHORT_STRADDLE
+        return STAND_ASIDE
 
     # -- marking ---------------------------------------------------------
 
@@ -309,15 +451,37 @@ class GexStraddleStrategy:
         if self._entries_this_session >= cfg.max_entries_per_session:
             return
 
+        # The entry window is checked here rather than in the bar loop, so
+        # the backtest and the live runner cannot disagree about which bars
+        # are eligible. Its purpose is the open-interest print: the exchange
+        # publishes final open interest for the previous session during the
+        # morning, and an entry before that lands is taken on preliminary
+        # numbers. Exits are never windowed.
         local = moment.timetz().replace(tzinfo=None)
-        if not (cfg.entry_time <= local <= cfg.entry_cutoff_time):
+        if self.cfg.gates.entry_window and not (
+            cfg.entry_time <= local <= cfg.entry_cutoff_time
+        ):
             return
 
-        expiry = self._todays_expiry(moment)
+        expiry = self._traded_expiry(moment)
         if expiry is None:
-            self._record(moment, "entry_skipped", "no 0DTE series is listed")
+            self._record(
+                moment, "entry_skipped",
+                f"no expiry listed between {self.tenor.min_days} and "
+                f"{self.tenor.max_days} trading days out",
+            )
             return
 
+        days_left = self.clock.days_to_expiry(moment, expiry)
+        if self.tenor.should_close(days_left):
+            # Nothing listed far enough out to be worth opening: entering
+            # here would open a position already eligible for the DTE exit.
+            self._record(
+                moment, "entry_skipped",
+                f"the {expiry} series is {days_left}DTE, at or below the "
+                f"{self.tenor.close_days}DTE close-out floor",
+            )
+            return
         if self.clock.seconds_to_expiry(moment, expiry) <= (
             cfg.close_before_expiry_minutes * 60
         ):
@@ -326,13 +490,35 @@ class GexStraddleStrategy:
         if profile is None:
             self._record(
                 moment, "entry_skipped",
-                "no GEX profile: open interest is unavailable for this expiry",
+                "no GEX profile: open interest is unavailable for these expiries",
             )
             return
-        direction = profile.direction
-        if direction == 0:
-            self._record(moment, "entry_skipped", profile.reason, regime=profile.regime)
+        if profile.direction == 0:
+            self._record(
+                moment, "entry_skipped", profile.reason,
+                regime=profile.regime, gate=profile.gate,
+            )
             return
+
+        direction = self._confirmed_direction()
+        if direction == 0 or direction != profile.direction:
+            self._record(
+                moment, "entry_skipped",
+                f"the {profile.regime} read has held {self._streak_bars} of the "
+                f"{self.cfg.gates.persistence_bars} bars it needs before it "
+                "counts as the regime rather than as spot crossing a level",
+                regime=profile.regime, gate=GATE_PERSISTENCE,
+            )
+            return
+
+        if self.cfg.gates.ensemble:
+            ensemble = self.gex.ensemble(bar.close, self._books, bar.atm_iv)
+            if not ensemble.unanimous or ensemble.regime != profile.regime:
+                self._record(
+                    moment, "entry_skipped", ensemble.detail,
+                    regime=profile.regime, gate=GATE_ENSEMBLE,
+                )
+                return
 
         t = self.clock.time_to_expiry(moment, expiry)
         quote = select_atm_straddle(
@@ -387,7 +573,8 @@ class GexStraddleStrategy:
         intent = "scalp gamma" if direction > 0 else "collect theta"
         self._record(
             moment, "entry",
-            f"{side} {sizing.contracts} {expiry} {quote.strike:g} straddle "
+            f"{side} {sizing.contracts} {expiry} ({days_left}DTE) "
+            f"{quote.strike:g} straddle "
             f"@ {call_fill.price + put_fill.price:.2f} "
             f"(C {call_fill.price:.2f} / P {put_fill.price:.2f}, IV {quote.iv:.3f}) "
             f"for ${cash:,.0f} {'debit' if direction > 0 else 'credit'}; "
@@ -472,26 +659,30 @@ class GexStraddleStrategy:
         cfg = self.cfg.strategy
 
         seconds_left = self.clock.seconds_to_expiry(moment, position.expiry)
+        days_left = self.clock.days_to_expiry(moment, position.expiry)
         pnl = self._position_pnl(quote, bar.close)
         premium = position.premium_at_risk(self.source.option.multiplier)
         reason: str | None = None
 
-        if seconds_left <= cfg.close_before_expiry_minutes * 60:
-            reason = f"{cfg.close_before_expiry_minutes}m to expiry"
-        elif (
-            cfg.exit_on_regime_flip
-            and profile is not None
-            and profile.direction != 0
-            and profile.direction != position.direction
-        ):
+        # The DTE floor leads the ladder and is never gated. It is the whole
+        # point of moving off 0DTE: the position comes off before the tenor
+        # decays into the range where gamma, pin risk and the staleness of
+        # the open-interest print all get worse at once.
+        if self.tenor.should_close(days_left):
             reason = (
-                f"GEX flipped to {profile.regime}: {profile.reason}. The position "
-                f"is on the wrong side of dealer hedging"
+                f"{days_left}DTE, at the {self.tenor.close_days}DTE close-out floor"
             )
-        elif position.is_long:
-            reason = self._long_exit_reason(cfg, pnl, premium)
-        else:
-            reason = self._short_exit_reason(cfg, position, quote)
+        elif seconds_left <= cfg.close_before_expiry_minutes * 60:
+            reason = f"{cfg.close_before_expiry_minutes}m to expiry"
+        elif cfg.exit_on_regime_flip and profile is not None:
+            reason = self._flip_exit_reason(bar, moment, position, profile)
+
+        if reason is None:
+            reason = (
+                self._long_exit_reason(cfg, pnl, premium)
+                if position.is_long
+                else self._short_exit_reason(cfg, position, quote)
+            )
 
         if reason is None:
             limit = cfg.daily_loss_limit_pct
@@ -508,6 +699,52 @@ class GexStraddleStrategy:
         if reason is None:
             return
         self._close_position(bar, moment, quote, execution, reason)
+
+    def _flip_exit_reason(
+        self, bar: MarketBar, moment: datetime, position, profile: GexProfile
+    ) -> str | None:
+        """Close only on a flip the gates are willing to stand behind.
+
+        A regime that has not yet held ``persistence_bars`` is spot crossing
+        a level rather than positioning changing, and closing on it churns
+        the book at exactly the wrong moments -- open interest, the only
+        input, has not moved at all.  The same is true of a flip only part
+        of the ensemble agrees with.
+
+        A blocked flip is recorded rather than silently dropped: "the
+        position stayed open through an opposing read" is a decision, and it
+        is one worth being able to count afterwards.  The hard exits above
+        are unaffected -- a gate can delay a side change, never an exit.
+        """
+        if profile.direction == 0 or profile.direction == position.direction:
+            return None
+
+        if self._confirmed_direction() != profile.direction:
+            self._record(
+                moment, "exit_deferred",
+                f"GEX reads {profile.regime} against the open position, but "
+                f"only for {self._streak_bars} of the "
+                f"{self.cfg.gates.persistence_bars} consecutive bars a flip "
+                "needs; holding",
+                regime=position.regime, gate=GATE_PERSISTENCE,
+            )
+            return None
+
+        if self.cfg.gates.ensemble:
+            ensemble = self.gex.ensemble(bar.close, self._books, bar.atm_iv)
+            if not ensemble.unanimous or ensemble.regime != profile.regime:
+                self._record(
+                    moment, "exit_deferred",
+                    f"GEX reads {profile.regime} against the open position but "
+                    f"{ensemble.detail}; holding",
+                    regime=position.regime, gate=GATE_ENSEMBLE,
+                )
+                return None
+
+        return (
+            f"GEX flipped to {profile.regime}: {profile.reason}. The position "
+            f"is on the wrong side of dealer hedging"
+        )
 
     def _long_exit_reason(self, cfg, pnl: float, premium: float) -> str | None:
         """Stops for the long (negative-GEX) side, measured on position P&L."""
@@ -635,7 +872,9 @@ class GexStraddleStrategy:
             if self._last_hedge_time
             else None
         )
-        decision = self.hedger.decide(net_delta, elapsed)
+        decision = self.hedger.decide(
+            net_delta, elapsed, self.clock.in_session(moment)
+        )
         if not decision.should_hedge:
             return
 
@@ -665,6 +904,8 @@ class GexStraddleStrategy:
         option_delta = self.portfolio.option_delta_units(quote)
         hedge_delta = self.portfolio.hedge_delta_units()
         net = option_delta + hedge_delta
+        in_session = self.clock.in_session(moment)
+        expiry = position.expiry if position else self._traded_expiry(moment)
         return BarState(
             timestamp=moment,
             future=bar.close,
@@ -688,9 +929,20 @@ class GexStraddleStrategy:
             equity=self.portfolio.equity(quote, bar.close),
             realised_pnl=self.portfolio.realised_pnl,
             fees_paid=self.portfolio.fees_paid,
-            in_band=self.cfg.hedge.in_band(net) if position or hedge_delta else True,
+            in_band=(
+                self.cfg.hedge.in_band(net, in_session)
+                if position or hedge_delta
+                else True
+            ),
             gex_total=profile.total_gex if profile else None,
             gex_flip=profile.flip_point if profile else None,
             gex_regime=profile.regime if profile else NEUTRAL,
             distance_to_flip=profile.distance_to_flip if profile else None,
+            gex_confidence=profile.confidence if profile else None,
+            gex_gate=profile.gate if profile else "",
+            confirmed_regime=self._confirmed_regime,
+            days_to_expiry=(
+                self.clock.days_to_expiry(moment, expiry) if expiry else None
+            ),
+            in_session=in_session,
         )
