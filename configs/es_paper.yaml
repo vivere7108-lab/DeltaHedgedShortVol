@@ -46,6 +46,7 @@ ibkr:
   port: 4002                       # IB Gateway paper. TWS paper is 7497.
   client_id: 17
   allow_live_trading: false        # the gate between this file and real money
+  use_delayed_data: true             # paper account has no CME real-time entitlement; delayed is fine for dry-run
   poll_seconds: 5.0
   use_whatif_margin: true
   hedge_order_type: MKT
