@@ -17,10 +17,17 @@
 # With both off, a correctly delta-hedged straddle must break even. It will
 # not do so on any single run: an ATM straddle carries several times the
 # gamma of an out-of-the-money put, so rebalancing once per 5-minute bar
-# leaves a path-dependent residual of a few percent. That residual is
-# discrete-time hedging error, it has mean zero, and it shrinks when you
-# hedge more often. Average across seeds before concluding anything --
-# tests/test_backtest.py::TestCorrectness does exactly that.
+# leaves a path-dependent residual. At this system's 2-5 DTE tenor the
+# position is carried past the close, and the backtest has no bars to
+# rebalance against overnight -- so a single run's residual now runs into
+# the high single digits or more of equity, well past the "a few percent"
+# a same-day-only position leaves. That residual is still discrete-time
+# hedging error (plus, overnight, real unhedged gap risk this backtest
+# cannot rebalance against), it has mean zero, and the intraday component
+# still shrinks when you hedge more often. Average across seeds before
+# concluding anything -- tests/test_backtest.py::TestCorrectness does
+# exactly that, and the README's "A single run does not measure the hedge"
+# has the numbers.
 
 risk_source: ES
 starting_equity: 250000.0

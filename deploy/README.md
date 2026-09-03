@@ -188,19 +188,22 @@ sudo -u deltahedger /opt/deltahedger/.venv/bin/deltahedger doctor \
   [ok  ] qualified the future             ESU5
   [ok  ] qualified the hedge              MESU5
   [ok  ] future price                     5,412.25
-  [ok  ] a 0DTE series is listed          2025-09-02
-  [ok  ] ATM straddle quote               5410 @ 21.40 (IV 0.118)
+  [ok  ] a 2-5DTE series is listed        2025-09-05 (3DTE)
+  [ok  ] ATM straddle quote               5410 @ 41.20 (IV 0.118)
   [ok  ] open interest (generic tick 101) 41 strikes, 38,204 contracts
+  [ok  ] open-interest subscription budget ~328 market-data lines per refresh
+         (4 expiries x 41 strikes x 2 rights), requested in batches of 50
   [ok  ] journal directory is writable    /opt/deltahedger/runs/live
 
-GEX +412.7M/1% at 5,412.25, flip 5,388.0, regime positive
+GEX +412.7M/1% at 5,412.25, flip 5,388.0, confidence 34%, regime positive
   right now it would: SHORT the ATM straddle and collect theta
 ```
 
-Every one of those is a thing you would otherwise discover at 09:35 as the
-strategy quietly doing nothing — which in a log is indistinguishable from
-the market genuinely reading neutral. **Do not skip to step 4 with a
-failing check.**
+Every one of those is a thing you would otherwise discover at 10:00 (the
+entry window's open) as the strategy quietly doing nothing — which in a
+log is indistinguishable from the market genuinely reading neutral, or
+from one of the four gates standing it aside. **Do not skip to step 4 with
+a failing check.**
 
 Run it again after any gateway restart or config change. It places no
 orders and is safe to run at any time.

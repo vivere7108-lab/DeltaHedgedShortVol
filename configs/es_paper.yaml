@@ -20,11 +20,17 @@ starting_equity: 250000.0
 hedge:
   target: 0.0
   band: 10.0                       # the fixed heuristic under test
+  overnight_band_multiplier: 2.5   # wider outside RTH; the walk now holds
+                                   # the position overnight and across days
   min_seconds_between_hedges: 60.0  # damp churn on noisy live quotes
 
 gex:
   enabled: true
   refresh_seconds: 900.0
+  blend_front_expiries: true       # classify on the front book, not just
+                                   # the traded series
+  blend_max_expiries: 4            # see `deltahedger doctor` for the
+                                   # market-data-line cost of raising this
 
 sizing:
   buying_power_pct: 0.10           # smaller than the backtest default: the
@@ -33,10 +39,13 @@ sizing:
   max_straddles: 10
 
 strategy:
-  min_days_to_expiry: 0
-  max_days_to_expiry: 0
-  entry_time: '09:35'
-  entry_cutoff_time: '14:30'
+  min_days_to_expiry: 2            # the shipped tenor: see the README
+  max_days_to_expiry: 5
+  prefer_min_days_to_expiry: 3
+  prefer_max_days_to_expiry: 4
+  close_at_days_to_expiry: 1
+  entry_time: '10:00'              # after the exchange's final OI print
+  entry_cutoff_time: '11:30'
   exit_on_regime_flip: true
   reenter_after_exit: true
   max_entries_per_session: 3

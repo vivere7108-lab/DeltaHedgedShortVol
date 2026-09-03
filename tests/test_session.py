@@ -5,6 +5,7 @@ import pytest
 
 from deltahedger.session import (
     SessionClock, easter, holidays, is_trading_day, next_trading_day,
+    trading_days_between,
 )
 
 NY = ZoneInfo("America/New_York")
@@ -53,6 +54,37 @@ class TestCalendar:
     def test_next_trading_day_skips_the_weekend_and_the_holiday(self):
         assert next_trading_day(date(2025, 7, 3)) == date(2025, 7, 7)
         assert next_trading_day(date(2025, 6, 13)) == date(2025, 6, 16)
+
+
+class TestTradingDaysBetween:
+    """The DTE arithmetic every tenor bound in this codebase means."""
+
+    def test_a_same_day_expiry_is_zero_dte(self):
+        assert trading_days_between(date(2025, 6, 10), date(2025, 6, 10)) == 0
+
+    def test_the_next_session_is_one_dte(self):
+        assert trading_days_between(date(2025, 6, 10), date(2025, 6, 11)) == 1
+
+    def test_a_weekend_costs_nothing(self):
+        """Friday to Monday is one trading day, the same as Thursday to
+        Friday -- the weekend does not count."""
+        assert trading_days_between(date(2025, 6, 13), date(2025, 6, 16)) == 1
+
+    def test_a_holiday_costs_nothing(self):
+        """July 4th 2025 is a Friday: Thursday to the following Monday is
+        one trading day, crossing both the holiday and the weekend."""
+        assert trading_days_between(date(2025, 7, 3), date(2025, 7, 7)) == 1
+
+    def test_a_full_week_is_five_trading_days(self):
+        assert trading_days_between(date(2025, 6, 9), date(2025, 6, 16)) == 5
+
+    def test_it_is_negative_for_a_day_in_the_past(self):
+        assert trading_days_between(date(2025, 6, 11), date(2025, 6, 10)) == -1
+
+    def test_starting_on_a_non_trading_day_still_counts_correctly(self):
+        """A Saturday reads Monday as one trading day away, not zero --
+        ``start`` itself is never counted whether or not it is a session."""
+        assert trading_days_between(date(2025, 6, 14), date(2025, 6, 16)) == 1
 
 
 class TestSessionClock:

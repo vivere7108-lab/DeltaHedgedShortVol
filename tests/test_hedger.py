@@ -190,3 +190,49 @@ class TestNeutralTarget:
             decision = neutral.decide(float(net))
             if decision.should_hedge:
                 assert abs(decision.residual_delta) <= es.hedge_quantum / 2 + 1e-9
+
+
+class TestOvernightBand:
+    """The band widens outside the regular session (see ``config.py`` and
+    the hedger's module docstring): a position is now carried overnight, so
+    a breach that would bind during RTH may not bind outside it."""
+
+    @pytest.fixture
+    def neutral(self, es):
+        return DeltaHedger(
+            HedgeConfig(target=0.0, band=10.0, overnight_band_multiplier=2.5), es
+        )
+
+    def test_a_breach_that_binds_intraday_can_be_inert_overnight(self, neutral):
+        """15 units breaches the 10-wide intraday band but sits inside the
+        25-wide overnight one."""
+        assert neutral.decide(15.0, in_session=True).should_hedge
+        assert not neutral.decide(15.0, in_session=False).should_hedge
+
+    def test_a_large_enough_breach_still_hedges_overnight(self, neutral):
+        """The band widens; it is never switched off. A move past the wider
+        bound must still be hedged, because an overnight gap is exactly
+        when an unhedged straddle does the most damage."""
+        decision = neutral.decide(40.0, in_session=False)
+        assert decision.should_hedge and decision.contracts < 0  # sells to reduce it
+
+    def test_the_default_multiplier_is_off_during_the_session(self, es):
+        """``in_session`` defaults True, so a caller that never passes it
+        (as every pre-existing test in this file does) gets the intraday
+        band unchanged -- the overnight widening is opt-in per call, not a
+        silent global change."""
+        cfg = HedgeConfig(target=0.0, band=10.0, overnight_band_multiplier=5.0)
+        hedger = DeltaHedger(cfg, es)
+        assert hedger.decide(12.0).should_hedge
+
+    def test_a_multiplier_of_one_hedges_identically_around_the_clock(self, es):
+        cfg = HedgeConfig(target=0.0, band=10.0, overnight_band_multiplier=1.0)
+        hedger = DeltaHedger(cfg, es)
+        day = hedger.decide(15.0, in_session=True)
+        night = hedger.decide(15.0, in_session=False)
+        assert day.should_hedge == night.should_hedge == True
+        assert day.contracts == night.contracts
+
+    def test_the_reason_names_the_overnight_band(self, neutral):
+        decision = neutral.decide(15.0, in_session=False)
+        assert "overnight" in decision.reason

@@ -25,8 +25,44 @@ futures options.  It reproduces CME SPAN's risk-array method: reprice the
 position across a grid of price and volatility scenarios and charge the
 worst loss.  Because we already have Black-76, the scenarios can be priced
 exactly rather than approximated, so the model captures the thing that
-matters most for a short 0DTE put -- margin exploding as the strike comes
+matters most for a short option -- margin exploding as the strike comes
 into range of the scan.
+
+What the tenor did to the requirement
+-------------------------------------
+Moving from 0DTE to 3-4 DTE changes the two branches in opposite
+directions, and the reason is worth stating because it is not what most
+people expect.
+
+The **scan range does not lengthen with the option**.  SPAN scans a
+one-day move -- about 49 ES points at a 2455 outright margin -- whatever
+the tenor of what you are holding.  What changes is how much the straddle
+is worth *after* that move relative to what it is worth now, and a
+longer-dated straddle has already collected most of the value that move
+would create.  So the short branch's margin per straddle is close to flat
+across the range (measured at 5000, 15 vol, a 250k account)::
+
+    tenor   premium   SPAN margin   debit    straddles short / long
+    0DTE      15.66        $1,699    $783                 15 / 25*
+    2DTE      46.97        $1,324   $2,349                 19 / 11
+    3DTE      56.45        $1,373   $2,822                 19 /  9
+    5DTE      71.73        $1,502   $3,586                 17 /  7
+
+    (* capped by max_straddles rather than by the budget)
+
+The **long branch is a different story**, because its requirement is the
+debit and the debit nearly quadruples.  So the same ``buying_power_pct``
+now buys a short book of roughly the same size and a long book two to
+three times smaller, and the two branches no longer carry comparable
+gamma.  That is a real asymmetry, it is a property of the requirement
+rather than of the signal, and the backtest's "Band feasibility" section
+reports median gamma per branch so a regime comparison cannot mistake it
+for one.
+
+One thing genuinely improves.  A one-day scan was a conservative charge
+against a position that would be flat by the bell; against a position
+carried overnight for several sessions it is the right horizon.  The
+margin now covers the risk it was designed to cover.
 
 ``RegTMarginModel`` is the 15%-of-notional equity-option rule.  It is
 included because it is what most people reach for, and it overstates ES
@@ -114,6 +150,10 @@ class SpanScanMarginModel:
     ``future_initial_margin / multiplier`` recovers the point move being
     scanned (about 49 ES points, ~1%, at a 2455 margin).  Volatility is
     scanned as a relative bump.
+
+    The scan is a *one-day* move and does not stretch with the option's
+    tenor, which is SPAN's design and not an approximation here.  See the
+    module docstring for what that does to the two branches at 2-5 DTE.
     """
 
     scan_multiplier: float = 1.0

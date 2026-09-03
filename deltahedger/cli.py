@@ -4,6 +4,7 @@
     deltahedger fetch     --config configs/es_default.yaml
     deltahedger live      --config configs/es_default.yaml --dry-run
     deltahedger sweep     --config configs/es_default.yaml --bands 5,10,20
+    deltahedger sweep     --config configs/es_default.yaml --gates
     deltahedger gex       --config configs/es_default.yaml --price 5000
     deltahedger doctor    --config configs/es_paper.yaml
     deltahedger report    --config configs/es_paper.yaml
@@ -116,6 +117,68 @@ def cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The gate sweep's runs: a label and the ``gates`` overrides that make it.
+#: "none" and "all" bracket the comparison; the middle rows turn exactly one
+#: gate on so its individual cost is readable rather than inferred.
+GATE_RUNS: tuple[tuple[str, dict], ...] = (
+    ("no gates", {}),
+    ("confidence", {"confidence": True}),
+    ("flip distance", {"flip_distance": True}),
+    ("ensemble", {"ensemble": True}),
+    ("persistence", {"persistence": True}),
+    ("entry window", {"entry_window": True}),
+    ("all gates", {
+        "confidence": True, "flip_distance": True, "ensemble": True,
+        "persistence": True, "entry_window": True,
+    }),
+)
+
+
+def cmd_sweep_gates(args: argparse.Namespace) -> int:
+    """Price each gate on its own, then all of them together.
+
+    Four gates that each look reasonable can between them leave a strategy
+    that never trades, and a headline of "no trades" does not say which one
+    did it.  Every row here is the same backtest with exactly one gate
+    switched on, against a first row with none of them, so the cost of each
+    is a difference rather than an inference.
+
+    Read the two regime columns rather than the total.  A gate that improves
+    the net by suppressing one branch entirely has not improved anything;
+    it has stopped testing half the strategy, and the trade counts next to
+    each column say so.
+    """
+    from .backtest import run_backtest
+
+    cfg = _load(args)
+    print(
+        f"{'gates':>14} {'entries':>7} {'return':>9} {'long gamma':>12} "
+        f"{'(n)':>4} {'short gamma':>12} {'(n)':>4} {'blocked by':>28}"
+    )
+    print("-" * 96)
+    for label, overrides in GATE_RUNS:
+        for name in ("confidence", "flip_distance", "ensemble", "persistence",
+                     "entry_window"):
+            setattr(cfg.gates, name, overrides.get(name, False))
+        m = run_backtest(cfg).metrics
+        blocked = ", ".join(
+            f"{name} {count}" for name, count in sorted(m.gate_blocks.items())
+        ) or "-"
+        print(
+            f"{label:>14} {m.entries:>7} {m.total_return:>8.2%} "
+            f"${m.long_gamma_pnl:>11,.0f} {m.long_gamma_trades:>4} "
+            f"${m.short_gamma_pnl:>11,.0f} {m.short_gamma_trades:>4} "
+            f"{blocked:>28}"
+        )
+    print(
+        "\nEvery row is the same data and the same tenor; only the gates "
+        "differ.\n'blocked by' counts would-be entries the gate refused, "
+        "including the\nungated reasons (no expiry listed, no open interest, "
+        "no buying power)."
+    )
+    return 0
+
+
 def cmd_sweep(args: argparse.Namespace) -> int:
     """Run the backtest across several band widths and compare.
 
@@ -126,6 +189,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     costing anything worth fixing.
     """
     from .backtest import run_backtest
+
+    if args.gates:
+        return cmd_sweep_gates(args)
 
     cfg = _load(args)
     widths = [float(w) for w in args.bands.split(",")]
@@ -150,45 +216,77 @@ def cmd_gex(args: argparse.Namespace) -> int:
     """Print the GEX profile at a given spot, without trading anything.
 
     Useful before a paper session: it says which side the strategy would
-    take today and how far spot is from the flip, which is the one number
-    worth eyeballing before letting the runner act on it.
+    take today, how far spot is from the flip, and how much of the blended
+    read comes from each expiry -- which is what tells you whether the
+    number is being made by the series you are about to trade or by the one
+    expiring this afternoon.
     """
     from datetime import datetime
 
+    from .chain import select_expiry
     from .data import build_open_interest_provider
-    from .gex import GexCalculator
+    from .gex import ExpiryBook, GexCalculator
     from .session import SessionClock
     from .volsurface import VolSurface
 
     cfg = _load(args)
     source = cfg.source
     clock = SessionClock(source)
+    tenor = cfg.strategy.tenor()
     now = clock.localize(
         datetime.fromisoformat(args.at) if args.at else datetime.now()
     )
 
-    expiries = clock.candidate_expiries(now, cfg.strategy.max_days_to_expiry)
-    if not expiries:
-        print(f"no expiry inside {cfg.strategy.max_days_to_expiry} day(s) of {now:%Y-%m-%d %H:%M}")
+    traded = select_expiry(clock, now, tenor)
+    if traded is None:
+        print(
+            f"no expiry listed between {tenor.min_days} and {tenor.max_days} "
+            f"trading days of {now:%Y-%m-%d %H:%M}"
+        )
         return 1
-    expiry = expiries[0]
+
+    expiries = [
+        e
+        for e in clock.candidate_expiries(now, clock.days_to_expiry(now, traded))
+        if e <= traded
+    ][: cfg.gex.blend_max_expiries] if cfg.gex.blend_front_expiries else [traded]
 
     provider = build_open_interest_provider(cfg, source)
-    calculator = GexCalculator(cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate)
-    price = args.price
-    t = clock.time_to_expiry(now, expiry)
-    profile = calculator.profile(
-        price, provider.open_interest(now, price, expiry), t, args.iv
+    calculator = GexCalculator(
+        cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate, cfg.gates
     )
+    price = args.price
+    books = [
+        ExpiryBook.of(
+            expiry,
+            clock.time_to_expiry(now, expiry),
+            provider.open_interest(now, price, expiry),
+            clock.days_to_expiry(now, expiry),
+        )
+        for expiry in expiries
+    ]
+    profile = calculator.blended_profile(price, books, args.iv)
+    ensemble = calculator.ensemble(price, books, args.iv)
 
     intent = {
         1: "LONG the ATM straddle and scalp gamma",
         -1: "SHORT the ATM straddle and collect theta",
         0: "stand aside",
     }[profile.direction]
-    print(f"\n{expiry} chain at {price:,.2f}, {t * 365 * 24:.2f}h to expiry, IV {args.iv:.3f}")
+    dte = clock.days_to_expiry(now, traded)
+    t = clock.time_to_expiry(now, traded)
+    print(
+        f"\nwould trade {traded} ({dte}DTE, {t * 365 * 24:.1f}h), IV {args.iv:.3f}, "
+        f"spot {price:,.2f}"
+    )
+    print(f"  regime read on {len(books)} front expiries")
     print(f"  total GEX      ${profile.total_gex / 1e6:+,.1f}M per 1% move")
     print(f"  gross GEX      ${profile.gross_gex / 1e6:,.1f}M")
+    print(
+        f"  confidence     {profile.confidence:.1%} "
+        f"(gate at {cfg.gates.min_confidence_ratio:.0%}"
+        f"{'' if cfg.gates.confidence else ', off'})"
+    )
     print(
         "  gamma flip     "
         + (f"{profile.flip_point:,.2f} "
@@ -197,9 +295,13 @@ def cmd_gex(args: argparse.Namespace) -> int:
     )
     peak = profile.peak_strike
     print(f"  peak gamma     {peak:,.0f}" if peak is not None else "  peak gamma     -")
-    print(f"  regime         {profile.regime}")
+    print(f"  regime         {profile.regime}"
+          + (f" (blocked by the {profile.gate} gate)" if profile.gate else ""))
     print(f"  because        {profile.reason}")
+    print(f"  ensemble       {ensemble.detail}")
     print(f"  would          {intent}\n")
+    print(profile.expiry_table())
+    print()
     print(profile.table())
     return 0
 
@@ -220,6 +322,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         IbkrOpenInterestProvider,
         _is_paper_account,
     )
+    from .chain import select_expiry
     from .gex import GexCalculator
     from .session import SessionClock
     from .volsurface import VolSurface
@@ -269,11 +372,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             price = None
 
         now = clock.localize(datetime.now())
-        expiries = clock.candidate_expiries(now, cfg.strategy.max_days_to_expiry)
-        expiry = expiries[0] if expiries else None
+        tenor = cfg.strategy.tenor()
+        expiry = select_expiry(clock, now, tenor)
         check(
-            "a 0DTE series is listed", expiry is not None,
-            str(expiry) if expiry else "none today -- the strategy stands aside",
+            f"a {tenor.min_days}-{tenor.max_days}DTE series is listed",
+            expiry is not None,
+            f"{expiry} ({clock.days_to_expiry(now, expiry)}DTE)" if expiry
+            else "none in range -- the strategy stands aside",
         )
 
         if price is None or expiry is None:
@@ -302,14 +407,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             else "none returned -- GEX cannot be computed and the strategy "
                  "will stand aside on every bar",
         )
+        # The blend reads one chain per front expiry, and each chain costs
+        # two market-data lines per listed strike. That is the number most
+        # likely to hit an account's simultaneous-line limit, so say it out
+        # loud before a walk rather than after.
+        lines = 2 * len(rows) * (
+            cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1
+        )
+        check(
+            "open-interest subscription budget", True,
+            f"~{lines} market-data lines per refresh "
+            f"({cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1} "
+            f"expiries x {len(rows)} strikes x 2 rights), requested in batches "
+            f"of {IbkrOpenInterestProvider.MAX_CONCURRENT}",
+        )
 
         if rows and total > 0:
             atm_iv = straddle.iv if straddle else cfg.data.default_atm_iv
             calculator = GexCalculator(
-                cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate
+                cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate, cfg.gates
             )
             profile = calculator.profile(price, rows, t, atm_iv)
             print()
+            print(
+                "The read below is the traded expiry alone. The strategy "
+                "blends the front expiries;\n`deltahedger gex` prints that "
+                "read with its per-expiry breakdown."
+            )
             print(profile.describe())
             intent = {
                 1: "LONG the ATM straddle and scalp gamma",
@@ -509,9 +633,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deltahedger",
         description=(
-            "GEX-directed, delta-hedged 0DTE straddles on ES futures options. "
-            "Dealer gamma exposure picks the side; a fixed delta band holds it "
-            "neutral."
+            "GEX-directed, delta-hedged 2-5 DTE straddles on ES futures "
+            "options. Dealer gamma exposure picks the side; a fixed delta "
+            "band holds it neutral."
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -563,6 +687,10 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--bar-size", help='e.g. "5 mins"')
     sweep.add_argument(
         "--bands", default="5,10,15,20,40", help="comma-separated band half-widths",
+    )
+    sweep.add_argument(
+        "--gates", action="store_true",
+        help="sweep the stand-aside gates one at a time instead of band widths",
     )
     sweep.set_defaults(func=cmd_sweep)
 

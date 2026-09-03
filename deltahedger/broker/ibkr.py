@@ -315,13 +315,29 @@ class IbkrOpenInterestProvider:
     read.
 
     What comes back is the *exchange's* open interest, which is an
-    end-of-previous-day figure.  That is the honest input -- same-day 0DTE
-    flow is not in it and cannot be -- and it is why the strategy treats a
-    GEX read as a regime classification rather than a precise level.
+    end-of-previous-day figure.  That is the honest input -- same-day flow
+    is not in it and cannot be -- and it is why the strategy treats a GEX
+    read as a regime classification rather than a precise level.
+
+    Line budget
+    -----------
+    The GEX profile is a blend over the front expiries, and this provider is
+    called once per expiry in it.  Each call wants two market-data lines per
+    listed strike, so a four-expiry blend over a 2%-wide window on ES asks
+    for several hundred subscriptions -- comfortably past the simultaneous-
+    line limit on an ordinary account, where the excess is silently dropped
+    rather than refused.  ``MAX_CONCURRENT`` bounds it: strikes are
+    requested in batches, each batch is allowed to settle, and it is
+    cancelled before the next goes out.  The cost is ``settle_seconds`` per
+    batch, paid on the ``gex.refresh_seconds`` timer rather than per poll.
     """
 
     #: Generic tick 101 is option open interest.
     GENERIC_TICKS = "101"
+    #: Market-data lines held at once. Well inside the 100 an ordinary IBKR
+    #: account carries, leaving room for the future, the hedge and the
+    #: chain quotes the rest of the runner is using at the same time.
+    MAX_CONCURRENT = 50
 
     def __init__(
         self, connection: IbkrConnection, cfg: Config, settle_seconds: float = 3.0
@@ -336,6 +352,31 @@ class IbkrOpenInterestProvider:
         from ..chain import strike_grid
 
         strikes = strike_grid(future_price, self.conn.source, self.cfg.gex.strike_width_pct)
+        batch = max(self.MAX_CONCURRENT // 2, 1)  # two rights per strike
+        rows: list[StrikeOpenInterest] = []
+        listed = 0
+        for start in range(0, len(strikes), batch):
+            found, rows_in_batch = self._read_batch(
+                expiry, strikes[start:start + batch]
+            )
+            listed += found
+            rows.extend(rows_in_batch)
+
+        if not listed:
+            log.warning("no listed strikes near %.2f for %s", future_price, expiry)
+            return []
+        if not rows:
+            log.warning(
+                "IBKR returned no open interest for %s. The account may not carry "
+                "the market-data permission for it; GEX cannot be computed and the "
+                "strategy will stand aside.", expiry,
+            )
+        return rows
+
+    def _read_batch(
+        self, expiry: date, strikes: list[float]
+    ) -> tuple[int, list[StrikeOpenInterest]]:
+        """One batch of strikes: subscribe, settle, read, always cancel."""
         subscriptions: dict[float, dict[str, Any]] = {}
         for strike in strikes:
             legs: dict[str, Any] = {}
@@ -351,8 +392,7 @@ class IbkrOpenInterestProvider:
                 subscriptions[strike] = legs
 
         if not subscriptions:
-            log.warning("no listed strikes near %.2f for %s", future_price, expiry)
-            return []
+            return 0, []
 
         # Open interest arrives on its own tick, after the snapshot.
         self.conn.ib.sleep(self.settle_seconds)
@@ -370,14 +410,7 @@ class IbkrOpenInterestProvider:
             for legs in subscriptions.values():
                 for ticker in legs.values():
                     self.conn.ib.cancelMktData(ticker.contract)
-
-        if not rows:
-            log.warning(
-                "IBKR returned no open interest for %s. The account may not carry "
-                "the market-data permission for it; GEX cannot be computed and the "
-                "strategy will stand aside.", expiry,
-            )
-        return rows
+        return len(subscriptions), rows
 
 
 def _open_interest(ticker: Any, right: str) -> float:

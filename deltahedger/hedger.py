@@ -32,6 +32,26 @@ The band is target-agnostic and symmetric, which matters here more than it
 looks: the same width is applied whether the book is long gamma or short it,
 so a comparison between the two regimes measures the signal rather than the
 hedger.
+
+Outside the session
+-------------------
+The position is held for several sessions now, so for most of its life the
+regular session is closed.  ``decide`` therefore takes ``in_session`` and
+widens the band by ``overnight_band_multiplier`` when it is false: outside
+RTH only a *larger* breach is hedged.
+
+The reason is not that overnight delta matters less -- it matters more.  It
+is that overnight the two costs of hedging both go up while the information
+in a breach goes down: the book is quoted wider, so each MES fill gives up
+more; and a delta picked up on thin overnight volume is as likely to be
+handed back by the open as to be realised.  Hedging is not switched off,
+because a gap through the band is exactly the event an unhedged straddle
+cannot survive.  Setting the multiplier to 1.0 hedges identically around the
+clock, which is the control to compare against.
+
+Only the *width* is session-dependent.  The target, the granularity rule and
+the strict-improvement rule are the same at every hour, so the residual
+bound stays whichever of half a contract or the effective band is wider.
 """
 
 from __future__ import annotations
@@ -73,14 +93,19 @@ class DeltaHedger:
         self,
         net_delta: float,
         seconds_since_last_hedge: float | None = None,
+        in_session: bool = True,
     ) -> HedgeDecision:
         cfg = self.cfg
+        low, high = cfg.bounds(in_session)
+        where = "" if in_session else " (overnight band)"
         no_trade = lambda reason: HedgeDecision(  # noqa: E731
             False, 0, net_delta, net_delta, cfg.target, reason
         )
 
-        if cfg.in_band(net_delta):
-            return no_trade(f"net delta {net_delta:.1f} inside [{cfg.lower:.1f}, {cfg.upper:.1f}]")
+        if cfg.in_band(net_delta, in_session):
+            return no_trade(
+                f"net delta {net_delta:.1f} inside [{low:.1f}, {high:.1f}]{where}"
+            )
 
         if (
             seconds_since_last_hedge is not None
@@ -127,7 +152,7 @@ class DeltaHedger:
             net_delta_after=net_after,
             target=cfg.target,
             reason=(
-                f"net delta {net_delta:.1f} outside [{cfg.lower:.1f}, {cfg.upper:.1f}]"
+                f"net delta {net_delta:.1f} outside [{low:.1f}, {high:.1f}]{where}"
                 f"; {side} {abs(contracts)} {self.source.hedge.symbol} -> "
                 f"{net_after:.1f}"
             ),

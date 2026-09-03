@@ -1,13 +1,19 @@
-# GEX-directed, delta-hedged 0DTE straddles on ES futures options.
+# GEX-directed, delta-hedged 2-5 DTE straddles on ES futures options.
 #
-# Read dealer gamma exposure off the 0DTE chain, find the gamma flip point,
-# and take the side dealer hedging is forced to supply:
+# Read dealer gamma exposure off the front expiries -- 0DTE through the
+# traded series -- find the gamma flip point, and take the side dealer
+# hedging is forced to supply:
 #
 #   negative GEX -> dealers amplify moves -> LONG the ATM straddle, scalp gamma
 #   positive GEX -> dealers damp moves    -> SHORT the ATM straddle, hold theta
 #   near the flip                         -> stand aside
 #
-# The delta band is a fixed heuristic for the initial forward walk.
+# Four gates can additionally stand the strategy aside on a read that is
+# not confident, not corroborated by nearby expiries, has not held, or
+# arrives outside the morning entry window -- see `gates:` below.
+#
+# The delta band is a fixed heuristic for the initial forward walk, widened
+# outside the regular session since the position is now carried overnight.
 #
 # Generate a fresh copy of this file with:  deltahedger config -o my.yaml
 
@@ -24,12 +30,18 @@ hedge:
   # delta by 10 units, so anything below 5 cannot bind at all (the hedger
   # only trades when a whole contract lands closer to target). 10 is the
   # smallest value that both binds and leaves room to land inside the band.
+  # At the 2-5 DTE tenor this covers a few ES points -- run `deltahedger
+  # backtest` and read "Band feasibility" for what it is at your book size.
   #
   # One number is used in both regimes, which is a simplification: hedging
   # a long straddle realises a gamma scalp, hedging a short one locks in a
   # loss against theta. `deltahedger sweep` breaks the result out by regime
   # so the cost of that simplification is visible before it is fixed.
   band: 10.0
+  # Outside the regular session the band widens by this factor -- wider
+  # spreads and thin volume make a tight overnight hedge expensive and its
+  # information short-lived, but a large enough breach is still hedged.
+  overnight_band_multiplier: 2.5
   min_hedge_contracts: 1
   max_hedge_contracts: 200
   min_seconds_between_hedges: 0.0
@@ -42,14 +54,33 @@ gex:
   # which side. Flip these to test how much of the result depends on it.
   call_sign: 1.0
   put_sign: -1.0
-  strike_width_pct: 0.02      # strikes within 2% carry essentially all 0DTE gamma
+  strike_width_pct: 0.02      # strikes within 2% carry essentially all the
+                              # front expiries' gamma
   flip_search_pct: 0.03       # hypothetical-spot grid for the flip search
   flip_search_steps: 61
-  neutral_gex_fraction: 0.05  # |net| below 5% of gross reads as "dealers flat"
   flip_proximity_pct: 0.0015  # right at the flip, the sign is about to change
-  min_hours_to_expiry: 0.5    # keeps the late-session profile legible
+  min_hours_to_expiry: 0.5    # keeps the nearest expiry's profile legible
   refresh_seconds: 900.0      # OI is an end-of-day figure; the profile is
                               # still recomputed at the live spot every bar
+  # Classify on the aggregate of the front expiries, not the traded series
+  # alone -- a dealer hedges a book, not one series. Capped for the live
+  # market-data-line budget; `deltahedger doctor` reports what it costs.
+  blend_front_expiries: true
+  blend_max_expiries: 4
+
+gates:
+  # Four independent reasons to stand aside, each priced on its own by
+  # `deltahedger sweep --gates`.
+  confidence: true            # |total|/gross GEX below this reads as noise
+  min_confidence_ratio: 0.15
+  flip_distance: true         # spot within flip_proximity_pct of the flip
+  ensemble: true               # unanimous across a skew/sign-convention grid
+  ensemble_skew_slope_deltas: [-0.5, 0.0, 0.5]
+  ensemble_sign_conventions: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
+  persistence: true            # a regime must hold this many bars in a row
+  persistence_bars: 3
+  entry_window: true           # entries only inside strategy.entry_time/
+                               # entry_cutoff_time; exits are never gated
 
 sizing:
   buying_power_pct: 0.15      # margin for a short straddle, debit for a long one
@@ -62,17 +93,26 @@ sizing:
   span_short_option_minimum: 250.0
 
 strategy:
-  min_days_to_expiry: 0       # 0DTE only, both ends
-  max_days_to_expiry: 0
-  entry_time: '09:35'
-  entry_cutoff_time: '14:30'
-  close_before_expiry_minutes: 5
+  # Trade a listed expiry 2-5 trading days out, preferring the middle of
+  # that range, and close at the 1DTE floor -- before the expiry-week
+  # gamma spike and the staleness of the open-interest print both worsen.
+  min_days_to_expiry: 2
+  max_days_to_expiry: 5
+  prefer_min_days_to_expiry: 3
+  prefer_max_days_to_expiry: 4
+  close_at_days_to_expiry: 1
+  # Entries only after the exchange's final open-interest print for the
+  # previous session has landed; exits are always live (gated by
+  # gates.entry_window, not by this window alone).
+  entry_time: '10:00'
+  entry_cutoff_time: '11:30'
+  close_before_expiry_minutes: 5  # backstop only; the DTE floor leads
   # Short straddle: judged on the premium, which is what runs away.
   short_stop_loss_premium_multiple: 2.5
   short_take_profit_pct: 0.60
   # Long straddle: judged on position P&L (straddle + the gamma the hedge
   # scalped back), as a fraction of the debit. A premium-decay stop would be
-  # wrong -- a long 0DTE straddle is supposed to bleed on the mark.
+  # wrong -- a long straddle is supposed to bleed on the mark.
   long_stop_loss_pct: 0.50
   long_take_profit_pct: 1.00
   daily_loss_limit_pct: 0.05

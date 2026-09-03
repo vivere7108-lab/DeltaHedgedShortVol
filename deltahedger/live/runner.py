@@ -17,7 +17,14 @@ Differences from the backtest that are worth being explicit about:
   * open interest is the exchange's, read through
     ``IbkrOpenInterestProvider``, rather than generated.  A forward test
     with a generated OI surface would be measuring the generator, so the
-    live path refuses to fall back to one.
+    live path refuses to fall back to one;
+  * **the loop does not stop at the bell.**  The tenor is multi-session, so
+    the book is carried overnight and the runner keeps polling while
+    anything is open, under the widened overnight band.  This is the one
+    thing the backtest cannot check: its bar sources are RTH-only, so in a
+    backtest an overnight move arrives whole on the next session's first
+    bar, and no hedge happens inside it.  The forward walk is where that
+    part of the system is actually exercised.
 """
 
 from __future__ import annotations
@@ -188,6 +195,21 @@ class LiveRunner:
 
             log.info("live runner stopped after %d cycles", self._cycles)
 
+    def _holding(self) -> bool:
+        """Whether there is anything to hedge right now.
+
+        The tenor is multi-session, so the book is open through the night
+        and the runner has to keep polling to hedge it -- the widened
+        overnight band is a *wider* band, not an absent hedger, and a gap
+        through it is exactly what an unhedged straddle cannot survive.
+        When the book is flat there is nothing outside the session worth
+        waking up for: entries are blocked by the entry window regardless.
+        """
+        book = self.strategy.portfolio if self.strategy else None
+        if book is None:
+            return False
+        return book.straddle is not None or book.hedge.quantity != 0
+
     def _sleep(self, seconds: float) -> None:
         """Sleep in slices so a stop signal is not swallowed by a backoff."""
         deadline = time.monotonic() + seconds
@@ -206,8 +228,8 @@ class LiveRunner:
         """
         assert self.strategy is not None
         now = datetime.now(self.strategy.clock.tz)
-        if not self.strategy.clock.in_session(now):
-            log.debug("outside the session at %s; idling", now)
+        if not self.strategy.clock.in_session(now) and not self._holding():
+            log.debug("outside the session at %s and flat; idling", now)
             return
 
         try:
@@ -233,25 +255,33 @@ class LiveRunner:
             f"{state.gex_total / 1e6:+,.0f}M" if state.gex_total is not None else "n/a"
         )
         flip = f"{state.gex_flip:,.1f}" if state.gex_flip is not None else "-"
+        band = self.cfg.hedge.effective_band(state.in_session)
         log.info(
-            "%s F=%.2f IV=%.3f | GEX %s (%s, flip %s) | straddle=%+d @ %s "
-            "hedge=%+d | net delta %+.1f (target %.1f) | equity %s",
-            now.strftime("%H:%M:%S"), state.future, state.atm_iv,
-            gex, state.gex_regime, flip,
+            "%s%s F=%.2f IV=%.3f | GEX %s (%s->%s, flip %s) | straddle=%+d @ %s "
+            "%s | hedge=%+d | net delta %+.1f (target %.1f +/- %.1f) | equity %s",
+            now.strftime("%H:%M:%S"), "" if state.in_session else " [overnight]",
+            state.future, state.atm_iv,
+            gex, state.gex_regime, state.confirmed_regime, flip,
             state.straddle_contracts,
             f"{state.strike:g}" if state.strike else "-",
+            f"{state.days_to_expiry}DTE" if state.days_to_expiry is not None else "-",
             state.hedge_contracts, state.net_delta_units, self.cfg.hedge.target,
-            f"${state.equity:,.0f}",
+            band, f"${state.equity:,.0f}",
         )
 
     def _atm_iv(self, conn, chain_provider, future_price: float, now: datetime) -> float:
-        """Read ATM implied vol off the live chain.
+        """Read ATM implied vol off the live chain, on the traded series.
 
         Averaged across the call and the put at the money rather than taken
-        from one right: at 0DTE a single stale leg moves the level enough to
-        change what the whole book is marked at.
+        from one right: a single stale leg moves the level enough to change
+        what the whole book is marked at.
+
+        The series asked for is the one the tenor policy selects -- or the
+        one an open position is already on -- so the vol marking the book is
+        read at the tenor the book is actually carrying, not at the front
+        month's.
         """
-        expiry = self.strategy._todays_expiry(now)
+        expiry = self.strategy._traded_expiry(now)
         if expiry is None:
             return self.cfg.data.default_atm_iv
         t = self.strategy.clock.time_to_expiry(now, expiry)
