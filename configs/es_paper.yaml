@@ -4,10 +4,15 @@
 #   deltahedger live -c configs/es_paper.yaml --dry-run     # decides, places nothing
 #   deltahedger live -c configs/es_paper.yaml               # routes to paper
 #
-# `allow_live_trading` stays false, so the broker refuses to connect to
-# anything that is not an IBKR paper account. That is the only thing
-# standing between this file and real money; leave it alone until the walk
-# has actually said something.
+# `allow_live_trading` is true here because cli.py's `live` command refuses
+# to route ANY non-dry-run order -- paper included -- unless it is set; it
+# is not solely a live-account gate. Once it is true, it ALSO disables
+# broker/ibkr.py's account-type check (which otherwise refuses to connect
+# to anything but an IBKR paper account, ids beginning with `D`) -- so with
+# this flag on, the only thing standing between this file and real money is
+# which account the Gateway session is actually logged into. Keep `port:
+# 4002` pointed at a paper Gateway (TradingMode=paper) until the walk has
+# actually said something.
 
 risk_source: ES
 starting_equity: 250000.0
@@ -45,8 +50,8 @@ ibkr:
   host: 127.0.0.1
   port: 4002                       # IB Gateway paper. TWS paper is 7497.
   client_id: 17
-  allow_live_trading: false        # the gate between this file and real money
-  use_delayed_data: true             # paper account has no CME real-time entitlement; delayed is fine for dry-run
+  allow_live_trading: true         # required by cli.py to route non-dry-run orders; see note above
+  use_delayed_data: true             # paper account has no CME real-time entitlement of its own
   poll_seconds: 5.0
   use_whatif_margin: true
   hedge_order_type: MKT

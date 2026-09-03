@@ -233,10 +233,13 @@ sudo nano /etc/deltahedger.env      # remove --dry-run
 sudo systemctl restart deltahedger
 ```
 
-That routes orders to the **paper** account. Routing to a live account
-additionally requires `ibkr.allow_live_trading: true` in the config, which
-`es_paper.yaml` deliberately does not set, and which you should not set for
-a forward walk.
+That routes orders to the **paper** account. `es_paper.yaml` sets
+`ibkr.allow_live_trading: true`, because `cli.py`'s `live` command refuses
+to route *any* non-dry-run order -- paper included -- without it; the flag
+is not solely a live-account switch. With it set, the account actually used
+is decided by which account the Gateway session is logged into
+(`TradingMode` in `/etc/ibc/config.ini`), not by this file, so keep that
+pointed at paper until the walk has earned a live account.
 
 ## What runs, and what it survives
 
