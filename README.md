@@ -45,6 +45,11 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[ibkr,dev]'
 # What would it trade right now, and why?
 .venv/bin/deltahedger gex -c configs/es_default.yaml --price 5000 --iv 0.14
 
+# The intraday flow nowcast (needs configs/*.yaml nowcast.enabled: true and
+# the databento extra) -- see "The nowcast" below.
+.venv/bin/deltahedger nowcast-backfill -c configs/es_default.yaml --days 270
+.venv/bin/deltahedger nowcast -c configs/es_default.yaml --price 5000
+
 # Pull real history from a running TWS / IB Gateway, then backtest it.
 .venv/bin/deltahedger fetch    -c configs/es_default.yaml --start 2025-01-02 --end 2025-06-30
 .venv/bin/deltahedger backtest -c configs/es_default.yaml --start 2025-01-02 --end 2025-06-30 -o runs/h1
@@ -220,6 +225,99 @@ the shape of the attribution, not the P&L — see "Reading a result honestly.")
 Read the trade-count columns before the return: a gate that improves the net
 by suppressing one branch to near zero has not improved anything, it has
 stopped testing half the strategy.
+
+## The nowcast
+
+The daily open-interest print is a snapshot: it tells you where dealer
+gamma sat as of the last settlement, and says nothing about what has traded
+since. The nowcast is an optional intraday correction, built from real CME
+Globex MDP 3.0 option trades over [Databento](https://databento.com), that
+narrows the gap between "what the print says" and "what dealers are
+carrying right now" — without ever being trusted to pick a side on its own.
+
+```
+GEX(t) = repriced(base OI) + Σ_strike (signed flow × dealer_share × current gamma)
+```
+
+**Where the flow comes from.** Every ES option trade carries CME's own
+*aggressor* side — traded at the ask is a customer buy, at the bid a
+customer sell, no tick rule needed. Reading "the customer bought" as "the
+dealer sold, and so gave up long-call inventory" is the same kind of
+assumption `gex.call_sign`/`gex.put_sign` already make about who is on which
+side of the open interest — an assumption to be varied, not believed. That
+is exactly what `nowcast.dealer_share` (0–3, one scalar, applied to calls and
+puts alike) exists to scale: `0.0` says flow tells you nothing about dealer
+inventory, `1.0` says every contract traded shows up as a full unit of
+inventory change; the default of `0.35` is a starting guess, not a fact.
+
+**Its authority is narrow, on purpose.** The daily OI read remains the only
+thing that ever picks a side — the nowcast can only say "not this one," "not
+any more," or "not this much," never "buy" or "sell":
+
+- **Veto** (`nowcast.veto_enabled`) — block an entry the print already
+  picked, when flow since the print actively disagrees with it.
+- **Early exit** (`nowcast.exit_enabled`) — close a position early on that
+  same disagreement, checked in `_check_exits` right after the regime-flip
+  ladder (`GATE_PERSISTENCE`) and before the P&L stops.
+- **Size haircut** (`nowcast.size_haircut_enabled`,
+  `size_haircut_when_unconfirmed`, default `0.5`) — shrink the position only
+  when flow has *no opinion* (neutral) — never when it disagrees (already a
+  full veto, at the entry check ahead of sizing) and never when it agrees
+  (full size).
+
+A disagreement and a null read are different things, and are treated
+differently: enough opposing flow is a veto or an exit; flow that just
+doesn't corroborate the print is a haircut. `GexCalculator.nowcast_profile`
+does the actual math — flow-adjusted inventory added to the base open
+interest, strike by strike, then repriced through the exact same
+gamma-weighted pipeline `blended_profile` uses for the base read — so
+`tests/test_gex.py::TestNowcast` proves the arithmetic once and
+`tests/test_strategy.py::TestNowcast` only has to prove the strategy obeys
+it, exactly the same split the four gates already use.
+
+Refreshed on its own, much coarser timer (`nowcast.refresh_seconds`, default
+1200s = 20 minutes) rather than every bar: a few thousand contracts of flow
+in a five-minute window is mostly noise relative to the open interest it is
+correcting, and re-reading it that often would just re-price the same noise
+faster. `gex.refresh_seconds` (how stale the OI print itself may be) and
+`nowcast.refresh_seconds` (how coarse the flow read is) are deliberately
+independent clocks.
+
+**Backtesting it, not just observing it live.** `deltahedger nowcast-backfill`
+downloads 6–12 months (`nowcast.backfill_days`, default 270 trading days) of
+raw trades and instrument definitions from Databento's historical API and
+caches them as DBN, one definitions file and one trades file per UTC day,
+under `nowcast.cache_dir`. That is the actual trade tape on disk, not a
+pre-aggregated summary — a backtest replays it through the identical
+`InstrumentInfo.from_definition` / `FlowAccumulator.record` path the live
+feed uses, so `flow_since(moment, expiry, since)` answers exactly the same
+question whether it is asking a live feed or years-old cached DBN. This is
+the step a vendor's real-time-only GEX dashboard cannot offer: the nowcast
+here is a backtestable input, not just something to watch.
+
+```bash
+# One-time: pull the trade tape a backtest's nowcast will replay.
+.venv/bin/deltahedger nowcast-backfill -c configs/es_default.yaml --days 270
+
+# What does flow since the print say right now, on top of the daily read?
+.venv/bin/deltahedger nowcast -c configs/es_default.yaml --price 5000 --since-hours 2
+```
+
+**The reconciliation check, which is free.** At every new session's first
+OI refresh, the strategy compares what the prior session's flow-adjusted
+book *predicted* the close would look like against the fresh print that
+actually lands, strike by strike, and logs a `nowcast_reconciliation` event
+with the mean absolute call/put OI error. Both numbers already exist —
+nothing new is fetched to compute this — so it costs nothing and runs every
+session `nowcast.reconciliation_enabled` is on. That residual is the ongoing
+answer to "is `dealer_share` any good": a `dealer_share` that is roughly
+right should leave a small, stable residual; one that is badly wrong should
+show up as an error that tracks flow volume rather than staying flat.
+
+Off by default (`nowcast.enabled: false`) — it needs a paid Databento
+subscription and the `databento` extra (`pip install -e '.[databento]'`),
+and a backtest or paper session with it off behaves exactly as it did before
+this section existed.
 
 ## The delta band is a fixed heuristic
 
@@ -757,4 +855,8 @@ Python 3.10+, `numpy`, `scipy`, `pandas`, `PyYAML`. Live trading, history
 and live open interest also need `ib_async` and a running TWS or IB Gateway
 with CME market data. Reading open interest needs the market-data permission
 that carries generic tick 101; without it the live runner logs that GEX
-cannot be computed and stands aside rather than guessing a side.
+cannot be computed and stands aside rather than guessing a side. The
+intraday nowcast (`nowcast.enabled: true`) additionally needs the
+`databento` extra (`pip install -e '.[databento]'`) and a Databento API key
+with a CME Globex MDP 3.0 subscription, exported as `DATABENTO_API_KEY` or
+passed to `nowcast`/`nowcast-backfill` via `--api-key`.

@@ -8,6 +8,7 @@ from deltahedger.config import (
     GatesConfig,
     GexConfig,
     HedgeConfig,
+    NowcastConfig,
     SizingConfig,
     StrategyConfig,
 )
@@ -47,6 +48,18 @@ class TestDefaults:
         gex = Config().gex
         assert gex.enabled
         assert (gex.call_sign, gex.put_sign) == (1.0, -1.0)
+
+    def test_nowcast_is_off_by_default(self):
+        """The nowcast needs a paid Databento subscription; it must never
+        turn itself on."""
+        nowcast = Config().nowcast
+        assert nowcast.enabled is False
+        assert nowcast.dataset == "GLBX.MDP3"
+        assert nowcast.parent_symbol == "ES.OPT"
+        assert nowcast.dealer_share == 0.35
+        assert nowcast.refresh_seconds == 1200.0
+        assert nowcast.veto_enabled and nowcast.exit_enabled
+        assert nowcast.size_haircut_enabled and nowcast.reconciliation_enabled
 
     def test_open_interest_defaults_to_the_generated_surface(self):
         """A backtest must never silently reach for a live connection."""
@@ -201,4 +214,30 @@ class TestValidation:
         path = tmp_path / "g.yaml"
         path.write_text(yaml.safe_dump({"gex": {"call_signn": 1.0}}))
         with pytest.raises(ValueError, match="call_signn"):
+            Config.from_yaml(path)
+
+    @pytest.mark.parametrize("kwargs,message", [
+        ({"dealer_share": -0.1}, "dealer_share"),
+        ({"dealer_share": 3.1}, "dealer_share"),
+        ({"refresh_seconds": 0.0}, "refresh_seconds"),
+        ({"refresh_seconds": -1.0}, "refresh_seconds"),
+        ({"backfill_days": 0}, "backfill_days"),
+        ({"size_haircut_when_unconfirmed": -0.1}, "size_haircut_when_unconfirmed"),
+        ({"size_haircut_when_unconfirmed": 1.1}, "size_haircut_when_unconfirmed"),
+    ])
+    def test_rejects_impossible_nowcast_settings(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            NowcastConfig(**kwargs).validate()
+
+    def test_a_nowcast_section_round_trips_through_yaml(self, tmp_path):
+        path = tmp_path / "n.yaml"
+        path.write_text(yaml.safe_dump({"nowcast": {"enabled": True, "dealer_share": 0.5}}))
+        cfg = Config.from_yaml(path)
+        assert cfg.nowcast.enabled is True
+        assert cfg.nowcast.dealer_share == 0.5
+
+    def test_a_nowcast_typo_is_rejected_rather_than_ignored(self, tmp_path):
+        path = tmp_path / "n.yaml"
+        path.write_text(yaml.safe_dump({"nowcast": {"dealer_sharee": 0.5}}))
+        with pytest.raises(ValueError, match="dealer_sharee"):
             Config.from_yaml(path)

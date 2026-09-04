@@ -274,6 +274,10 @@ class SizingResult:
     option_budget: float
     direction: int = 0
     reason: str = ""
+    #: Applied to ``option_budget`` before sizing -- 1.0 unless something
+    #: outside the buying-power rule itself asked for less, e.g. the
+    #: nowcast sizing haircut (``NowcastConfig.size_haircut_when_unconfirmed``).
+    size_multiplier: float = 1.0
 
     @property
     def ok(self) -> bool:
@@ -292,6 +296,7 @@ def size_straddles(
     cfg: SizingConfig,
     source: RiskSource,
     model: MarginModel,
+    size_multiplier: float = 1.0,
 ) -> SizingResult:
     """How many straddles the buying-power allocation supports.
 
@@ -300,12 +305,20 @@ def size_straddles(
     against cash or margin against collateral -- but not how the budget is
     carved up, so the same reserve still stands behind the hedge leg in
     both cases.
+
+    ``size_multiplier`` scales the option budget before it is divided by
+    the per-contract requirement -- a haircut applied *before* sizing
+    rather than a contract count rounded down after, so it composes
+    correctly with ``max_straddles``/``min_straddles`` instead of bypassing
+    them. 1.0 by default; the nowcast's confidence haircut
+    (``NowcastConfig.size_haircut_when_unconfirmed``) is the one caller
+    that passes anything else today.
     """
     if direction == 0:
         return SizingResult(0, 0.0, 0.0, 0.0, 0.0, 0, "no direction to size")
 
     budget = max(equity, 0.0) * cfg.buying_power_pct
-    option_budget = budget * (1.0 - cfg.hedge_margin_reserve_pct)
+    option_budget = budget * (1.0 - cfg.hedge_margin_reserve_pct) * size_multiplier
     per_contract = model.straddle_requirement(quote, future_price, source, direction)
     kind = "debit" if direction > 0 else "margin"
 
@@ -313,6 +326,7 @@ def size_straddles(
         return SizingResult(
             0, per_contract, 0.0, budget, option_budget, direction,
             f"the {kind} model returned a non-positive requirement",
+            size_multiplier,
         )
 
     raw = int(option_budget // per_contract)
@@ -322,7 +336,10 @@ def size_straddles(
             0, per_contract, 0.0, budget, option_budget, direction,
             f"buying power supports {raw} straddles, minimum is "
             f"{cfg.min_straddles} (${per_contract:,.0f} {kind} each vs "
-            f"${option_budget:,.0f} available)",
+            f"${option_budget:,.0f} available"
+            + (f", {size_multiplier:.0%} sized" if size_multiplier != 1.0 else "")
+            + ")",
+            size_multiplier,
         )
     return SizingResult(
         contracts=contracts,
@@ -332,4 +349,5 @@ def size_straddles(
         option_budget=option_budget,
         direction=direction,
         reason="capped by max_straddles" if raw > contracts else "",
+        size_multiplier=size_multiplier,
     )

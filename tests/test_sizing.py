@@ -203,6 +203,46 @@ class TestBuyingPower:
         assert "no direction" in result.reason
 
 
+class TestSizeMultiplier:
+    """The nowcast sizing haircut: applied to the option budget before
+    contracts are counted, so it composes with max/min_straddles rather
+    than bypassing them."""
+
+    def test_the_default_multiplier_is_full_size(self, es, span):
+        quote = straddle(es)
+        full = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span)
+        explicit = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span, 1.0)
+        assert full.contracts == explicit.contracts
+
+    def test_a_haircut_reduces_the_option_budget(self, es, span):
+        quote = straddle(es)
+        result = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span, 0.4)
+        full = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span, 1.0)
+        assert result.option_budget == pytest.approx(full.option_budget * 0.4)
+
+    def test_a_haircut_can_reduce_the_contract_count(self, es, span):
+        quote = straddle(es)
+        full = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span, 1.0)
+        haircut = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span, 0.4)
+        assert haircut.contracts < full.contracts
+
+    def test_the_multiplier_is_reported_on_the_result(self, es, span):
+        result = size_straddles(250_000, straddle(es), F, SHORT, SizingConfig(), es, span, 0.4)
+        assert result.size_multiplier == pytest.approx(0.4)
+
+    def test_a_zero_multiplier_declines_with_a_reason(self, es, span):
+        result = size_straddles(250_000, straddle(es), F, SHORT, SizingConfig(), es, span, 0.0)
+        assert not result.ok
+        assert "sized" in result.reason
+
+    def test_the_hard_cap_still_applies_under_a_haircut(self, es, span):
+        """A haircut only ever shrinks the count -- it cannot be used to
+        sneak past max_straddles from the other direction."""
+        cfg = SizingConfig(max_straddles=3)
+        result = size_straddles(5_000_000, straddle(es), F, SHORT, cfg, es, span, 1.0)
+        assert result.contracts == 3
+
+
 class TestModelSelection:
     @pytest.mark.parametrize("name,expected", [
         ("span_scan", SpanScanMarginModel),

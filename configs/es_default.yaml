@@ -82,6 +82,30 @@ gates:
   entry_window: true           # entries only inside strategy.entry_time/
                                # entry_cutoff_time; exits are never gated
 
+nowcast:
+  # The intraday flow correction: signed ES options flow since the OI print,
+  # scaled by dealer_share and repriced through the same GEX pipeline. Off
+  # by default -- it needs a paid Databento (CME Globex MDP 3.0) subscription
+  # and never picks the entry direction, only vetoes/exits/haircuts what the
+  # daily OI print already decided. See the README's "The nowcast" section.
+  enabled: false
+  dataset: GLBX.MDP3
+  parent_symbol: ES.OPT
+  # What fraction of the aggressor-signed flow is trusted to represent an
+  # actual dealer inventory change. This is an assumption, not a fact -- vary
+  # it (deltahedger sweep-style) rather than believe the default. The
+  # reconciliation check (see the README) is the ongoing measurement of
+  # whether it holds.
+  dealer_share: 0.35
+  refresh_seconds: 1200.0     # a 15-30 minute cadence; per-bar is noise
+  cache_dir: data_cache/databento
+  backfill_days: 270          # ~6-12 months for `deltahedger nowcast-backfill`
+  veto_enabled: true
+  exit_enabled: true
+  size_haircut_enabled: true
+  size_haircut_when_unconfirmed: 0.5
+  reconciliation_enabled: true
+
 sizing:
   buying_power_pct: 0.15      # margin for a short straddle, debit for a long one
   hedge_margin_reserve_pct: 0.30

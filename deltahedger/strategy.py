@@ -73,12 +73,15 @@ from .data.base import MarketBar
 from .gex import (
     GATE_ENSEMBLE,
     GATE_ENTRY_WINDOW,
+    GATE_NOWCAST,
     GATE_PERSISTENCE,
     NEUTRAL,
     ExpiryBook,
     GexCalculator,
     GexProfile,
+    NowcastProvider,
     OpenInterestProvider,
+    StrikeFlow,
     StrikeOpenInterest,
 )
 from .hedger import DeltaHedger
@@ -154,6 +157,12 @@ class BarState:
     #: Whether the bar fell inside the regular session, which decides which
     #: band width applied to it.
     in_session: bool = True
+    # -- the nowcast read, when the flow feed is on --------------------
+    #: The flow-corrected total, ``None`` unless ``nowcast.enabled`` and a
+    #: read has landed. Reported for eyeballing against ``gex_total``;
+    #: never fed to anything downstream by itself.
+    nowcast_total: float | None = None
+    nowcast_regime: str = ""
 
 
 class GexStraddleStrategy:
@@ -163,6 +172,7 @@ class GexStraddleStrategy:
         source: RiskSource | None = None,
         margin_model: MarginModel | None = None,
         open_interest: OpenInterestProvider | None = None,
+        nowcast: NowcastProvider | None = None,
     ):
         self.cfg = cfg
         self.source = source or cfg.source
@@ -177,6 +187,12 @@ class GexStraddleStrategy:
         )
         self.tenor: TenorPolicy = cfg.strategy.tenor()
         self.open_interest = open_interest
+        #: The flow nowcast (config.NowcastConfig). ``None`` -- the default,
+        #: same as ``open_interest`` -- means the feature is off regardless
+        #: of ``cfg.nowcast.enabled``; a config that turns it on without a
+        #: provider wired in just never gets a read, the same way GEX itself
+        #: goes quiet without an ``open_interest`` provider.
+        self.nowcast = nowcast
         self.portfolio = Portfolio(cfg.starting_equity, self.source)
 
         self.events: list[StrategyEvent] = []
@@ -202,6 +218,25 @@ class GexStraddleStrategy:
         #: The books the last profile was built from, kept so the ensemble
         #: gate can re-price the same input without re-reading it.
         self._books: list[ExpiryBook] = []
+        #: The nowcast read, refreshed on its own timer (nowcast.refresh_
+        #: seconds), independent of gex.refresh_seconds. See _read_nowcast.
+        self._nowcast_profile: GexProfile | None = None
+        self._nowcast_read_at: datetime | None = None
+        #: When the current session's OI print became the standing one --
+        #: the "since" boundary flow is measured from, and the reference
+        #: point the next morning's reconciliation check measures against.
+        #: Approximated as session open: real settlement timing is not
+        #: exposed by an OI read, and the entry window already exists to
+        #: keep entries off a still-preliminary print -- see NowcastConfig.
+        self._session_open_at: datetime | None = None
+        #: What the flow implied the book looked like at the moment the OI
+        #: print most recently refreshed to a new day's value, kept so the
+        #: *next* refresh can reconcile against it. {expiry: {strike: (call, put)}}.
+        self._nowcast_reconciliation_baseline: dict[date, dict[float, tuple[float, float]]] = {}
+        #: The flow_by_expiry the last nowcast read used, kept only so the
+        #: session-roll reconciliation snapshot can be built from it without
+        #: re-reading flow for a session that is already ending.
+        self._last_nowcast_flow: dict[date, tuple[StrikeFlow, ...]] | None = None
         #: The persistence streak: the regime the last few bars have read,
         #: and how many in a row. ``_confirmed_regime`` is the one the
         #: strategy is allowed to act on.
@@ -221,6 +256,7 @@ class GexStraddleStrategy:
         quote = self._mark_open_straddle(bar, moment)
         profile = self._read_gex(bar, moment)
         self._update_persistence(profile)
+        self._read_nowcast(bar, moment)
 
         self._check_exits(bar, moment, quote, profile, execution)
 
@@ -247,7 +283,9 @@ class GexStraddleStrategy:
         day = moment.date()
         if day == self._session_date:
             return
+        self._capture_nowcast_reconciliation_baseline()
         self._session_date = day
+        self._session_open_at = moment
         quote = None
         if self.portfolio.straddle is not None:
             quote = self._mark_open_straddle(
@@ -359,6 +397,7 @@ class GexStraddleStrategy:
             self._oi = fresh
             self._oi_read_at = moment
             self._oi_expiries = tuple(expiries)
+            self._reconcile_nowcast(moment, fresh)
 
         self._books = [
             ExpiryBook.of(
@@ -371,6 +410,116 @@ class GexStraddleStrategy:
         ]
         self._profile = self.gex.blended_profile(bar.close, self._books, bar.atm_iv)
         return self._profile
+
+    # -- the flow nowcast --------------------------------------------------
+
+    def _read_nowcast(self, bar: MarketBar, moment: datetime) -> None:
+        """The flow correction, refreshed on its own (much coarser) timer.
+
+        Independent of ``gex.refresh_seconds``: the print's staleness and
+        the flow's noise floor are different clocks, and conflating them
+        would either re-read the print needlessly often or smooth the flow
+        too little -- see ``NowcastConfig``. A bar with no blend yet (no OI
+        read has landed) has nothing to correct, so this is a no-op until
+        ``_read_gex`` has populated ``self._books`` at least once.
+        """
+        cfg = self.cfg.nowcast
+        if not cfg.enabled or self.nowcast is None or not self._books:
+            self._nowcast_profile = None
+            return
+
+        stale = (
+            self._nowcast_read_at is None
+            or (moment - self._nowcast_read_at).total_seconds() >= cfg.refresh_seconds
+        )
+        if not stale:
+            return
+
+        since = self._session_open_at or moment
+        flow_by_expiry: dict[date, tuple[StrikeFlow, ...]] = {}
+        for book in self._books:
+            try:
+                flow_by_expiry[book.expiry] = self.nowcast.flow_since(
+                    moment, book.expiry, since
+                )
+            except Exception as exc:  # noqa: BLE001 - a bad read must not halt the run
+                log.warning(
+                    "could not read flow for %s (%s); treating as no flow "
+                    "since the print", book.expiry, exc,
+                )
+
+        self._last_nowcast_flow = flow_by_expiry
+        self._nowcast_profile = self.gex.nowcast_profile(
+            bar.close, self._books, flow_by_expiry, bar.atm_iv, cfg.dealer_share,
+        )
+        self._nowcast_read_at = moment
+
+    def _capture_nowcast_reconciliation_baseline(self) -> None:
+        """Snapshot what the flow implied the book looked like, at the last
+        moment ``self._books``/``self._nowcast_profile`` still describe the
+        session that is about to roll over.
+
+        Called from ``_roll_session``, before anything for the new day
+        resets. What is captured here is compared, once the new session's
+        OI print actually refreshes, against the print that comes back --
+        see ``_reconcile_nowcast``.
+        """
+        cfg = self.cfg.nowcast
+        if not (cfg.enabled and cfg.reconciliation_enabled):
+            return
+        if self.nowcast is None or self._last_nowcast_flow is None or not self._books:
+            return
+        adjusted = self.gex.nowcast_books(
+            self._books, self._last_nowcast_flow, cfg.dealer_share
+        )
+        self._nowcast_reconciliation_baseline = {
+            book.expiry: {row.strike: (row.call_oi, row.put_oi) for row in book.rows}
+            for book in adjusted
+        }
+
+    def _reconcile_nowcast(
+        self, moment: datetime, fresh: dict[date, list[StrikeOpenInterest]]
+    ) -> None:
+        """Compare the prior session's flow-implied close against the OI
+        print that actually lands, per strike, and write down the gap.
+
+        This is the whole ongoing check on whether ``dealer_share`` is any
+        good -- and it is free: both numbers already exist, this only has
+        to notice when a fresh print makes the comparison possible. Runs
+        from every OI refresh but the baseline is captured only once, at
+        the session roll, so in practice this does something once per
+        session: the first time the new day's print is read.
+        """
+        if not self._nowcast_reconciliation_baseline:
+            return
+        baseline = self._nowcast_reconciliation_baseline
+        self._nowcast_reconciliation_baseline = {}  # consume once, hit or miss
+
+        for expiry, predicted in baseline.items():
+            rows = fresh.get(expiry)
+            if not rows:
+                continue
+            actual = {row.strike: (row.call_oi, row.put_oi) for row in rows}
+            strikes = sorted(set(predicted) | set(actual))
+            if not strikes:
+                continue
+            call_errors = [
+                actual.get(k, (0.0, 0.0))[0] - predicted.get(k, (0.0, 0.0))[0]
+                for k in strikes
+            ]
+            put_errors = [
+                actual.get(k, (0.0, 0.0))[1] - predicted.get(k, (0.0, 0.0))[1]
+                for k in strikes
+            ]
+            mean_abs_call = sum(abs(e) for e in call_errors) / len(call_errors)
+            mean_abs_put = sum(abs(e) for e in put_errors) / len(put_errors)
+            self._record(
+                moment, "nowcast_reconciliation",
+                f"{expiry}: mean |predicted - actual| OI error "
+                f"{mean_abs_call:,.1f} calls / {mean_abs_put:,.1f} puts across "
+                f"{len(strikes)} strikes (dealer_share="
+                f"{self.cfg.nowcast.dealer_share:g})",
+            )
 
     # -- persistence -----------------------------------------------------
 
@@ -411,6 +560,67 @@ class GexStraddleStrategy:
         if self._confirmed_regime == POSITIVE:
             return SHORT_STRADDLE
         return STAND_ASIDE
+
+    # -- the flow nowcast's authority: veto, exit, size haircut ----------
+    #
+    # Narrow on purpose (see NowcastConfig): the daily OI blend remains the
+    # only thing that picks a side. The three methods below only ever say
+    # "not this one", "not any more" or "not this much" -- never "this one".
+
+    def _nowcast_veto_reason(self, direction: int) -> str | None:
+        """Why the flow read objects to an entry the print already picked,
+        or ``None`` if it does not.
+
+        Fires only when the nowcast has an opinion (``direction != 0``) and
+        that opinion disagrees with the print's. A neutral flow read -- no
+        corroboration, but no objection either -- is never a veto.
+        """
+        cfg = self.cfg.nowcast
+        if not (cfg.enabled and cfg.veto_enabled) or self._nowcast_profile is None:
+            return None
+        nc = self._nowcast_profile
+        if nc.direction == 0 or nc.direction == direction:
+            return None
+        return (
+            f"flow since the print reads {nc.regime} ({nc.confidence:.0%} "
+            f"confidence), against the side the daily print picked"
+        )
+
+    def _nowcast_size_multiplier(self) -> float:
+        """1.0 when flow corroborates the print or the feature is off; the
+        configured haircut when flow has no opinion at all.
+
+        A disagreeing flow read never reaches this call -- it is vetoed
+        first, in ``_try_entry`` -- so the only two cases here are
+        "agrees" and "no opinion".
+        """
+        cfg = self.cfg.nowcast
+        if not (cfg.enabled and cfg.size_haircut_enabled) or self._nowcast_profile is None:
+            return 1.0
+        if self._nowcast_profile.direction == 0:
+            return cfg.size_haircut_when_unconfirmed
+        return 1.0
+
+    def _nowcast_exit_reason(self, position: StraddlePosition) -> str | None:
+        """Close early when flow since the print argues against an open
+        position the print itself still likes.
+
+        Checked after the daily-OI flip ladder in ``_check_exits``, so this
+        only fires when the print agrees with the position but the trades
+        since it do not -- the same disagreement rule as the veto, applied
+        to what is already open rather than to a prospective entry.
+        """
+        cfg = self.cfg.nowcast
+        if not (cfg.enabled and cfg.exit_enabled) or self._nowcast_profile is None:
+            return None
+        nc = self._nowcast_profile
+        if nc.direction == 0 or nc.direction == position.direction:
+            return None
+        side = "long" if position.is_long else "short"
+        return (
+            f"flow since the print reads {nc.regime} ({nc.confidence:.0%} "
+            f"confidence), against the open {side} position"
+        )
 
     # -- marking ---------------------------------------------------------
 
@@ -520,6 +730,13 @@ class GexStraddleStrategy:
                 )
                 return
 
+        veto = self._nowcast_veto_reason(direction)
+        if veto is not None:
+            self._record(
+                moment, "entry_skipped", veto, regime=profile.regime, gate=GATE_NOWCAST,
+            )
+            return
+
         t = self.clock.time_to_expiry(moment, expiry)
         quote = select_atm_straddle(
             bar.close, expiry, t, bar.atm_iv, self.source, self.surface,
@@ -535,9 +752,10 @@ class GexStraddleStrategy:
             return
 
         equity = self.portfolio.equity(None, bar.close)
+        size_multiplier = self._nowcast_size_multiplier()
         sizing = size_straddles(
             equity, quote, bar.close, direction, self.cfg.sizing, self.source,
-            self.margin_model,
+            self.margin_model, size_multiplier,
         )
         if not sizing.ok:
             self._record(moment, "entry_skipped", sizing.reason, regime=profile.regime)
@@ -571,6 +789,10 @@ class GexStraddleStrategy:
         side = "bought" if direction > 0 else "sold"
         cash = abs(quantity) * (call_fill.price + put_fill.price) * self.source.option.multiplier
         intent = "scalp gamma" if direction > 0 else "collect theta"
+        haircut_note = (
+            f" ({size_multiplier:.0%} sized: flow since the print has no opinion)"
+            if size_multiplier != 1.0 else ""
+        )
         self._record(
             moment, "entry",
             f"{side} {sizing.contracts} {expiry} ({days_left}DTE) "
@@ -579,7 +801,7 @@ class GexStraddleStrategy:
             f"(C {call_fill.price:.2f} / P {put_fill.price:.2f}, IV {quote.iv:.3f}) "
             f"for ${cash:,.0f} {'debit' if direction > 0 else 'credit'}; "
             f"{sizing.requirement_kind} ${sizing.total_margin:,.0f} of "
-            f"${sizing.budget:,.0f} budget -- {profile.reason}, so {intent}",
+            f"${sizing.budget:,.0f} budget{haircut_note} -- {profile.reason}, so {intent}",
             regime=profile.regime,
         )
 
@@ -676,6 +898,9 @@ class GexStraddleStrategy:
             reason = f"{cfg.close_before_expiry_minutes}m to expiry"
         elif cfg.exit_on_regime_flip and profile is not None:
             reason = self._flip_exit_reason(bar, moment, position, profile)
+
+        if reason is None:
+            reason = self._nowcast_exit_reason(position)
 
         if reason is None:
             reason = (
@@ -945,4 +1170,8 @@ class GexStraddleStrategy:
                 self.clock.days_to_expiry(moment, expiry) if expiry else None
             ),
             in_session=in_session,
+            nowcast_total=(
+                self._nowcast_profile.total_gex if self._nowcast_profile else None
+            ),
+            nowcast_regime=self._nowcast_profile.regime if self._nowcast_profile else "",
         )

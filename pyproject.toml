@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ibkr = ["ib_async>=1.0"]
+databento = ["databento>=0.86"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]

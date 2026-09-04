@@ -24,7 +24,9 @@ from deltahedger.gex import (
     POSITIVE,
     SHORT_STRADDLE,
     STAND_ASIDE,
+    ExpiryBook,
     GexCalculator,
+    StrikeFlow,
     StrikeOpenInterest,
 )
 from deltahedger.volsurface import VolSurface
@@ -316,3 +318,110 @@ class TestProviderFactory:
         cfg.data.open_interest = "vibes"
         with pytest.raises(ValueError, match="unknown open-interest source"):
             build_open_interest_provider(cfg, cfg.source)
+
+
+class TestNowcast:
+    """The flow correction: dealer_share applied to signed volume, added to
+    the base open interest, then repriced through the ordinary pipeline.
+    See config.NowcastConfig for the sign derivation this checks."""
+
+    def flat_chain(self, call_oi=4000.0, put_oi=200.0, center=F, span=20):
+        return [
+            StrikeOpenInterest(center + 5.0 * i, call_oi, put_oi)
+            for i in range(-span, span + 1)
+        ]
+
+    def books(self, chain):
+        return [ExpiryBook.of(EXPIRY, T, chain, 0)]
+
+    def test_no_flow_leaves_the_profile_unchanged(self, calc):
+        books = self.books(self.flat_chain())
+        base = calc.blended_profile(F, books, 0.15)
+        nowcast = calc.nowcast_profile(F, books, {}, 0.15, dealer_share=0.35)
+        assert nowcast.total_gex == pytest.approx(base.total_gex)
+        assert nowcast.regime == base.regime
+
+    def test_customer_call_buying_pushes_gex_down(self, calc):
+        """A trade the aggressor bought is one the dealer sold: customer
+        call-buying reduces the dealer's (assumed) long-call inventory, so
+        with the standard call_sign=+1 the total must fall, not rise."""
+        books = self.books(self.flat_chain())
+        base = calc.blended_profile(F, books, 0.15).total_gex
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=5000.0, put_signed_volume=0.0)]}
+        nowcast = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.35).total_gex
+        assert nowcast < base
+
+    def test_customer_call_selling_pushes_gex_up(self, calc):
+        """The mirror case: a trade the aggressor sold is one the dealer
+        bought, adding to the dealer's long-call inventory."""
+        books = self.books(self.flat_chain())
+        base = calc.blended_profile(F, books, 0.15).total_gex
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=-5000.0, put_signed_volume=0.0)]}
+        nowcast = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.35).total_gex
+        assert nowcast > base
+
+    def test_a_larger_dealer_share_moves_the_number_further(self, calc):
+        """dealer_share is a magnitude knob: the same flow scaled up must
+        move the total further in the same direction, not flip it or do
+        nothing -- confirms the scaling is linear, not merely signed."""
+        books = self.books(self.flat_chain())
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=5000.0, put_signed_volume=0.0)]}
+        small = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.1).total_gex
+        large = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.9).total_gex
+        base = calc.blended_profile(F, books, 0.15).total_gex
+        assert base > small > large  # both fall from base; the bigger share falls further
+
+    def test_a_zero_dealer_share_is_the_null_hypothesis(self, calc):
+        """dealer_share=0 says flow tells you nothing about dealer
+        inventory -- the nowcast must then equal the base read exactly,
+        whatever the flow was."""
+        books = self.books(self.flat_chain())
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=50_000.0, put_signed_volume=-30_000.0)]}
+        base = calc.blended_profile(F, books, 0.15).total_gex
+        nowcast = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.0).total_gex
+        assert nowcast == pytest.approx(base)
+
+    def test_flow_at_a_strike_with_no_listed_open_interest_still_counts(self, calc):
+        """A strike nobody had open interest at yet, but which just traded
+        heavily, is not invisible to the nowcast -- the base OI there is
+        implicitly zero, not "excluded"."""
+        chain = [row for row in self.flat_chain() if row.strike != F]  # drop the ATM row
+        books = self.books(chain)
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=1000.0, put_signed_volume=0.0)]}
+        nowcast = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=1.0)
+        strike_row = next(r for r in nowcast.by_strike if r.strike == F)
+        assert strike_row.call_oi == pytest.approx(-1000.0)
+
+    def test_a_confident_disagreement_can_flip_the_regime(self, calc):
+        """Enough opposing flow can move the read to the other side of the
+        confidence gate entirely -- the point of the whole mechanism."""
+        chain = self.flat_chain(call_oi=4000.0, put_oi=200.0)
+        books = self.books(chain)
+        base = calc.blended_profile(F, books, 0.15)
+        assert base.regime == POSITIVE
+
+        flow_rows = [
+            StrikeFlow(strike=F + 5.0 * i, call_signed_volume=4000.0, put_signed_volume=0.0)
+            for i in range(-20, 21)
+        ]
+        nowcast = calc.nowcast_profile(F, books, {EXPIRY: flow_rows}, 0.15, dealer_share=1.0)
+        assert nowcast.regime == NEGATIVE
+
+    def test_nowcast_books_is_what_nowcast_profile_prices(self, calc):
+        """nowcast_profile is documented as blended_profile applied to
+        nowcast_books's output -- pin that relationship directly, since the
+        reconciliation check depends on nowcast_books alone matching."""
+        books = self.books(self.flat_chain())
+        flow = {EXPIRY: [StrikeFlow(strike=F, call_signed_volume=1000.0, put_signed_volume=500.0)]}
+        adjusted = calc.nowcast_books(books, flow, dealer_share=0.4)
+        expected = calc.blended_profile(F, adjusted, 0.15)
+        actual = calc.nowcast_profile(F, books, flow, 0.15, dealer_share=0.4)
+        assert actual.total_gex == pytest.approx(expected.total_gex)
+
+    def test_the_base_books_are_not_mutated(self, calc):
+        chain = self.flat_chain()
+        books = self.books(chain)
+        original_call_oi = books[0].rows[0].call_oi
+        flow = {EXPIRY: [StrikeFlow(strike=chain[0].strike, call_signed_volume=999.0, put_signed_volume=0.0)]}
+        calc.nowcast_profile(F, books, flow, 0.15, dealer_share=1.0)
+        assert books[0].rows[0].call_oi == original_call_oi

@@ -234,6 +234,119 @@ class GexConfig:
 
 
 @dataclass
+class NowcastConfig:
+    """The intraday flow nowcast: a correction to the daily OI print, not a
+    replacement for it.
+
+    The daily open-interest print is an end-of-previous-day snapshot; see
+    ``gex.py``'s honest limits.  Between one print and the next, the only
+    other public signal about dealer inventory is *trade prints* -- and a
+    trade print does not say who traded, only that someone did, at some
+    price, in some size.  The nowcast's whole method is one inference laid
+    on top of that ambiguity: **treat the trade's aggressor side as the
+    customer's side**, so a trade executed at the ask reads as a customer
+    buy (dealer sells, dealer inventory falls) and one at the bid reads as
+    a customer sell (dealer buys, dealer inventory rises).  Not every trade
+    is customer-vs-dealer -- two customers can cross, another market maker
+    can be on the other side -- and ``dealer_share`` is where that gap
+    lives::
+
+        dealer_inventory_delta(strike, right) = -dealer_share * signed_flow(strike, right)
+
+    where ``signed_flow`` is the aggressor-signed contract volume since the
+    last OI print.  ``dealer_share`` is config, exactly like
+    ``gex.call_sign``/``put_sign``: a number to sweep and measure, not one
+    to believe.  A single scalar applied to both rights, not a call/put
+    pair -- there is no evidence yet that dealer participation differs by
+    right, and the reconciliation log below is what would eventually make
+    that case rather than assuming it.
+
+    The delta is added to that strike's open interest and repriced through
+    the *same* gamma-weighted pipeline as the base print
+    (``GexCalculator.nowcast_profile``), so a well-calibrated
+    ``dealer_share`` is the one that makes the flow-adjusted count track
+    where tomorrow's real OI print actually lands -- which is exactly what
+    the reconciliation check measures, continuously, for free.
+
+    Authority is deliberately narrow.  The **entry signal stays the daily
+    OI blend**, unchanged by any of this.  The nowcast can only:
+
+    * **veto** an entry the daily read would otherwise take, when the flow
+      since the print actively disagrees with it (never pick a side the
+      daily read did not already pick);
+    * **exit early**, the same way, on an open position;
+    * **haircut size**, when the flow has no opinion at all -- not a
+      disagreement, just nothing to corroborate the daily read with.
+
+    It can say "no" or "not sure"; it can never say "buy" or "sell".
+    """
+
+    enabled: bool = False
+    #: CME Globex MDP 3.0 via Databento. The dataset id, and the parent
+    #: symbol whose ".OPT" suffix resolves to the whole ES options complex
+    #: rather than one expiry -- see ``data/databento_flow.py``.
+    dataset: str = "GLBX.MDP3"
+    parent_symbol: str = "ES.OPT"
+    #: Fraction of signed aggressor volume assumed to reach dealer
+    #: inventory. See the class docstring; 0 is a valid value to sweep (the
+    #: null hypothesis that flow tells you nothing), and a small amount
+    #: over 1 is not nonsensical (a customer trade can force a dealer's own
+    #: hedge trade against a *second* dealer, amplifying the inventory
+    #: shift) so the ceiling is intentionally loose rather than clamped to 1.
+    dealer_share: float = 0.35
+    #: How often the flow correction is recomputed, in seconds. Trade-by-
+    #: trade or even bar-by-bar would be chasing execution noise the same
+    #: way a tick-level GEX read would; 15-30 minutes is short enough to
+    #: react to a real intraday shift and long enough that a burst of
+    #: algo-driven prints does not flip the veto on and off within an hour.
+    #: Independent of ``gex.refresh_seconds``, which governs the daily
+    #: print, not this correction.
+    refresh_seconds: float = 1200.0
+    #: Cache directory for backfilled historical trades and definitions,
+    #: mirroring ``data.cache_dir`` for IBKR history.
+    cache_dir: str = "data_cache/databento"
+    #: Trading days to backfill when none of the cache already covers the
+    #: requested range. 6-12 months of ES options trades is what makes the
+    #: nowcast backtestable rather than only observable live -- the one
+    #: thing that separates it from a vendor's real-time-only product.
+    backfill_days: int = 270
+
+    #: Veto an about-to-be-taken entry when the flow since the print
+    #: disagrees with the direction the daily OI blend already picked.
+    #: Never fires on a neutral flow read -- "no opinion" is not
+    #: "disagreement" -- and never chooses a side on its own.
+    veto_enabled: bool = True
+    #: Close an open position early on the same disagreement, checked
+    #: against the position's direction rather than a prospective entry's.
+    exit_enabled: bool = True
+    #: Shrink the buying-power budget when the flow read is neutral (no
+    #: corroboration, but no veto either) rather than when it agrees.
+    #: Direction agreement is already worth its full size; outright
+    #: disagreement is already vetoed entirely; this covers the remaining
+    #: case, where the daily read is acting alone.
+    size_haircut_enabled: bool = True
+    size_haircut_when_unconfirmed: float = 0.5
+    #: Log the divergence between the flow-implied end-of-day inventory and
+    #: the next morning's actual OI print, per strike, whenever the daily
+    #: print refreshes. The only ongoing check on whether ``dealer_share``
+    #: is any good, and it costs nothing beyond writing down a number the
+    #: system already has both halves of.
+    reconciliation_enabled: bool = True
+
+    def validate(self) -> None:
+        if not 0.0 <= self.dealer_share <= 3.0:
+            raise ValueError("nowcast.dealer_share must be in [0, 3]")
+        if self.refresh_seconds <= 0.0:
+            raise ValueError("nowcast.refresh_seconds must be > 0")
+        if self.backfill_days < 1:
+            raise ValueError("nowcast.backfill_days must be >= 1")
+        if not 0.0 <= self.size_haircut_when_unconfirmed <= 1.0:
+            raise ValueError(
+                "nowcast.size_haircut_when_unconfirmed must be in [0, 1]"
+            )
+
+
+@dataclass
 class GatesConfig:
     """Four independent reasons to stand aside, each one switchable.
 
@@ -595,6 +708,7 @@ class Config:
     sizing: SizingConfig = field(default_factory=SizingConfig)
     gex: GexConfig = field(default_factory=GexConfig)
     gates: GatesConfig = field(default_factory=GatesConfig)
+    nowcast: NowcastConfig = field(default_factory=NowcastConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     vol: VolConfig = field(default_factory=VolConfig)
     costs: CostsConfig = field(default_factory=CostsConfig)
@@ -619,7 +733,8 @@ class Config:
             raise ValueError("starting_equity must be positive")
         get_risk_source(self.risk_source)  # raises on an unknown symbol
         for section in (
-            self.hedge, self.sizing, self.gex, self.gates, self.strategy, self.live,
+            self.hedge, self.sizing, self.gex, self.gates, self.nowcast,
+            self.strategy, self.live,
         ):
             section.validate()
 
@@ -649,6 +764,7 @@ class Config:
                 "sizing": SizingConfig,
                 "gex": GexConfig,
                 "gates": GatesConfig,
+                "nowcast": NowcastConfig,
                 "strategy": StrategyConfig,
                 "vol": VolConfig,
                 "costs": CostsConfig,

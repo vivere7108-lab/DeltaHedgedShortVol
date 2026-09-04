@@ -6,6 +6,8 @@
     deltahedger sweep     --config configs/es_default.yaml --bands 5,10,20
     deltahedger sweep     --config configs/es_default.yaml --gates
     deltahedger gex       --config configs/es_default.yaml --price 5000
+    deltahedger nowcast-backfill --config configs/es_default.yaml --days 270
+    deltahedger nowcast   --config configs/es_default.yaml --price 5000
     deltahedger doctor    --config configs/es_paper.yaml
     deltahedger report    --config configs/es_paper.yaml
     deltahedger config    --out configs/mine.yaml
@@ -82,6 +84,136 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     frame = source.load()
     print(f"{len(frame)} bars from {frame['timestamp'].min()} to {frame['timestamp'].max()}")
     print(f"cached at {source._cache_path()}")
+    return 0
+
+
+def cmd_nowcast_backfill(args: argparse.Namespace) -> int:
+    """Download the historical trade tape a backtest's nowcast will replay.
+
+    Mirrors ``fetch``: a one-time step run before a backtest, not something
+    the backtest itself does over the network. The default window
+    (``nowcast.backfill_days``) is the 6-12 months the phase asked for --
+    enough for the reconciliation check in a backtest to accumulate a real
+    read on whether ``dealer_share`` holds up.
+    """
+    from datetime import date, timedelta
+
+    from .data.databento_flow import DatabentoHistoricalFlowSource
+
+    cfg = _load(args)
+    end = date.fromisoformat(args.end_date) if args.end_date else date.today()
+    start = (
+        date.fromisoformat(args.start_date) if args.start_date
+        else end - timedelta(days=args.days or cfg.nowcast.backfill_days)
+    )
+    source = DatabentoHistoricalFlowSource(cfg.nowcast, api_key=args.api_key)
+    fetched = source.backfill(start, end, force=args.force)
+    print(
+        f"backfilled {len(fetched)} trading day(s) of {cfg.nowcast.dataset} "
+        f"{cfg.nowcast.parent_symbol} trades ({start} to {end}) into "
+        f"{source.cache_dir}"
+    )
+    if not fetched:
+        print("(all days in range were already cached; use --force to refetch)")
+    return 0
+
+
+def cmd_nowcast(args: argparse.Namespace) -> int:
+    """Print the flow-corrected GEX read at a given moment, live or replayed.
+
+    Mirrors ``gex``, but layers the nowcast's flow correction on top of the
+    same blended open-interest read -- the number the strategy's veto, exit
+    and sizing haircut actually act on, not the daily print alone.
+    """
+    from datetime import datetime, timedelta
+
+    from .chain import select_expiry
+    from .data import build_open_interest_provider
+    from .data.databento_flow import (
+        DatabentoHistoricalFlowSource,
+        DatabentoLiveFlowFeed,
+    )
+    from .gex import ExpiryBook, GexCalculator
+    from .session import SessionClock
+    from .volsurface import VolSurface
+
+    cfg = _load(args)
+    if not cfg.nowcast.enabled:
+        print(
+            "nowcast.enabled is False; set it in the config (or pass a config "
+            "with it on) to read the flow-corrected profile.",
+            file=sys.stderr,
+        )
+        return 2
+    source = cfg.source
+    clock = SessionClock(source)
+    tenor = cfg.strategy.tenor()
+    now = clock.localize(
+        datetime.fromisoformat(args.at) if args.at else datetime.now()
+    )
+
+    traded = select_expiry(clock, now, tenor)
+    if traded is None:
+        print(
+            f"no expiry listed between {tenor.min_days} and {tenor.max_days} "
+            f"trading days of {now:%Y-%m-%d %H:%M}"
+        )
+        return 1
+    expiries = [
+        e
+        for e in clock.candidate_expiries(now, clock.days_to_expiry(now, traded))
+        if e <= traded
+    ][: cfg.gex.blend_max_expiries] if cfg.gex.blend_front_expiries else [traded]
+
+    provider = build_open_interest_provider(cfg, source)
+    calculator = GexCalculator(
+        cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate, cfg.gates
+    )
+    price = args.price
+    books = [
+        ExpiryBook.of(
+            expiry,
+            clock.time_to_expiry(now, expiry),
+            provider.open_interest(now, price, expiry),
+            clock.days_to_expiry(now, expiry),
+        )
+        for expiry in expiries
+    ]
+    base = calculator.blended_profile(price, books, args.iv)
+
+    since = now - timedelta(hours=args.since_hours)
+    flow_source = (
+        DatabentoHistoricalFlowSource(cfg.nowcast, api_key=args.api_key)
+        if args.replay
+        else DatabentoLiveFlowFeed(cfg.nowcast, api_key=args.api_key)
+    )
+    if not args.replay:
+        flow_source.start()
+    try:
+        flow_by_expiry = {
+            expiry: flow_source.flow_since(now, expiry, since) for expiry in expiries
+        }
+    finally:
+        if not args.replay:
+            flow_source.stop()
+    nowcast = calculator.nowcast_profile(
+        price, books, flow_by_expiry, args.iv, cfg.nowcast.dealer_share
+    )
+
+    print(
+        f"\n{traded} ({clock.days_to_expiry(now, traded)}DTE), spot {price:,.2f}, "
+        f"flow since {since:%Y-%m-%d %H:%M} (dealer_share={cfg.nowcast.dealer_share:g})"
+    )
+    print(f"  daily print    ${base.total_gex / 1e6:+,.1f}M  {base.regime}")
+    print(f"  nowcast        ${nowcast.total_gex / 1e6:+,.1f}M  {nowcast.regime} "
+          f"({nowcast.confidence:.0%} confidence)")
+    if nowcast.direction == 0:
+        verdict = "no opinion -- a fresh entry would be sized down, not vetoed"
+    elif nowcast.direction == base.direction:
+        verdict = "agrees with the print"
+    else:
+        verdict = "disagrees with the print -- a fresh entry would be vetoed"
+    print(f"  reads as       {verdict}\n")
     return 0
 
 
@@ -704,6 +836,46 @@ def build_parser() -> argparse.ArgumentParser:
     gex.add_argument("--at", help="timestamp to profile at, ISO-8601 (default: now)")
     gex.add_argument("--open-interest", choices=["synthetic", "csv"])
     gex.set_defaults(func=cmd_gex, source=None, bar_size=None)
+
+    backfill = sub.add_parser(
+        "nowcast-backfill", parents=[common],
+        help="download historical Databento option trades for the nowcast",
+    )
+    backfill.add_argument("--start-date", help="YYYY-MM-DD (default: --days before --end-date)")
+    backfill.add_argument("--end-date", help="YYYY-MM-DD (default: today)")
+    backfill.add_argument(
+        "--days", type=int, help="trading days back from --end-date (default: nowcast.backfill_days)",
+    )
+    backfill.add_argument(
+        "--api-key", help="Databento API key (default: the DATABENTO_API_KEY env var)",
+    )
+    backfill.add_argument(
+        "--force", action="store_true", help="refetch days already cached",
+    )
+    backfill.set_defaults(func=cmd_nowcast_backfill, source=None, bar_size=None)
+
+    nowcast = sub.add_parser(
+        "nowcast", parents=[common],
+        help="print the flow-corrected GEX read: the daily print plus signed flow since",
+    )
+    nowcast.add_argument(
+        "--price", type=float, required=True, help="spot level to profile at",
+    )
+    nowcast.add_argument("--iv", type=float, default=0.15, help="ATM implied vol")
+    nowcast.add_argument("--at", help="timestamp to profile at, ISO-8601 (default: now)")
+    nowcast.add_argument(
+        "--since-hours", type=float, default=1.0,
+        help="how far back to measure flow, in hours (default: 1)",
+    )
+    nowcast.add_argument(
+        "--replay", action="store_true",
+        help="read flow from the backfilled cache instead of subscribing live",
+    )
+    nowcast.add_argument(
+        "--api-key", help="Databento API key (default: the DATABENTO_API_KEY env var)",
+    )
+    nowcast.add_argument("--open-interest", choices=["synthetic", "csv"])
+    nowcast.set_defaults(func=cmd_nowcast, source=None, bar_size=None)
 
     doctor = sub.add_parser(
         "doctor", parents=[common],

@@ -29,11 +29,13 @@ from deltahedger.gex import (
     GATE_ENSEMBLE,
     GATE_ENTRY_WINDOW,
     GATE_FLIP_DISTANCE,
+    GATE_NOWCAST,
     GATE_PERSISTENCE,
     NEGATIVE,
     NEUTRAL,
     POSITIVE,
     EnsembleResult,
+    StrikeFlow,
     StrikeOpenInterest,
 )
 from deltahedger.pricing import black76
@@ -810,4 +812,242 @@ class TestGates:
         cfg.gates.persistence = True
         strategy = drive(cfg, [bar(0)] + [bar(m) for m in range(5, 390, 5)])
         assert "exit" in kinds(strategy)
+
+
+class FixedFlow:
+    """A nowcast provider returning the same flow rows for every expiry
+    it's asked about, built from real strike-level flow so the calculator
+    still runs for real -- the ``FixedRegime`` convention, applied here."""
+
+    def __init__(self, rows: tuple[StrikeFlow, ...]):
+        self.rows = rows
+        self.calls = 0
+
+    def flow_since(self, moment, expiry, since):
+        self.calls += 1
+        return self.rows
+
+
+def _flow_rows(
+    call_signed_volume: float = 0.0, put_signed_volume: float = 0.0,
+    center: float = 5000.0,
+) -> tuple[StrikeFlow, ...]:
+    return tuple(
+        StrikeFlow(center + 5.0 * i, call_signed_volume, put_signed_volume)
+        for i in range(-20, 21)
+    )
+
+
+#: Against ``FixedRegime(POSITIVE)`` (call_oi=4000, put_oi=200 at every
+#: strike): no flow at all leaves the nowcast equal to the base read, so it
+#: always agrees with whatever regime the print picked.
+_AGREEING_FLOW = _flow_rows()
+
+#: Enough opposing call flow, at ``dealer_share=1.0``, to flip the read from
+#: POSITIVE to NEGATIVE outright -- see ``tests/test_gex.py::TestNowcast
+#: ::test_a_confident_disagreement_can_flip_the_regime`` for the same
+#: arithmetic proven directly against the calculator.
+_DISAGREEING_FLOW = _flow_rows(call_signed_volume=4000.0)
+
+#: Enough call flow, at ``dealer_share=1.0``, to bring the effective call
+#: and put OI to exactly the same number at every strike -- zero net GEX,
+#: which reads NEUTRAL (no opinion), not a disagreement.
+_NEUTRAL_FLOW = _flow_rows(call_signed_volume=3800.0)
+
+
+class TestNowcast:
+    """The flow nowcast's narrow authority: it can veto an entry the print
+    picked, exit a position early, or haircut size when flow has no
+    opinion -- it can never pick the side itself. ``FixedRegime`` always
+    supplies the entry direction; only what the flow feed says changes."""
+
+    def _cfg(self, **nowcast_overrides):
+        cfg = make_cfg()
+        cfg.nowcast.enabled = True
+        cfg.nowcast.dealer_share = 1.0
+        for attr, value in nowcast_overrides.items():
+            setattr(cfg.nowcast, attr, value)
+        return cfg
+
+    # -- veto ----------------------------------------------------------
+
+    def test_an_agreeing_flow_does_not_veto_the_entry(self):
+        cfg = self._cfg()
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_AGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is not None
+
+    def test_a_disagreeing_flow_vetoes_the_entry(self):
+        cfg = self._cfg()
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_DISAGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
         assert strategy.portfolio.straddle is None
+        blocked = [e for e in strategy.events if e.gate == GATE_NOWCAST]
+        assert blocked and blocked[0].kind == "entry_skipped"
+
+    def test_the_veto_can_be_turned_off(self):
+        """The veto is a gate, not a rewiring of who picks the side: turning
+        it off must still take the print's (short) direction, never the
+        nowcast's disagreeing (long) one."""
+        cfg = self._cfg(veto_enabled=False)
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_DISAGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is not None
+        assert strategy.portfolio.straddle.quantity < 0  # still short: the print's side
+
+    def test_nowcast_disabled_never_vetoes(self):
+        cfg = self._cfg(enabled=False)
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_DISAGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is not None
+
+    # -- size haircut ----------------------------------------------------
+
+    def test_a_neutral_flow_haircuts_the_size(self):
+        cfg = self._cfg(size_haircut_when_unconfirmed=0.4)
+        baseline = GexStraddleStrategy(make_cfg(), open_interest=FixedRegime(POSITIVE))
+        baseline.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_NEUTRAL_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert abs(strategy.portfolio.straddle.quantity) < abs(baseline.portfolio.straddle.quantity)
+        entry = details(strategy, "entry")[0]
+        assert "40% sized" in entry and "no opinion" in entry
+
+    def test_an_agreeing_flow_does_not_haircut_the_size(self):
+        cfg = self._cfg(size_haircut_when_unconfirmed=0.4)
+        baseline = GexStraddleStrategy(make_cfg(), open_interest=FixedRegime(POSITIVE))
+        baseline.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_AGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle.quantity == baseline.portfolio.straddle.quantity
+
+    def test_a_disagreeing_flow_is_vetoed_rather_than_haircut(self):
+        """Disagreement is a full veto, never a partial size -- the two
+        never compose."""
+        cfg = self._cfg(veto_enabled=False, size_haircut_when_unconfirmed=0.4)
+        baseline = GexStraddleStrategy(make_cfg(), open_interest=FixedRegime(POSITIVE))
+        baseline.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_DISAGREEING_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle.quantity == baseline.portfolio.straddle.quantity
+
+    def test_size_haircut_disabled_trades_full_size(self):
+        cfg = self._cfg(size_haircut_enabled=False, size_haircut_when_unconfirmed=0.4)
+        baseline = GexStraddleStrategy(make_cfg(), open_interest=FixedRegime(POSITIVE))
+        baseline.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_NEUTRAL_FLOW),
+        )
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle.quantity == baseline.portfolio.straddle.quantity
+
+    # -- early exit --------------------------------------------------------
+
+    def test_a_disagreeing_flow_closes_an_open_position_early(self):
+        """The print never flips (``FixedRegime`` is pinned POSITIVE
+        throughout) -- only the flow read changes, from bar to bar."""
+        cfg = self._cfg(refresh_seconds=0.0)
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        cfg.strategy.exit_on_regime_flip = False
+        nowcast = FixedFlow(_AGREEING_FLOW)
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE), nowcast=nowcast)
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        assert strategy.portfolio.straddle is not None
+
+        nowcast.rows = _DISAGREEING_FLOW
+        strategy.on_bar(bar(5), execution)
+        exits = [e for e in strategy.events if e.kind == "exit"]
+        assert exits and "against the open short position" in exits[0].detail
+
+    def test_an_agreeing_flow_does_not_close_the_position(self):
+        cfg = self._cfg(refresh_seconds=0.0)
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        cfg.strategy.exit_on_regime_flip = False
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE), nowcast=FixedFlow(_AGREEING_FLOW),
+        )
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        strategy.on_bar(bar(5), execution)
+        assert "exit" not in kinds(strategy)
+
+    def test_exit_disabled_holds_through_a_disagreeing_flow(self):
+        cfg = self._cfg(refresh_seconds=0.0, exit_enabled=False)
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        cfg.strategy.exit_on_regime_flip = False
+        nowcast = FixedFlow(_AGREEING_FLOW)
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE), nowcast=nowcast)
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        nowcast.rows = _DISAGREEING_FLOW
+        strategy.on_bar(bar(5), execution)
+        assert "exit" not in kinds(strategy)
+        assert strategy.portfolio.straddle is not None
+
+    # -- reconciliation ----------------------------------------------------
+
+    def test_reconciliation_logs_the_divergence_against_next_mornings_oi(self):
+        cfg = self._cfg()
+        cfg.gex.refresh_seconds = 0.0
+        cfg.nowcast.refresh_seconds = 0.0
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE),
+            nowcast=FixedFlow(_flow_rows(call_signed_volume=500.0)),
+        )
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(session_bar(0, 0), execution)
+        strategy.on_bar(session_bar(1, 0), execution)
+        events = [e for e in strategy.events if e.kind == "nowcast_reconciliation"]
+        assert events
+        assert "OI error" in events[0].detail
+        assert "dealer_share=1" in events[0].detail
+
+    def test_reconciliation_can_be_turned_off(self):
+        cfg = self._cfg(reconciliation_enabled=False)
+        cfg.gex.refresh_seconds = 0.0
+        cfg.nowcast.refresh_seconds = 0.0
+        strategy = GexStraddleStrategy(
+            cfg, open_interest=FixedRegime(POSITIVE),
+            nowcast=FixedFlow(_flow_rows(call_signed_volume=500.0)),
+        )
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(session_bar(0, 0), execution)
+        strategy.on_bar(session_bar(1, 0), execution)
+        assert "nowcast_reconciliation" not in kinds(strategy)
+
+    # -- authority stays narrow --------------------------------------------
+
+    def test_the_nowcast_never_supplies_the_entry_direction(self):
+        """Even fully corroborating flow only ever agrees or defers -- the
+        direction itself always traces back to the daily print, in both
+        regimes."""
+        for regime in (POSITIVE, NEGATIVE):
+            cfg = self._cfg()
+            strategy = GexStraddleStrategy(
+                cfg, open_interest=FixedRegime(regime), nowcast=FixedFlow(_AGREEING_FLOW),
+            )
+            strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+            position = strategy.portfolio.straddle
+            assert position is not None
+            assert position.regime == regime

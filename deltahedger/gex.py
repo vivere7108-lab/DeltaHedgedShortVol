@@ -129,6 +129,11 @@ GATE_FLIP_DISTANCE = "flip_distance"
 GATE_ENSEMBLE = "ensemble"
 GATE_PERSISTENCE = "persistence"
 GATE_ENTRY_WINDOW = "entry_window"
+#: The nowcast veto/exit (config.NowcastConfig): a fifth gate, but one that
+#: needs a Databento subscription and is off by default, so it is kept out
+#: of GATE_NAMES -- the tuple every gate-sweep and default-config test
+#: assumes is "the four gates that ship enabled".
+GATE_NOWCAST = "nowcast"
 GATE_NAMES = (
     GATE_CONFIDENCE,
     GATE_FLIP_DISTANCE,
@@ -187,6 +192,34 @@ class OpenInterestProvider(Protocol):
     def open_interest(
         self, moment: datetime, future_price: float, expiry: date
     ) -> list[StrikeOpenInterest]: ...
+
+
+@dataclass(frozen=True)
+class StrikeFlow:
+    """Aggressor-signed contract volume at one strike, since some reference
+    time -- the flow analogue of ``StrikeOpenInterest``.  Unlike open
+    interest these numbers are signed and are not a position count: see
+    ``config.NowcastConfig`` and ``data/databento_flow.py`` for where they
+    come from and what they mean.
+    """
+
+    strike: float
+    call_signed_volume: float
+    put_signed_volume: float
+
+
+class NowcastProvider(Protocol):
+    """Anything that can say what has traded at each strike since a moment.
+
+    The live Databento feed and the historical replay source both
+    implement this with the same signature, so ``GexCalculator.nowcast_profile``
+    -- and the strategy above it -- cannot tell which one it is reading
+    from, the same symmetry ``OpenInterestProvider`` already has.
+    """
+
+    def flow_since(
+        self, moment: datetime, expiry: date, since: datetime
+    ) -> tuple[StrikeFlow, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -342,6 +375,33 @@ class GexProfile:
         return "\n".join(lines)
 
 
+def _apply_flow(
+    rows: Sequence[StrikeOpenInterest],
+    flow: Sequence[StrikeFlow],
+    dealer_share: float,
+) -> tuple[StrikeOpenInterest, ...]:
+    """Base open interest, adjusted by dealer-share-scaled signed flow.
+
+    Unioned by strike: a strike with flow but no listed open interest still
+    gets a row (base zero), and a strike with open interest but no flow
+    this session is passed through unchanged. The result can carry a
+    negative call_oi/put_oi -- once flow is folded in these are no longer
+    literal open interest counts, they are a signed dealer-inventory
+    proxy, and the pricing pipeline downstream never assumed positivity.
+    """
+    by_strike: dict[float, list[float]] = {
+        row.strike: [row.call_oi, row.put_oi] for row in rows
+    }
+    for row in flow:
+        bucket = by_strike.setdefault(row.strike, [0.0, 0.0])
+        bucket[0] += -dealer_share * row.call_signed_volume
+        bucket[1] += -dealer_share * row.put_signed_volume
+    return tuple(
+        StrikeOpenInterest(strike=k, call_oi=v[0], put_oi=v[1])
+        for k, v in sorted(by_strike.items())
+    )
+
+
 class PreparedBook(NamedTuple):
     """One expiry's open interest, windowed and arrayed, ready to price."""
 
@@ -471,6 +531,61 @@ class GexCalculator:
             ),
             by_expiry=tuple(by_expiry),
         )
+
+    def nowcast_books(
+        self,
+        books: Sequence[ExpiryBook],
+        flow_by_expiry: dict[date, Sequence[StrikeFlow]],
+        dealer_share: float,
+    ) -> list[ExpiryBook]:
+        """``books``, with each strike's open interest corrected by signed
+        flow since the print.
+
+        A trade the aggressor bought (``+`` signed volume) is one the
+        dealer sold, so it moves dealer inventory the *opposite* way::
+
+            dealer_inventory_delta(strike, right) = -dealer_share * signed_volume(strike, right)
+
+        That delta is added to the strike's base open interest -- for a
+        strike with flow but no listed OI at all, the base is implicitly
+        zero.  ``books`` is not mutated; a fresh list is returned, so a
+        caller can safely reuse the same base ``books`` for both the
+        entry-signal read and this one.
+
+        Split out from ``nowcast_profile`` because the reconciliation check
+        (``NowcastConfig.reconciliation_enabled``) wants the adjusted
+        per-strike table itself -- what the flow implied the book looked
+        like -- not the profile computed from it.
+        """
+        return [
+            ExpiryBook.of(
+                book.expiry,
+                book.time_to_expiry,
+                _apply_flow(
+                    book.rows, flow_by_expiry.get(book.expiry, ()), dealer_share
+                ),
+                book.days_to_expiry,
+            )
+            for book in books
+        ]
+
+    def nowcast_profile(
+        self,
+        spot: float,
+        books: Sequence[ExpiryBook],
+        flow_by_expiry: dict[date, Sequence[StrikeFlow]],
+        atm_iv: float,
+        dealer_share: float,
+    ) -> GexProfile:
+        """The daily-OI blend, corrected by signed flow since the print --
+        see ``nowcast_books``.  Repriced through exactly the same
+        gamma-weighted pipeline ``blended_profile`` uses, so everything
+        downstream of the strike table (sign convention, the confidence and
+        flip-distance gates, the flip search) is identical between a base
+        read and a nowcast one; the only difference is what went into it.
+        """
+        adjusted = self.nowcast_books(books, flow_by_expiry, dealer_share)
+        return self.blended_profile(spot, adjusted, atm_iv)
 
     def total_at(
         self,
