@@ -20,13 +20,13 @@ bother with, because they are the whole question for this strategy:
     trades does not say which one did it.  ``deltahedger sweep --gates``
     prices them one at a time against this count.
 
-Band feasibility is reported per *branch* as well as in aggregate.  At a
-multi-session tenor the two sides no longer carry comparable gamma: the
-short branch is sized by SPAN margin, which barely moves with tenor, while
-the long branch is sized by the debit, which roughly quadruples between
-0DTE and 3DTE.  The same +/-10 band therefore covers a different number of
-ES points on each side, and a regime comparison that did not know that
-would be reading the sizing rule as if it were the signal.
+The band is reported per *branch* as well as in aggregate, and under the
+Whalley-Wilmott model it is a per-bar quantity rather than a config number:
+it scales with the book's gamma, and the two sides do not carry the same
+gamma -- the short branch is sized by SPAN margin, the long branch by the
+debit.  So the report gives the median half-width each branch was actually
+held to, in delta units and in ES points, and a regime comparison can see
+how much of any P&L difference is position size rather than signal.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ..config import BAND_FIXED
 from ..gex import NEGATIVE, NEUTRAL, POSITIVE
 from ..strategy import BarState, StrategyEvent
 
@@ -79,20 +80,30 @@ class Metrics:
     mean_abs_delta_error: float
     max_abs_delta_error: float
     mean_net_delta: float
-    # Band feasibility: is the target band even reachable at this size?
+    # Band feasibility: is the band even reachable at this size?
     median_gamma_units: float
     band_width_points: float
     pct_bars_band_below_tick: float
     hedge_tick_points: float
     hedge_quantum: float
+    #: Median half-width over held bars, in delta units. A config number
+    #: under the fixed model; a property of the book under Whalley-Wilmott.
     band_half_width: float
     # Per branch, because the two are sized by different constraints.
     median_gamma_units_long: float = 0.0
     median_gamma_units_short: float = 0.0
     band_width_points_long: float = 0.0
     band_width_points_short: float = 0.0
+    band_half_width_long: float = 0.0
+    band_half_width_short: float = 0.0
+    # Which band model produced the numbers above.
+    band_model: str = "whalley_wilmott"
+    risk_aversion: float = 0.01
     # Tenor actually traded, in trading days, over bars holding a position.
     median_days_to_expiry: float = 0.0
+    # Bars that fell inside an event blackout, and exits it caused.
+    bars_in_event_blackout: int = 0
+    event_exits: int = 0
     # Gate attribution: blocked entries and blocked flip exits by gate.
     gate_blocks: dict[str, int] = field(default_factory=dict)
     gate_blocked_exits: dict[str, int] = field(default_factory=dict)
@@ -141,6 +152,8 @@ class Metrics:
                 f"  ({pct(self.win_rate)})",
                 f"  hedge trades         {self.hedges}"
                 f" ({self.hedge_contracts_traded} contracts)",
+                f"  event blackouts      {self.bars_in_event_blackout} bars inside one, "
+                f"{self.event_exits} exits caused",
                 "",
                 "Hedge quality",
                 f"  bars inside band     {self.bars_in_band} / {self.bars_with_position}"
@@ -149,13 +162,16 @@ class Metrics:
                 f"  max  |delta - target| {self.max_abs_delta_error:,.2f} delta units",
                 f"  mean net delta        {self.mean_net_delta:,.2f} delta units",
                 "",
-                "Band feasibility",
+                self._band_heading(),
+                f"  median half-width     {self.band_half_width:,.1f} delta units"
+                f"  ({self.band_width_points:,.3f} points wide; hedge tick "
+                f"{self.hedge_tick_points:g})",
                 f"  median position gamma {self.median_gamma_units:,.1f} delta units per point",
-                f"  band width in points  {self.band_width_points:,.3f}"
-                f"  (hedge tick {self.hedge_tick_points:g})",
-                f"    long-gamma branch   {self.band_width_points_long:,.3f} points"
+                f"    long-gamma branch   +/-{self.band_half_width_long:,.1f} units, "
+                f"{self.band_width_points_long:,.3f} points"
                 f"  (gamma {self.median_gamma_units_long:,.1f})",
-                f"    short-gamma branch  {self.band_width_points_short:,.3f} points"
+                f"    short-gamma branch  +/-{self.band_half_width_short:,.1f} units, "
+                f"{self.band_width_points_short:,.3f} points"
                 f"  (gamma {self.median_gamma_units_short:,.1f})",
                 f"  band finer than a tick on {pct(self.pct_bars_band_below_tick)} of held bars",
                 f"  hedge quantum         {self.hedge_quantum:,.0f} delta units"
@@ -165,6 +181,11 @@ class Metrics:
                 self._branch_note(),
             ]
         )
+
+    def _band_heading(self) -> str:
+        if self.band_model == BAND_FIXED:
+            return f"Band (fixed +/-{self.band_half_width:g})"
+        return f"Band (Whalley-Wilmott, risk aversion {self.risk_aversion:g} per $)"
 
     def _gate_lines(self) -> str:
         """Which gate stopped what, or a plain statement that none did."""
@@ -247,14 +268,21 @@ class Metrics:
         dead_zone = self.hedge_quantum / 2.0
         if self.band_half_width >= dead_zone:
             return (
-                f"  -> band +/-{self.band_half_width:g} is wider than half the "
+                f"  -> band +/-{self.band_half_width:,.1f} is wider than half the "
                 f"quantum ({dead_zone:g}); it binds."
             )
+        if self.band_model == BAND_FIXED:
+            return (
+                f"  -> band +/-{self.band_half_width:g} is INERT: it is narrower than\n"
+                f"     half a hedge contract ({dead_zone:g} delta units), so the system\n"
+                f"     behaves exactly as if the band were +/-{dead_zone:g}. To make the\n"
+                f"     band bind, hedge with a smaller instrument or widen it."
+            )
         return (
-            f"  -> band +/-{self.band_half_width:g} is INERT: it is narrower than\n"
-            f"     half a hedge contract ({dead_zone:g} delta units), so the system\n"
-            f"     behaves exactly as if the band were +/-{dead_zone:g}. To make the\n"
-            f"     band bind, hedge with a smaller instrument or widen it."
+            f"  -> the median band +/-{self.band_half_width:,.1f} is narrower than\n"
+            f"     half a hedge contract ({dead_zone:g} delta units): for most held\n"
+            f"     bars the contract size, not the formula, is what bounds the\n"
+            f"     residual. A bigger book or a lower risk aversion would let it bind."
         )
 
     def _feasibility_note(self) -> str:
@@ -314,6 +342,8 @@ def bars_to_frame(states: list[BarState], target: float) -> pd.DataFrame:
                 "confirmed_regime": s.confirmed_regime,
                 "days_to_expiry": s.days_to_expiry,
                 "in_session": s.in_session,
+                "band_half_width": s.band_half_width,
+                "event_blackout": s.event_blackout,
                 "strike": s.strike,
                 "straddle_contracts": s.straddle_contracts,
                 "direction": s.direction,
@@ -413,7 +443,9 @@ def compute_metrics(
     target: float,
     regime_pnl: dict[str, float] | None = None,
     regime_trades: dict[str, int] | None = None,
-    band_width: float = 0.0,
+    band_model: str = "whalley_wilmott",
+    risk_aversion: float = 0.01,
+    fixed_band: float = 10.0,
     hedge_tick: float = 0.25,
     hedge_quantum: float = 0.0,
 ) -> Metrics:
@@ -433,7 +465,9 @@ def compute_metrics(
             pct_bars_in_band=0.0, mean_abs_delta_error=0.0, max_abs_delta_error=0.0,
             mean_net_delta=0.0, median_gamma_units=0.0, band_width_points=0.0,
             pct_bars_band_below_tick=0.0, hedge_tick_points=hedge_tick,
-            hedge_quantum=hedge_quantum, band_half_width=band_width / 2.0,
+            hedge_quantum=hedge_quantum,
+            band_half_width=fixed_band if band_model == BAND_FIXED else 0.0,
+            band_model=band_model, risk_aversion=risk_aversion,
         )
 
     final_equity = float(bars["equity"].iloc[-1])
@@ -475,13 +509,24 @@ def compute_metrics(
     )
     gate_blocks = _gate_counts(events, "entry_skipped")
     gate_blocked_exits = _gate_counts(events, "exit_deferred")
+    blackout_bars = (
+        int((bars["event_blackout"].fillna("") != "").sum())
+        if "event_blackout" in bars else 0
+    )
+    event_exits = (
+        int(((events["kind"] == "exit")
+             & events["detail"].str.contains("blackout", na=False)).sum())
+        if not events.empty else 0
+    )
 
     branch_gamma = {1: 0.0, -1: 0.0}
     branch_points = {1: 0.0, -1: 0.0}
+    branch_band = {1: 0.0, -1: 0.0}
     median_dte = 0.0
     if held.empty:
         in_band = mean_err = max_err = mean_delta = 0.0
         median_gamma = band_points = below_tick = 0.0
+        median_band = fixed_band if band_model == BAND_FIXED else 0.0
         bars_in_band = bars_with_position = 0
     else:
         bars_with_position = len(held)
@@ -492,35 +537,45 @@ def compute_metrics(
         max_err = float(errors.max())
         mean_delta = float(held["net_delta_units"].mean())
 
+        # The band each bar was actually held to. Under the fixed model it
+        # is one number; under Whalley-Wilmott it moves with the book's
+        # gamma, so the statistics below are taken bar by bar.
+        band = (
+            held["band_half_width"].astype(float)
+            if "band_half_width" in held
+            else pd.Series(fixed_band, index=held.index)
+        )
+        median_band = float(band.median())
+
         # How far the underlying must move to cross the band, given gamma.
         # Bars with ~zero gamma (deep out of the money, late in the session)
         # would divide to infinity, so they are treated as "band reachable"
         # rather than skewing the statistic.
         gamma = held["gamma_units"].abs()
         median_gamma = float(gamma.median())
-        band_points = (
-            band_width / median_gamma if median_gamma > 1e-9 else float("inf")
+        movable = gamma > 1e-9
+        points = (2.0 * band[movable]) / gamma[movable]
+        band_points = float(points.median()) if not points.empty else float("inf")
+        below_tick = (
+            float((points < hedge_tick).sum() / len(held)) if not points.empty else 0.0
         )
-        movable = gamma[gamma > 1e-9]
-        if movable.empty:
-            below_tick = 0.0
-        else:
-            below_tick = float(
-                ((band_width / movable) < hedge_tick).sum() / len(held)
-            )
 
         # The same arithmetic per branch. They are sized by different
         # constraints -- a debit on the long side, SPAN margin on the short
-        # one -- so at a multi-session tenor their gamma loads diverge and
-        # one band means two different numbers of ES points.
+        # one -- so their gamma loads differ, and under Whalley-Wilmott so
+        # do the bands they are held to.
         for direction in (1, -1):
-            side = held[held["direction"] == direction]["gamma_units"].abs()
+            side = held[held["direction"] == direction]
             if side.empty:
                 continue
-            value = float(side.median())
-            branch_gamma[direction] = value
+            side_gamma = side["gamma_units"].abs()
+            side_band = band.loc[side.index]
+            branch_gamma[direction] = float(side_gamma.median())
+            branch_band[direction] = float(side_band.median())
+            ok = side_gamma > 1e-9
+            side_points = (2.0 * side_band[ok]) / side_gamma[ok]
             branch_points[direction] = (
-                band_width / value if value > 1e-9 else float("inf")
+                float(side_points.median()) if not side_points.empty else float("inf")
             )
         if "days_to_expiry" in held and held["days_to_expiry"].notna().any():
             median_dte = float(held["days_to_expiry"].dropna().median())
@@ -566,12 +621,18 @@ def compute_metrics(
         pct_bars_band_below_tick=below_tick,
         hedge_tick_points=hedge_tick,
         hedge_quantum=hedge_quantum,
-        band_half_width=band_width / 2.0,
+        band_half_width=median_band,
         median_gamma_units_long=branch_gamma[1],
         median_gamma_units_short=branch_gamma[-1],
         band_width_points_long=branch_points[1],
         band_width_points_short=branch_points[-1],
+        band_half_width_long=branch_band[1],
+        band_half_width_short=branch_band[-1],
+        band_model=band_model,
+        risk_aversion=risk_aversion,
         median_days_to_expiry=median_dte,
+        bars_in_event_blackout=blackout_bars,
+        event_exits=event_exits,
         gate_blocks=gate_blocks,
         gate_blocked_exits=gate_blocked_exits,
     )

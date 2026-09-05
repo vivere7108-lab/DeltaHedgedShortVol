@@ -593,7 +593,7 @@ class IbkrExecution:
 
     def _check_size(self, quantity: int, instrument: str) -> None:
         limit = min(MAX_ORDER_CONTRACTS, self.cfg.hedge.max_hedge_contracts
-                    if instrument == "hedge" else self.cfg.sizing.max_short_contracts)
+                    if instrument == "hedge" else self.cfg.sizing.max_straddles)
         if abs(quantity) > limit:
             raise ExecutionError(
                 f"refusing to send a {abs(quantity)}-contract {instrument} order; "

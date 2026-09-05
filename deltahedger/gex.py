@@ -29,10 +29,11 @@ One book, several expiries
 The regime is read off the **aggregate of the front expiries**, from the
 one expiring today out to the one being traded, rather than off the traded
 series alone.  A dealer does not hedge a series; they hedge a book, and
-their delta is the sum over everything they are carrying.  At a 3-4 DTE
-tenor the traded series is a minority of the gamma sitting in front of
-them, so classifying on it alone would be reading a corner of the book and
-calling it the book.
+their delta is the sum over everything they are carrying.  With today's
+series traded that is one book for most of the day; in the roll window,
+when tomorrow's series is the one being entered, it is today's and
+tomorrow's together, and today's expiring gamma is still the larger part
+of what dealers are hedging.
 
 The blend needs no weights.  GEX is already gamma-weighted by
 construction, and gamma per contract scales roughly as ``1/sqrt(T)``, so a
@@ -76,13 +77,13 @@ Honest limits
    it is the load-bearing one.  ``call_sign``/``put_sign`` are config so it
    can be varied rather than believed, and the ensemble gate turns that
    variation into a trading rule.
-2. **OI is stale intraday.**  Exchange open interest is an end-of-previous-
-   day figure.  This bites least on the series the blend weights most
-   heavily by gamma and most on the ones that have been listed longest --
-   which is the wrong way round, and is the single largest approximation
-   in the GEX layer.  The entry window exists to at least ensure the
-   figure being used is the exchange's *final* print rather than its
-   preliminary one.
+2. **OI is only as fresh as the feed.**  With intraday open interest
+   from the exchange's MDP 3.0 feed the same-day series' print describes
+   the book that is actually there, which is what makes a 0DTE read
+   usable; on a feed that only carries the previous session's close the
+   same-day series is stalest exactly where most of the flow is, and the
+   GEX layer has no way to tell.  ``gex.refresh_seconds`` is how often
+   the print is re-read.
 3. **Expiring gamma is a spike.**  As expiry approaches, gamma concentrates
    at the money and vanishes elsewhere, so the 0DTE leg of the blend
    becomes dominated by two or three strikes and the flip point gets noisy.

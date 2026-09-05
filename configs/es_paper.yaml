@@ -1,5 +1,6 @@
-# The initial forward walk: IBKR paper account, real bars, real open
-# interest, one fixed heuristic delta band.
+# The forward walk: IBKR paper account, real bars, real open interest,
+# 0DTE straddles rolled at the bell, sized to the margin limit, hedged
+# under a Whalley-Wilmott band.
 #
 #   deltahedger live -c configs/es_paper.yaml --dry-run     # decides, places nothing
 #   deltahedger live -c configs/es_paper.yaml               # routes to paper
@@ -19,33 +20,40 @@ starting_equity: 250000.0
 
 hedge:
   target: 0.0
-  band: 10.0                       # the fixed heuristic under test
-  overnight_band_multiplier: 2.5   # wider outside RTH; the walk now holds
-                                   # the position overnight and across days
+  band_model: whalley_wilmott
+  risk_aversion: 0.01              # per dollar; see es_default.yaml
+  overnight_band_multiplier: 2.5   # wider outside RTH: the rolled 1DTE
+                                   # position is carried overnight
+  max_hedge_contracts: 500         # a margin-limit book can need it near the bell
   min_seconds_between_hedges: 60.0  # damp churn on noisy live quotes
 
 gex:
   enabled: true
   refresh_seconds: 900.0
-  blend_front_expiries: true       # classify on the front book, not just
-                                   # the traded series
+  blend_front_expiries: true       # today's series, plus tomorrow's in the
+                                   # roll window
   blend_max_expiries: 4            # see `deltahedger doctor` for the
                                    # market-data-line cost of raising this
 
 sizing:
-  buying_power_pct: 0.10           # smaller than the backtest default: the
-                                   # forward walk is measuring behaviour,
-                                   # not compounding
-  max_straddles: 10
+  buying_power_pct: 0.80           # the margin limit less a 20% buffer
+  hedge_margin_reserve_pct: 0.30
+  max_straddles: 500
 
 strategy:
-  min_days_to_expiry: 2            # the shipped tenor: see the README
-  max_days_to_expiry: 5
-  prefer_min_days_to_expiry: 3
-  prefer_max_days_to_expiry: 4
-  close_at_days_to_expiry: 1
-  entry_time: '10:00'              # after the exchange's final OI print
-  entry_cutoff_time: '11:30'
+  min_days_to_expiry: 0            # today's series ...
+  max_days_to_expiry: 1            # ... or tomorrow's, in the roll window
+  prefer_min_days_to_expiry: 0
+  prefer_max_days_to_expiry: 0
+  close_at_days_to_expiry: null
+  entry_time: '09:35'
+  entry_cutoff_time: '14:30'
+  close_before_expiry_minutes: 15  # out before the expiry gamma spike ...
+  roll_at_expiry: true             # ... and into tomorrow's series
+  hold_over_weekends: false        # flat from Friday 15:45 to Monday 09:35
+  events_path: configs/events.txt  # FOMC statements; verify before a walk
+  event_blackout_minutes_before: 15
+  event_blackout_minutes_after: 15
   exit_on_regime_flip: true
   reenter_after_exit: true
   max_entries_per_session: 3

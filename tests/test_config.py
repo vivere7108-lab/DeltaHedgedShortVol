@@ -14,26 +14,38 @@ from deltahedger.config import (
 
 
 class TestDefaults:
-    def test_the_band_is_neutral_plus_or_minus_ten(self):
-        """The fixed heuristic threshold for the forward walk: hold the
-        straddle delta-neutral, one whole MES contract either side."""
+    def test_the_band_is_whalley_wilmott_about_neutral(self):
+        """Hold the straddle delta-neutral under a Whalley-Wilmott band at
+        a risk aversion of 0.01 per dollar; the fixed +/-10 is the control."""
         hedge = Config().hedge
-        assert hedge.target == 0.0 and hedge.band == 10.0
-        assert (hedge.lower, hedge.upper) == (-10.0, 10.0)
+        assert hedge.target == 0.0
+        assert hedge.band_model == "whalley_wilmott" and not hedge.is_fixed
+        assert hedge.risk_aversion == 0.01
+        assert hedge.hedge_cost_per_contract is None  # derived from costs
+        assert hedge.band == 10.0
 
-    def test_buying_power_defaults_to_fifteen_percent(self):
-        assert Config().sizing.buying_power_pct == 0.15
+    def test_buying_power_defaults_to_the_margin_limit_less_a_fifth(self):
+        assert Config().sizing.buying_power_pct == 0.80
 
     def test_the_default_risk_source_is_es(self):
         assert Config().source.name == "ES"
 
-    def test_the_default_tenor_is_two_to_five_dte(self):
+    def test_the_default_tenor_is_todays_series_rolled_into_tomorrows(self):
         strategy = Config().strategy
-        assert (strategy.min_days_to_expiry, strategy.max_days_to_expiry) == (2, 5)
+        assert (strategy.min_days_to_expiry, strategy.max_days_to_expiry) == (0, 1)
         assert (
             strategy.prefer_min_days_to_expiry, strategy.prefer_max_days_to_expiry
-        ) == (3, 4)
-        assert strategy.close_at_days_to_expiry == 1
+        ) == (0, 0)
+        assert strategy.close_at_days_to_expiry is None
+        assert strategy.close_before_expiry_minutes == 15
+        assert strategy.roll_at_expiry
+        assert not strategy.hold_over_weekends
+
+    def test_the_event_blackout_is_a_quarter_hour_each_side(self):
+        strategy = Config().strategy
+        assert strategy.event_blackout_minutes_before == 15
+        assert strategy.event_blackout_minutes_after == 15
+        assert strategy.events == [] and strategy.events_path is None
 
     def test_all_four_gates_are_on_by_default(self):
         gates = Config().gates
@@ -52,11 +64,8 @@ class TestDefaults:
         """A backtest must never silently reach for a live connection."""
         assert Config().data.open_interest == "synthetic"
 
-    @pytest.mark.parametrize("value,expected", [
-        (-10.0, True), (0.0, True), (10.0, True), (-10.1, False), (10.1, False),
-    ])
-    def test_in_band(self, value, expected):
-        assert Config().hedge.in_band(value) is expected
+    def test_the_fixed_model_is_selectable(self):
+        assert HedgeConfig(band_model="fixed").is_fixed
 
 
 class TestSerialisation:
@@ -73,13 +82,28 @@ class TestSerialisation:
         assert restored.sizing.buying_power_pct == 0.25
         assert restored.strategy.entry_time == time(10, 15)
 
+    def test_events_and_the_tenor_round_trip(self, tmp_path):
+        original = Config()
+        original.strategy.events = ["2026-09-16 14:00 FOMC statement"]
+        original.strategy.hold_over_weekends = True
+        original.strategy.close_at_days_to_expiry = None
+        original.hedge.band_model = "fixed"
+        path = tmp_path / "c.yaml"
+        original.to_yaml(path)
+
+        restored = Config.from_yaml(path)
+        assert restored.strategy.events == ["2026-09-16 14:00 FOMC statement"]
+        assert restored.strategy.hold_over_weekends
+        assert restored.strategy.close_at_days_to_expiry is None
+        assert restored.hedge.band_model == "fixed"
+
     def test_a_partial_file_keeps_the_other_defaults(self, tmp_path):
         path = tmp_path / "partial.yaml"
         path.write_text(yaml.safe_dump({"hedge": {"band": 8.0}}))
         cfg = Config.from_yaml(path)
         assert cfg.hedge.band == 8.0
         assert cfg.hedge.target == 0.0
-        assert cfg.sizing.buying_power_pct == 0.15
+        assert cfg.sizing.buying_power_pct == 0.80
 
     def test_an_empty_file_gives_the_defaults(self, tmp_path):
         path = tmp_path / "empty.yaml"
@@ -134,12 +158,35 @@ class TestValidation:
                 prefer_min_days_to_expiry=1, prefer_max_days_to_expiry=4,
             ).validate()
 
+    def test_a_disabled_close_floor_is_allowed_at_any_tenor(self):
+        StrategyConfig(
+            min_days_to_expiry=0, max_days_to_expiry=0, close_at_days_to_expiry=None,
+        ).validate()
+
+    def test_rejects_a_negative_pre_settlement_buffer(self):
+        with pytest.raises(ValueError, match="close_before_expiry_minutes"):
+            StrategyConfig(close_before_expiry_minutes=-1).validate()
+
+    def test_rejects_an_events_entry_that_is_not_a_list(self):
+        with pytest.raises(ValueError, match="events"):
+            StrategyConfig(events="2026-09-16 14:00").validate()
+
+    def test_rejects_an_unknown_band_model(self):
+        with pytest.raises(ValueError, match="band_model"):
+            HedgeConfig(band_model="adaptive").validate()
+
+    def test_rejects_a_non_positive_risk_aversion(self):
+        with pytest.raises(ValueError, match="risk_aversion"):
+            HedgeConfig(risk_aversion=-0.01).validate()
+
     def test_rejects_a_close_floor_at_or_above_the_dte_minimum(self):
         """A position entered at the floor would be immediately eligible to
         close, which is not a tenor -- it is a bug that looks like one."""
         with pytest.raises(ValueError, match="close_days"):
             StrategyConfig(
-                min_days_to_expiry=2, max_days_to_expiry=5, close_at_days_to_expiry=2,
+                min_days_to_expiry=2, max_days_to_expiry=5,
+                prefer_min_days_to_expiry=3, prefer_max_days_to_expiry=4,
+                close_at_days_to_expiry=2,
             ).validate()
 
     def test_rejects_an_overnight_band_narrower_than_the_day_band(self):

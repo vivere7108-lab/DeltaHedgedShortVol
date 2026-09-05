@@ -87,6 +87,17 @@ class RiskSource:
         """Delta units moved by one hedge contract. 10.0 for MES against ES."""
         return self.delta_units_per_contract(self.hedge)
 
+    @property
+    def dollars_per_point_per_delta_unit(self) -> float:
+        """Dollar P&L one delta unit earns per 1.00 move in the underlying.
+
+        One unit is 1% of the reference future, so this is 1% of its
+        multiplier: $0.50 for ES.  It is what converts a gamma quoted in
+        delta units per point into the dollar-denominated gamma the
+        Whalley-Wilmott band is written in.
+        """
+        return self.reference_multiplier / DELTA_UNITS_PER_FUTURE
+
 
 ES = RiskSource(
     name="ES",

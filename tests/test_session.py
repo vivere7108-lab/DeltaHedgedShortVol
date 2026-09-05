@@ -135,3 +135,84 @@ class TestSessionClock:
         """Expiry is 16:00 local on both sides of the DST boundary."""
         for day in (date(2025, 1, 15), date(2025, 7, 15)):
             assert clock.expiry_datetime(day).hour == 16
+
+
+class TestGaps:
+    """The weekend rule's calendar arithmetic: is there a session-less day
+    between now and the expiry?"""
+
+    @pytest.fixture
+    def clock(self, es):
+        return SessionClock(es)
+
+    def test_thursday_to_friday_is_not_a_gap(self, clock):
+        assert not clock.gap_before(datetime(2025, 6, 12, 15, 45, tzinfo=NY), date(2025, 6, 13))
+
+    def test_friday_to_monday_is_a_gap(self, clock):
+        assert clock.gap_before(datetime(2025, 6, 13, 15, 45, tzinfo=NY), date(2025, 6, 16))
+
+    def test_a_holiday_is_a_gap_too(self, clock):
+        """Thursday 2025-07-03 to Monday 2025-07-07 crosses July 4th."""
+        assert clock.gap_before(datetime(2025, 7, 3, 15, 45, tzinfo=NY), date(2025, 7, 7))
+        # And the Wednesday before Thanksgiving to the Friday after it.
+        assert clock.gap_before(datetime(2025, 11, 26, 15, 45, tzinfo=NY), date(2025, 11, 28))
+
+    def test_todays_expiry_is_never_across_a_gap(self, clock):
+        assert not clock.gap_before(datetime(2025, 6, 13, 10, 0, tzinfo=NY), date(2025, 6, 13))
+
+    def test_gap_after_reads_the_last_session_before_a_gap(self, clock):
+        assert clock.gap_after(datetime(2025, 6, 13, 12, 0, tzinfo=NY))  # Friday
+        assert clock.gap_after(datetime(2025, 7, 3, 12, 0, tzinfo=NY))  # before July 4th
+        assert not clock.gap_after(datetime(2025, 6, 12, 12, 0, tzinfo=NY))  # Thursday
+
+
+class TestBufferedSelection:
+    """``select_expiry`` with the pre-settlement buffer and the weekend rule
+    -- the two filters that make a 0DTE policy roll and stay flat."""
+
+    @pytest.fixture
+    def clock(self, es):
+        return SessionClock(es)
+
+    def pick(self, clock, moment, hold_over_gaps=False):
+        return clock.select_expiry(
+            moment, 0, 1, (0, 0), min_seconds_to_expiry=15 * 60,
+            hold_over_gaps=hold_over_gaps,
+        )
+
+    def test_during_the_day_it_is_todays_series(self, clock):
+        assert self.pick(clock, datetime(2025, 6, 10, 10, 0, tzinfo=NY)) == date(2025, 6, 10)
+
+    def test_inside_the_buffer_it_rolls_to_tomorrow(self, clock):
+        """15:45 on a Tuesday: today's series is still listed but inside
+        the 15-minute buffer, so Wednesday's is the nearest eligible."""
+        assert self.pick(clock, datetime(2025, 6, 10, 15, 45, tzinfo=NY)) == date(2025, 6, 11)
+        assert self.pick(clock, datetime(2025, 6, 10, 15, 44, tzinfo=NY)) == date(2025, 6, 10)
+
+    def test_after_the_bell_it_is_tomorrow(self, clock):
+        assert self.pick(clock, datetime(2025, 6, 10, 20, 0, tzinfo=NY)) == date(2025, 6, 11)
+
+    def test_a_friday_afternoon_has_nothing_to_roll_into(self, clock):
+        assert self.pick(clock, datetime(2025, 6, 13, 15, 45, tzinfo=NY)) is None
+
+    def test_the_friday_roll_is_allowed_when_gaps_are_held(self, clock):
+        assert self.pick(
+            clock, datetime(2025, 6, 13, 15, 45, tzinfo=NY), hold_over_gaps=True
+        ) == date(2025, 6, 16)
+
+    def test_the_eve_of_a_holiday_has_nothing_to_roll_into(self, clock):
+        assert self.pick(clock, datetime(2025, 7, 3, 15, 45, tzinfo=NY)) is None
+
+    def test_a_weekend_moment_reads_nothing(self, clock):
+        assert self.pick(clock, datetime(2025, 6, 14, 12, 0, tzinfo=NY)) is None
+
+    def test_the_buffer_does_not_apply_to_a_wider_tenor(self, clock):
+        """A 2-5 DTE policy on a Tuesday afternoon still picks the same
+        series it picked in the morning; the buffer only bites on a series
+        that is minutes from settling."""
+        moment = datetime(2025, 6, 10, 15, 50, tzinfo=NY)
+        assert clock.select_expiry(
+            moment, 2, 5, (3, 4), min_seconds_to_expiry=15 * 60, hold_over_gaps=True
+        ) == clock.select_expiry(
+            datetime(2025, 6, 10, 10, 0, tzinfo=NY), 2, 5, (3, 4),
+        )

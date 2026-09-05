@@ -20,6 +20,7 @@ hedge, not of the accounting.
 """
 
 import statistics
+from datetime import time
 
 import pytest
 
@@ -38,6 +39,20 @@ def synthetic(days=10, **overrides) -> Config:
     for dotted, value in overrides.items():
         section, _, attr = dotted.partition(".")
         setattr(getattr(cfg, section) if attr else cfg, attr or section, value)
+    return cfg
+
+
+def unlimited(cfg: Config) -> Config:
+    """Lift the per-session entry cap and the daily loss limit.
+
+    Both are right for trading and wrong for a test of the end-of-day
+    rules: a book sized to the margin limit can trip a 5% daily loss limit
+    inside an hour of generated data, and a flickering ungated regime can
+    use up three entries by lunchtime -- after which ``_try_entry`` returns
+    before it reaches the rule under test, and records nothing.
+    """
+    cfg.strategy.max_entries_per_session = 1_000
+    cfg.strategy.daily_loss_limit_pct = None
     return cfg
 
 
@@ -100,27 +115,73 @@ class TestEndToEnd:
         assert 0 < result.metrics.entries
 
     def test_every_entry_is_matched_by_an_exit_or_is_still_open(self):
-        """Unlike the 0DTE version, a position now spans several sessions,
-        so a backtest window can end mid-hold -- that is an honest "not
-        finished yet", not a leak. At most one entry (the last one) may be
-        unmatched, and only if the book is still holding it."""
+        """A position rolled into tomorrow's series at 15:45 spans the end
+        of a backtest window -- that is an honest "not finished yet", not a
+        leak. At most one entry (the last one) may be unmatched, and only
+        if the book is still holding it."""
         result = run_backtest(synthetic(days=7))
         kinds = result.events["kind"].value_counts()
         entries, exits = kinds.get("entry", 0), kinds.get("exit", 0)
         still_open = result.bars["straddle_contracts"].iloc[-1] != 0
         assert entries - exits == (1 if still_open else 0)
 
-    def test_it_ends_flat_unless_a_position_is_still_within_its_tenor(self):
-        """A position open at the last bar must be the one the tenor policy
-        would still hold -- not a leak, and not a hedge left unmatched to
-        it."""
+    def test_it_ends_flat_unless_a_position_was_rolled_into_tomorrow(self):
+        """A position open at the last bar (16:00) can only be one rolled
+        into the next session's series at the buffer -- today's has been
+        closed by then -- and it must not be a leak, nor a hedge left
+        unmatched to it."""
         result = run_backtest(synthetic())
         last = result.bars.iloc[-1]
         if last["straddle_contracts"] == 0:
             assert last["hedge_contracts"] == 0
         else:
-            assert last["days_to_expiry"] >= Config().strategy.close_at_days_to_expiry
-            assert last["hedge_contracts"] != 0 or abs(last["net_delta_units"]) <= 10.0
+            assert last["days_to_expiry"] == 1
+            assert last["hedge_contracts"] != 0 or abs(last["net_delta_units"]) <= max(
+                last["band_half_width"], 5.0
+            )
+
+    def test_todays_position_is_closed_at_the_buffer_and_rolled(self):
+        """Every session ends the same way: an exit '15m to expiry' on the
+        15:45 bar, and -- when the read allows and tomorrow is a session --
+        an entry into the 1DTE series inside the roll window, never before."""
+        result = run_backtest(unlimited(synthetic(days=10)))
+        events = result.events
+        exits = events[(events["kind"] == "exit") & events["detail"].str.contains("to expiry")]
+        assert not exits.empty
+        assert all(ts.time().isoformat() == "15:45:00" for ts in exits["timestamp"])
+        rolls = events[(events["kind"] == "entry") & events["detail"].str.contains("1DTE")]
+        assert not rolls.empty
+        assert all(ts.time() >= time(15, 45) for ts in rolls["timestamp"])
+        assert (rolls["timestamp"].dt.time == time(15, 45)).any()
+
+    def test_no_position_is_carried_over_a_weekend(self):
+        """The generated run starts on Thursday 2025-01-02: the Friday
+        bells must leave the book flat, and the Friday roll must be
+        refused for the weekend gap by name."""
+        result = run_backtest(unlimited(synthetic(days=10)))
+        bars = result.bars
+        fridays = bars[bars["timestamp"].dt.weekday == 4]
+        last_of_each = fridays.groupby(fridays["timestamp"].dt.date).tail(1)
+        assert (last_of_each["straddle_contracts"] == 0).all()
+        assert (last_of_each["hedge_contracts"] == 0).all()
+        blocked = result.events[result.events["gate"] == "weekend_gap"]
+        assert not blocked.empty
+        assert blocked["detail"].str.contains("weekend or holiday").all()
+
+    def test_an_event_blackout_closes_and_blocks(self):
+        """A calendar with one event at 14:00 on the first session: the
+        position is closed at 13:45, nothing is opened until after 14:15,
+        and the bars in between are flagged."""
+        cfg = unlimited(ungated(synthetic(days=1)))
+        cfg.strategy.events = ["2025-01-02 14:00 test event"]
+        result = run_backtest(cfg)
+        bars = result.bars
+        inside = bars[bars["event_blackout"] != ""]
+        assert len(inside) == 7  # 13:45 .. 14:15 on 5-minute bars
+        assert (inside["straddle_contracts"] == 0).all()
+        assert result.metrics.bars_in_event_blackout == 7
+        blocked = result.events[result.events["gate"] == "event_blackout"]
+        assert len(blocked) == 7
 
     def test_both_regimes_are_exercised(self):
         """A run that only ever saw one regime has tested half the strategy;
@@ -129,11 +190,10 @@ class TestEndToEnd:
         assert m.long_gamma_trades > 0 and m.short_gamma_trades > 0
 
     def test_every_bar_carries_its_gex_read(self):
-        """Unlike the 0DTE version, there is no bell to run out the clock
-        on: a 2-5 DTE window always has a listed expiry inside it, so every
-        bar -- including the 16:00 one -- gets a profile. A gap here would
-        mean the tenor selection or the blend broke, not that a series
-        settled."""
+        """There is no bell to run out the clock on: once today's series
+        is inside the buffer the traded series is tomorrow's, so every bar
+        -- including the 16:00 one -- gets a profile. A gap here would mean
+        the tenor selection or the blend broke, not that a series settled."""
         result = run_backtest(synthetic(days=5))
         assert result.bars["gex_total"].notna().all()
         assert set(result.bars["gex_regime"]) <= {POSITIVE, NEGATIVE, "neutral"}
@@ -177,29 +237,25 @@ class TestCorrectness:
         If it did not, the dispersion would be an accounting fault rather
         than a known property of rebalancing on a 5-minute grid.
 
-        Confined to positions that open and close same-day (``ZERO_DTE``,
-        borrowed from ``test_strategy``), which isolates *intraday*
-        discretisation from a second, much larger source of dispersion at
-        the shipped 2-5 DTE tenor: the overnight gap. A position carried
-        past the close is not rebalanced again until the next session's
-        first bar -- the backtest's bar sources are RTH-only, so there is
-        nothing to rebalance against overnight even in principle, unlike
-        the live runner, which keeps polling and hedging around the clock.
-        That gap is real risk, but it is not *discretisation* error and it
-        does not shrink by sampling the session more finely, so mixing it
-        into this comparison would test the wrong thing. See "A single run
-        does not measure the hedge" in the README for the overnight-
-        inclusive number.
+        Confined to positions that open and close same-day (the roll is
+        switched off), which isolates *intraday* discretisation from a
+        second source of dispersion: the overnight gap the rolled 1DTE
+        position spans. A position carried past the close is not
+        rebalanced again until the next session's first bar -- the
+        backtest's bar sources are RTH-only, so there is nothing to
+        rebalance against overnight even in principle, unlike the live
+        runner, which keeps polling and hedging around the clock. That gap
+        is real risk, but it is not *discretisation* error and it does not
+        shrink by sampling the session more finely, so mixing it into this
+        comparison would test the wrong thing. See "A single run does not
+        measure the hedge" in the README for the overnight-inclusive number.
         """
         def rms(bar_size):
             values = []
             for seed in (3, 7, 11, 19, 23):
                 cfg = ungated(synthetic(days=10, **{"costs.enabled": False}))
-                cfg.strategy.min_days_to_expiry = 0
                 cfg.strategy.max_days_to_expiry = 0
-                cfg.strategy.prefer_min_days_to_expiry = 0
-                cfg.strategy.prefer_max_days_to_expiry = 0
-                cfg.strategy.close_at_days_to_expiry = -1
+                cfg.strategy.roll_at_expiry = False
                 cfg.data.synthetic_seed = seed
                 cfg.data.bar_size = bar_size
                 m = run_backtest(cfg, source=pin_implied_vol(cfg)).metrics
@@ -305,42 +361,97 @@ class TestCorrectness:
             assert "of $" in row.detail  # every entry states the budget it fit inside
 
 
+def uncapped(cfg: Config) -> Config:
+    """Lift the per-order hedge cap so the band's residual bound is testable.
+
+    A book sized to the margin limit can need more than the per-order cap
+    in one bar near expiry; what the cap holds back is sent on the next
+    pass. That is the right live behaviour and it is tested on its own
+    below, but it would break a test of the bound the *band* promises.
+    """
+    cfg.hedge.max_hedge_contracts = 100_000
+    return cfg
+
+
 class TestHedgeBehaviour:
     def test_net_delta_is_held_at_neutral(self):
-        result = run_backtest(synthetic(days=10))
+        """Under Whalley-Wilmott the band is a few hundred units on a book
+        sized to the margin limit, so "neutral" means "well inside it" --
+        the mean net delta over held bars sits within half the median band."""
+        result = run_backtest(uncapped(synthetic(days=10)))
         held = result.bars[result.bars["straddle_contracts"] != 0]
-        assert held["net_delta_units"].mean() == pytest.approx(0.0, abs=3.0)
+        assert abs(held["net_delta_units"].mean()) <= 0.5 * result.metrics.band_half_width
 
     def test_the_residual_never_exceeds_the_binding_constraint(self, es):
-        """The bound the hedger promises, verified over a run.
+        """The bound the hedger promises, verified bar by bar over a run.
 
         Two things can bind, and the wider one wins. The hedger stops once
         no whole contract lands closer to target, which caps the residual at
         half a contract; but it does not act at all inside the band, which
-        caps it at the band. The shipped band of 10 is wider than half an MES
-        (5), so the band is what binds -- unlike the old +/-3, where the
-        contract size did.
+        caps it at the band. Under Whalley-Wilmott the band is a per-bar
+        number, so the bound is checked against the band each bar was
+        actually held to.
         """
-        result = run_backtest(synthetic(days=10))
-        bound = max(Config().hedge.band, es.hedge_quantum / 2)
-        assert result.metrics.max_abs_delta_error <= bound + 1e-6
+        result = run_backtest(uncapped(synthetic(days=10)))
+        held = result.bars[result.bars["straddle_contracts"] != 0]
+        bound = held["band_half_width"].clip(lower=es.hedge_quantum / 2)
+        assert (held["delta_error"].abs() <= bound + 1e-6).all()
+
+    def test_the_per_order_cap_is_honoured_and_caught_up(self):
+        """What the cap holds back is sent on the next pass rather than
+        forgotten: no single hedge fill exceeds it, and the residual left
+        behind is gone within a few bars."""
+        cfg = synthetic(days=10)
+        cfg.hedge.max_hedge_contracts = 100
+        result = run_backtest(cfg)
+        hedges = result.fills[result.fills["instrument"] == "hedge"]
+        assert (hedges["quantity"].abs() <= 100).all()
+        assert result.metrics.hedges > 0
+        # The flatten on exit is sent in capped orders too, and says so.
+        flattens = result.events[result.events["kind"] == "hedge_flatten"]
+        assert flattens["detail"].str.contains("in \\d+ orders").any()
 
     def test_a_band_narrower_than_the_quantum_is_bounded_by_the_contract(self, es):
-        """The other side of the same rule."""
-        result = run_backtest(synthetic(days=10, **{"hedge.band": 1.0}))
+        """The other side of the same rule, under the fixed model."""
+        result = run_backtest(uncapped(synthetic(
+            days=10, **{"hedge.band": 1.0, "hedge.band_model": "fixed"}
+        )))
         assert result.metrics.max_abs_delta_error <= es.hedge_quantum / 2 + 1e-6
 
     def test_neither_regime_is_hedged_more_tightly_than_the_other(self):
-        """One fixed band, applied symmetrically. If the long side were held
-        tighter than the short side the regime comparison would be measuring
-        the hedger rather than the signal."""
-        result = run_backtest(synthetic(days=20))
+        """Under the fixed model, one band applied symmetrically: if the
+        long side were held tighter than the short side the regime
+        comparison would be measuring the hedger rather than the signal.
+        (Under Whalley-Wilmott the band is even in gamma -- pinned in
+        ``test_hedger`` -- but the two branches carry different gamma, so
+        their bands differ in delta units by construction.)"""
+        result = run_backtest(uncapped(synthetic(days=20, **{
+            "hedge.band_model": "fixed", "hedge.band": 10.0,
+            # At the old allocation: at the margin limit a 5-minute bar
+            # moves a bigger book further outside a +/-10 band on the
+            # heavier branch, which is size, not asymmetry in the hedger.
+            "sizing.buying_power_pct": 0.15,
+        })))
         held = result.bars[result.bars["straddle_contracts"] != 0]
         errors = held.groupby(held["direction"])["delta_error"].apply(
             lambda column: column.abs().mean()
         )
         assert len(errors) == 2
         assert errors.max() - errors.min() < 1.0
+
+    def test_the_band_widens_with_the_gamma_of_the_book(self):
+        """The Whalley-Wilmott property, end to end: a book with more gamma
+        is held to a wider band in delta units, so a bigger allocation --
+        more straddles, more gamma -- gets a wider median band."""
+        small = run_backtest(synthetic(days=10, **{"sizing.buying_power_pct": 0.10}))
+        large = run_backtest(synthetic(days=10, **{"sizing.buying_power_pct": 0.80}))
+        assert large.metrics.band_half_width > small.metrics.band_half_width
+
+    def test_a_higher_risk_aversion_hedges_more_often(self):
+        timid = run_backtest(synthetic(days=10, **{"hedge.risk_aversion": 1.0}))
+        bold = run_backtest(synthetic(days=10, **{"hedge.risk_aversion": 0.001}))
+        assert timid.metrics.band_half_width < bold.metrics.band_half_width
+        assert timid.metrics.hedges > bold.metrics.hedges
 
     def test_unhedged_delta_is_far_larger(self):
         """Without the hedge the book runs the full straddle delta."""
@@ -351,17 +462,19 @@ class TestHedgeBehaviour:
         held = result.bars[result.bars["straddle_contracts"] != 0]
         assert held["net_delta_units"].abs().max() > 100
 
-    def test_a_wider_band_trades_less(self):
-        tight = run_backtest(synthetic(days=10, **{"hedge.band": 5.0}))
-        loose = run_backtest(synthetic(days=10, **{"hedge.band": 40.0}))
+    def test_a_wider_fixed_band_trades_less(self):
+        fixed = {"hedge.band_model": "fixed"}
+        tight = run_backtest(synthetic(days=10, **fixed, **{"hedge.band": 5.0}))
+        loose = run_backtest(synthetic(days=10, **fixed, **{"hedge.band": 40.0}))
         assert loose.metrics.hedges < tight.metrics.hedges
 
-    def test_a_band_below_half_the_quantum_is_inert(self, es):
+    def test_a_fixed_band_below_half_the_quantum_is_inert(self, es):
         """Documented behaviour: MES granularity makes +/-1, +/-3 and +/-5
-        identical, which is why the shipped default is 10."""
-        narrow = run_backtest(synthetic(days=10, **{"hedge.band": 1.0}))
-        middle = run_backtest(synthetic(days=10, **{"hedge.band": 3.0}))
-        at_quantum = run_backtest(synthetic(days=10, **{"hedge.band": 5.0}))
+        identical, which is why the fixed control is 10."""
+        fixed = {"hedge.band_model": "fixed"}
+        narrow = run_backtest(synthetic(days=10, **fixed, **{"hedge.band": 1.0}))
+        middle = run_backtest(synthetic(days=10, **fixed, **{"hedge.band": 3.0}))
+        at_quantum = run_backtest(synthetic(days=10, **fixed, **{"hedge.band": 5.0}))
         assert narrow.metrics.hedges == middle.metrics.hedges == at_quantum.metrics.hedges
 
     def test_the_hedge_is_flattened_with_the_straddle(self):

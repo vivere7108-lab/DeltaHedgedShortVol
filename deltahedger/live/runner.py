@@ -18,13 +18,15 @@ Differences from the backtest that are worth being explicit about:
     ``IbkrOpenInterestProvider``, rather than generated.  A forward test
     with a generated OI surface would be measuring the generator, so the
     live path refuses to fall back to one;
-  * **the loop does not stop at the bell.**  The tenor is multi-session, so
-    the book is carried overnight and the runner keeps polling while
-    anything is open, under the widened overnight band.  This is the one
-    thing the backtest cannot check: its bar sources are RTH-only, so in a
-    backtest an overnight move arrives whole on the next session's first
-    bar, and no hedge happens inside it.  The forward walk is where that
-    part of the system is actually exercised.
+  * **the loop does not stop at the bell.**  The 0DTE position is rolled
+    into tomorrow's series a quarter of an hour before settlement and that
+    position is carried overnight, so the runner keeps polling while
+    anything is open, under the widened overnight band -- and honours a
+    pre-market event blackout on the way.  This is the one thing the
+    backtest cannot check: its bar sources are RTH-only, so in a backtest
+    an overnight move arrives whole on the next session's first bar, and
+    no hedge happens inside it.  The forward walk is where that part of
+    the system is actually exercised.
 """
 
 from __future__ import annotations
@@ -198,12 +200,13 @@ class LiveRunner:
     def _holding(self) -> bool:
         """Whether there is anything to hedge right now.
 
-        The tenor is multi-session, so the book is open through the night
-        and the runner has to keep polling to hedge it -- the widened
-        overnight band is a *wider* band, not an absent hedger, and a gap
-        through it is exactly what an unhedged straddle cannot survive.
-        When the book is flat there is nothing outside the session worth
-        waking up for: entries are blocked by the entry window regardless.
+        The rolled position is open through the night and the runner has
+        to keep polling to hedge it -- the widened overnight band is a
+        *wider* band, not an absent hedger, and a gap through it is exactly
+        what an unhedged straddle cannot survive.  When the book is flat
+        there is nothing outside the session worth waking up for: entries
+        are blocked by the entry window regardless, and the end-of-day
+        roll happens inside the session.
         """
         book = self.strategy.portfolio if self.strategy else None
         if book is None:
@@ -255,18 +258,18 @@ class LiveRunner:
             f"{state.gex_total / 1e6:+,.0f}M" if state.gex_total is not None else "n/a"
         )
         flip = f"{state.gex_flip:,.1f}" if state.gex_flip is not None else "-"
-        band = self.cfg.hedge.effective_band(state.in_session)
         log.info(
-            "%s%s F=%.2f IV=%.3f | GEX %s (%s->%s, flip %s) | straddle=%+d @ %s "
+            "%s%s%s F=%.2f IV=%.3f | GEX %s (%s->%s, flip %s) | straddle=%+d @ %s "
             "%s | hedge=%+d | net delta %+.1f (target %.1f +/- %.1f) | equity %s",
             now.strftime("%H:%M:%S"), "" if state.in_session else " [overnight]",
+            " [event blackout]" if state.event_blackout else "",
             state.future, state.atm_iv,
             gex, state.gex_regime, state.confirmed_regime, flip,
             state.straddle_contracts,
             f"{state.strike:g}" if state.strike else "-",
             f"{state.days_to_expiry}DTE" if state.days_to_expiry is not None else "-",
             state.hedge_contracts, state.net_delta_units, self.cfg.hedge.target,
-            band, f"${state.equity:,.0f}",
+            state.band_half_width, f"${state.equity:,.0f}",
         )
 
     def _atm_iv(self, conn, chain_provider, future_price: float, now: datetime) -> float:
