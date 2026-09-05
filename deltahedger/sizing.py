@@ -1,10 +1,11 @@
 """Capital requirements and buying-power based position sizing.
 
 The number of straddles is driven by buying power, not by the delta target:
-``buying_power_pct`` (15% by default) of portfolio equity is the budget,
-part of it is reserved for the hedge leg, and the remainder divided by the
-per-straddle requirement gives the count.  The delta band then absorbs
-whatever delta that position happens to carry.
+``buying_power_pct`` (80% by default -- the margin limit less a 20% buffer)
+of portfolio equity is the budget, part of it is reserved for the hedge
+leg, and the remainder divided by the per-straddle requirement gives the
+count.  The delta band then absorbs whatever delta that position happens
+to carry.
 
 The requirement means different things in the two regimes, and conflating
 them would misstate the risk in both directions:
@@ -28,11 +29,12 @@ exactly rather than approximated, so the model captures the thing that
 matters most for a short option -- margin exploding as the strike comes
 into range of the scan.
 
-What the tenor did to the requirement
--------------------------------------
-Moving from 0DTE to 3-4 DTE changes the two branches in opposite
-directions, and the reason is worth stating because it is not what most
-people expect.
+What the tenor does to the requirement
+--------------------------------------
+The traded series is today's, rolled into tomorrow's at the end of the
+day, so the book is sized at 0DTE in the morning and at 1DTE at the roll.
+The two branches respond to tenor in opposite directions, and the reason
+is worth stating because it is not what most people expect.
 
 The **scan range does not lengthen with the option**.  SPAN scans a
 one-day move -- about 49 ES points at a 2455 outright margin -- whatever
@@ -51,18 +53,22 @@ across the range (measured at 5000, 15 vol, a 250k account)::
     (* capped by max_straddles rather than by the budget)
 
 The **long branch is a different story**, because its requirement is the
-debit and the debit nearly quadruples.  So the same ``buying_power_pct``
-now buys a short book of roughly the same size and a long book two to
-three times smaller, and the two branches no longer carry comparable
-gamma.  That is a real asymmetry, it is a property of the requirement
-rather than of the signal, and the backtest's "Band feasibility" section
-reports median gamma per branch so a regime comparison cannot mistake it
-for one.
+debit and the debit roughly doubles between the morning's 0DTE entry and
+the afternoon's 1DTE roll.  So the same ``buying_power_pct`` buys a short
+book of roughly the same size at either moment and a long book about half
+as big at the roll, and the two branches do not carry comparable gamma.
+That is a real asymmetry, it is a property of the requirement rather than
+of the signal, and the backtest's band section reports median gamma and
+band per branch so a regime comparison cannot mistake it for one.
 
-One thing genuinely improves.  A one-day scan was a conservative charge
-against a position that would be flat by the bell; against a position
-carried overnight for several sessions it is the right horizon.  The
-margin now covers the risk it was designed to cover.
+A one-day scan is a conservative charge against a 0DTE position that will
+be flat by the bell, and exactly the horizon a rolled 1DTE position is
+carried over.
+
+At the default 80% allocation the long branch spends more than half of
+equity on a same-day straddle's debit.  That is the maximum loss on the
+option leg, and it can be reached in a single session; the daily loss
+limit in ``StrategyConfig`` is the rule that stops it getting there.
 
 ``RegTMarginModel`` is the 15%-of-notional equity-option rule.  It is
 included because it is what most people reach for, and it overstates ES
@@ -153,7 +159,7 @@ class SpanScanMarginModel:
 
     The scan is a *one-day* move and does not stretch with the option's
     tenor, which is SPAN's design and not an approximation here.  See the
-    module docstring for what that does to the two branches at 2-5 DTE.
+    module docstring for what that does to the two branches.
     """
 
     scan_multiplier: float = 1.0

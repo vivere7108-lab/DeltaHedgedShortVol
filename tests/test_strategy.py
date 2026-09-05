@@ -37,12 +37,18 @@ from deltahedger.gex import (
     StrikeOpenInterest,
 )
 from deltahedger.pricing import black76
-from deltahedger.strategy import GexStraddleStrategy
+from deltahedger.strategy import (
+    BLOCK_EVENT_BLACKOUT,
+    BLOCK_WEEKEND_GAP,
+    GexStraddleStrategy,
+)
 
 NY = ZoneInfo("America/New_York")
-#: Inside the default entry window (10:00-11:30) so a test that leaves the
-#: entry-window gate on does not also have to move this.
+#: Inside the default entry window (09:35-14:30) so a test that leaves the
+#: entry-window gate on does not also have to move this. A Tuesday.
 OPEN = datetime(2025, 6, 10, 10, 0, tzinfo=NY)
+#: Minutes from OPEN to the 15:45 roll window (15 minutes before the bell).
+ROLL = 345
 
 
 class FixedRegime:
@@ -79,6 +85,11 @@ def make_cfg(**overrides) -> Config:
     cfg.gates.ensemble = False
     cfg.gates.persistence = False
     cfg.gates.entry_window = False
+    # A book sized to the margin limit on a half-million account needs more
+    # than the per-order cap in one 5-minute bar after a 5-point move; the
+    # cap is a live rate limit (tested on its own in test_backtest), not
+    # part of what these tests exercise.
+    cfg.hedge.max_hedge_contracts = 100_000
     for dotted, value in overrides.items():
         section, _, attr = dotted.partition(".")
         setattr(getattr(cfg, section), attr, value)
@@ -108,16 +119,24 @@ def session_bar(
 
 
 #: A tenor pinned to exactly 5 DTE, closing at 1 DTE. Time-decay tests use
-#: this rather than the shipped 2-5 DTE range so the number of sessions a
-#: position lives is deterministic and the test can drive exactly that many
-#: bars instead of guessing how many the range's preference logic would
-#: pick.
+#: this rather than the shipped same-day tenor so a position lives a
+#: deterministic number of sessions and the test can drive exactly that
+#: many bars. Such a series always spans a weekend from a Tuesday, so the
+#: weekend rule has to be switched off for it to be entered at all.
 FIVE_DTE = {
     "strategy.min_days_to_expiry": 5,
     "strategy.max_days_to_expiry": 5,
     "strategy.prefer_min_days_to_expiry": 5,
     "strategy.prefer_max_days_to_expiry": 5,
     "strategy.close_at_days_to_expiry": 1,
+    "strategy.hold_over_weekends": True,
+}
+FIFTEEN_DTE = {
+    "strategy.min_days_to_expiry": 15, "strategy.max_days_to_expiry": 15,
+    "strategy.prefer_min_days_to_expiry": 15,
+    "strategy.prefer_max_days_to_expiry": 15,
+    "strategy.close_at_days_to_expiry": 1,
+    "strategy.hold_over_weekends": True,
 }
 
 
@@ -185,15 +204,26 @@ class TestTenorSelection:
         cfg = strategy.cfg.strategy
         assert cfg.min_days_to_expiry <= dte <= cfg.max_days_to_expiry
 
-    def test_the_default_window_is_two_to_five_dte(self):
+    def test_the_default_window_is_today_or_tomorrow(self):
         cfg = Config()
-        assert (cfg.strategy.min_days_to_expiry, cfg.strategy.max_days_to_expiry) == (2, 5)
+        assert (cfg.strategy.min_days_to_expiry, cfg.strategy.max_days_to_expiry) == (0, 1)
 
-    def test_it_prefers_the_expiry_closest_to_the_preferred_window(self):
-        """From a Tuesday, 4 trading days out (Monday) is the nearest listed
-        expiry inside ``(3, 4)`` -- Friday (3 days) is also inside the
-        window, but 4 wins the tie-break toward the longer tenor."""
+    def test_it_trades_todays_series_during_the_day(self):
+        """Both today's and tomorrow's are inside ``[0, 1]``; the preference
+        for 0 picks today's for as long as it is outside the buffer."""
         strategy = drive(make_cfg(), [bar(0)])
+        assert strategy.portfolio.straddle.expiry == OPEN.date()
+
+    def test_a_multi_session_tenor_is_still_reachable(self):
+        """The old 2-5 DTE policy, with the weekend rule off: from a
+        Tuesday, 4 trading days out (Monday) is the nearest listed expiry
+        inside ``(3, 4)``."""
+        cfg = make_cfg(**{
+            "strategy.min_days_to_expiry": 2, "strategy.max_days_to_expiry": 5,
+            "strategy.prefer_min_days_to_expiry": 3, "strategy.prefer_max_days_to_expiry": 4,
+            "strategy.close_at_days_to_expiry": 1, "strategy.hold_over_weekends": True,
+        })
+        strategy = drive(cfg, [bar(0)])
         dte = strategy.clock.days_to_expiry(OPEN, strategy.portfolio.straddle.expiry)
         assert dte == 4
 
@@ -208,7 +238,7 @@ class TestTenorSelection:
         strategy._traded_expiry = lambda moment: None
         strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
         assert strategy.portfolio.straddle is None
-        assert "no expiry listed" in " ".join(details(strategy, "entry_skipped"))
+        assert "no expiry eligible" in " ".join(details(strategy, "entry_skipped"))
 
     def test_an_open_position_keeps_its_own_expiry_rather_than_reselecting(self):
         """``_traded_expiry`` must answer ``on the book`` while a position is
@@ -291,14 +321,13 @@ def _entry_quote(strategy):
     )
 
 
-#: A same-day expiry, with the DTE floor disabled (close_days < min_days=0
-#: means it can never trigger). Used only to test the seconds-based
-#: backstop exit in isolation from the DTE floor that leads the ladder at
-#: the shipped tenor -- see ``close_before_expiry_minutes`` in config.py.
+#: Today's series only, with the roll off: a position that opens and closes
+#: the same day, for exit tests that must not see a roll.
 ZERO_DTE = {
     "strategy.min_days_to_expiry": 0, "strategy.max_days_to_expiry": 0,
     "strategy.prefer_min_days_to_expiry": 0, "strategy.prefer_max_days_to_expiry": 0,
-    "strategy.close_at_days_to_expiry": -1,
+    "strategy.close_at_days_to_expiry": None,
+    "strategy.roll_at_expiry": False,
 }
 
 
@@ -365,13 +394,7 @@ class TestExits:
         reach the threshold; it is testing the stop's arithmetic, not the
         shipped tenor.
         """
-        tenor = {
-            "strategy.min_days_to_expiry": 15, "strategy.max_days_to_expiry": 15,
-            "strategy.prefer_min_days_to_expiry": 15,
-            "strategy.prefer_max_days_to_expiry": 15,
-            "strategy.close_at_days_to_expiry": 1,
-        }
-        cfg = make_cfg(**{**tenor, "strategy.long_stop_loss_pct": 0.5})
+        cfg = make_cfg(**{**FIFTEEN_DTE, "strategy.long_stop_loss_pct": 0.5})
         cfg.strategy.exit_on_regime_flip = False
         cfg.strategy.daily_loss_limit_pct = None
         cfg.strategy.reenter_after_exit = False
@@ -388,13 +411,7 @@ class TestExits:
         premium-decay stop gets wrong. It would close a winning gamma trade
         for having done the thing a long straddle is supposed to do.
         """
-        tenor = {
-            "strategy.min_days_to_expiry": 15, "strategy.max_days_to_expiry": 15,
-            "strategy.prefer_min_days_to_expiry": 15,
-            "strategy.prefer_max_days_to_expiry": 15,
-            "strategy.close_at_days_to_expiry": 1,
-        }
-        cfg = make_cfg(**{**tenor, "strategy.long_stop_loss_pct": 0.25})
+        cfg = make_cfg(**{**FIFTEEN_DTE, "strategy.long_stop_loss_pct": 0.25})
         cfg.strategy.exit_on_regime_flip = False
         cfg.strategy.daily_loss_limit_pct = None
         cfg.strategy.long_take_profit_pct = None
@@ -459,7 +476,9 @@ class TestExits:
         bars = [bar(0), bar(5, 4900.0), bar(10, 4800.0), bar(15, 4700.0)]
         strategy = drive(cfg, bars, regime=POSITIVE)
         residual = abs(strategy.portfolio.hedge_delta_units())
-        assert residual <= cfg.hedge.band
+        # With no straddle behind it the Whalley-Wilmott band is zero, so
+        # only the contract size can leave anything behind.
+        assert residual <= cfg.source.hedge_quantum / 2
 
 
 class TestRegimeFlip:
@@ -530,15 +549,40 @@ class TestRegimeFlip:
         assert kinds(strategy).count("entry") == 2
 
 
+def inside_band(states, es):
+    """Every bar's net delta within the band it was held to (or half a
+    contract, whichever is wider) -- the bound the hedger promises."""
+    return all(
+        abs(s.net_delta_units) <= max(s.band_half_width, es.hedge_quantum / 2) + 1e-9
+        for s in states
+    )
+
+
 class TestHedging:
-    def test_a_short_straddle_is_held_delta_neutral(self):
+    def test_a_short_straddle_is_held_delta_neutral(self, es):
         strategy = drive(make_cfg(), [bar(0), bar(5, 4995.0), bar(10, 4990.0)],
                          regime=POSITIVE)
-        assert all(abs(s.net_delta_units) <= 10.0 for s in strategy.bar_states[1:])
+        assert inside_band(strategy.bar_states[1:], es)
 
-    def test_a_long_straddle_is_held_delta_neutral(self):
+    def test_a_long_straddle_is_held_delta_neutral(self, es):
         strategy = drive(make_cfg(), [bar(0), bar(5, 4995.0), bar(10, 4990.0)],
                          regime=NEGATIVE)
+        assert inside_band(strategy.bar_states[1:], es)
+
+    def test_the_band_is_a_property_of_the_book(self):
+        """Under Whalley-Wilmott the band scales with gamma, so a bigger
+        allocation -- more straddles -- is held to a wider band in delta
+        units, and a flat book to none at all."""
+        small = drive(make_cfg(**{"sizing.buying_power_pct": 0.10}), [bar(0), bar(5)])
+        large = drive(make_cfg(**{"sizing.buying_power_pct": 0.80}), [bar(0), bar(5)])
+        assert large.bar_states[-1].band_half_width > small.bar_states[-1].band_half_width > 0
+        flat = drive(make_cfg(), [bar(0)], regime=NEUTRAL)
+        assert flat.bar_states[-1].band_half_width == 0.0
+
+    def test_the_fixed_band_is_still_selectable(self):
+        cfg = make_cfg(**{"hedge.band_model": "fixed", "hedge.band": 10.0})
+        strategy = drive(cfg, [bar(0), bar(5, 4995.0)])
+        assert all(s.band_half_width == 10.0 for s in strategy.bar_states)
         assert all(abs(s.net_delta_units) <= 10.0 for s in strategy.bar_states[1:])
 
     def test_the_hedge_leans_the_opposite_way_in_the_two_regimes(self):
@@ -800,9 +844,9 @@ class TestGates:
 
     # -- exits are never gated --------------------------------------
 
-    def test_the_dte_floor_exit_is_never_gated(self):
-        """A gate can delay a side change; it can never keep a position past
-        its close-out floor."""
+    def test_the_pre_settlement_exit_is_never_gated(self):
+        """A gate can delay a side change; it can never keep a position
+        into the last minutes before settlement."""
         cfg = make_cfg(**{**ZERO_DTE, "strategy.reenter_after_exit": False})
         cfg.gates.confidence = True
         cfg.gates.flip_distance = True
@@ -811,3 +855,217 @@ class TestGates:
         strategy = drive(cfg, [bar(0)] + [bar(m) for m in range(5, 390, 5)])
         assert "exit" in kinds(strategy)
         assert strategy.portfolio.straddle is None
+
+
+class TestEndOfDay:
+    """The 15:45 rules: out of today's series, into tomorrow's, never into a
+    weekend, never inside an event blackout. All hard rules -- none of the
+    gates can delay them -- and all written so the backtest and the live
+    runner inherit them identically."""
+
+    def test_todays_position_is_closed_fifteen_minutes_before_the_bell(self):
+        cfg = make_cfg(**{"strategy.roll_at_expiry": False})
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(m) for m in range(0, 360, 5)])
+        exits = [e for e in strategy.events if e.kind == "exit"]
+        assert len(exits) == 1
+        assert exits[0].timestamp.time() == time(15, 45)
+        assert "15m to expiry" in exits[0].detail
+
+    def test_the_exit_rolls_into_tomorrows_series(self):
+        """On the same bar today's position is closed, tomorrow's is
+        opened -- outside the entry window, through the GEX gates."""
+        cfg = make_cfg()
+        cfg.gates.entry_window = True  # 09:35-14:30; 15:45 is outside it
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL - 5), bar(ROLL), bar(ROLL + 5)])
+        entries = [e for e in strategy.events if e.kind == "entry"]
+        assert len(entries) == 2
+        assert entries[1].timestamp.time() == time(15, 45)
+        assert "1DTE" in entries[1].detail
+        position = strategy.portfolio.straddle
+        assert position is not None
+        assert position.expiry == datetime(2025, 6, 11).date()
+        assert strategy.clock.days_to_expiry(bar(ROLL).timestamp, position.expiry) == 1
+
+    def test_the_rolled_position_is_hedged_from_the_first_bar(self, es):
+        cfg = make_cfg()
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5, 4990.0), bar(ROLL + 10, 4980.0)])
+        assert strategy.portfolio.straddle is not None
+        assert inside_band(strategy.bar_states[-2:], es)
+
+    def test_the_roll_can_be_switched_off(self):
+        """With the roll off nothing is opened inside the buffer, whether or
+        not the entry window would have allowed it (it is off here)."""
+        cfg = make_cfg(**{"strategy.roll_at_expiry": False})
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5)])
+        assert strategy.portfolio.straddle is None
+        assert kinds(strategy).count("entry") == 1
+        assert "roll_at_expiry is off" in " ".join(details(strategy, "entry_skipped"))
+
+    def test_a_flat_friday_afternoon_still_reads_gex(self):
+        """Nothing is eligible to trade between Friday's buffer and the
+        bell, but the read is still made -- for the journal, and so the
+        persistence streak is live rather than reset when Monday opens."""
+        cfg = make_cfg()
+        friday = 3
+        strategy = drive(cfg, [session_bar(friday, ROLL + 5)], regime=NEUTRAL)
+        state = strategy.bar_states[-1]
+        assert state.gex_total is not None and state.days_to_expiry is None
+
+    def test_the_roll_window_does_not_reopen_todays_series(self):
+        """Inside the buffer today's series is still listed, but entering it
+        would open a position already due to close. It is never chosen."""
+        cfg = make_cfg()
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(ROLL), bar(ROLL + 5)])
+        position = strategy.portfolio.straddle
+        assert position is not None and position.expiry > OPEN.date()
+
+    def test_friday_does_not_roll_into_monday(self):
+        """No positions over the weekend: the Friday roll is refused, by
+        name, and the book is flat at the bell."""
+        cfg = make_cfg()
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        friday = 3  # sessions after Tuesday's OPEN
+        bars = [session_bar(friday, 0), session_bar(friday, ROLL), session_bar(friday, ROLL + 5)]
+        strategy = drive(cfg, bars)
+        assert strategy.portfolio.straddle is None
+        assert strategy.portfolio.hedge.quantity == 0
+        blocked = [e for e in strategy.events if e.gate == BLOCK_WEEKEND_GAP]
+        assert blocked and "2025-06-16" in blocked[0].detail
+
+    def test_the_eve_of_a_holiday_does_not_roll_either(self):
+        """Thursday 2025-07-03: the next session is Monday the 7th."""
+        cfg = make_cfg()
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        eve = datetime(2025, 7, 3, 10, 0, tzinfo=NY)
+        bars = [
+            MarketBar(eve + timedelta(minutes=m), 5000.0, 5000.0, 5000.0, 5000.0, 0.15)
+            for m in (0, ROLL, ROLL + 5)
+        ]
+        strategy = drive(cfg, bars)
+        assert strategy.portfolio.straddle is None
+        assert any(e.gate == BLOCK_WEEKEND_GAP for e in strategy.events)
+
+    def test_the_weekend_can_be_held_if_asked(self):
+        cfg = make_cfg(**{"strategy.hold_over_weekends": True})
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        friday = 3
+        strategy = drive(cfg, [session_bar(friday, 0), session_bar(friday, ROLL)])
+        position = strategy.portfolio.straddle
+        assert position is not None and position.expiry == datetime(2025, 6, 16).date()
+
+    def test_a_position_across_a_gap_is_closed_before_it(self):
+        """The safety net for a position that is already on the far side of
+        a gap when the weekend rule applies -- a wider tenor, or a config
+        change with a position open. It comes off at the buffer on the last
+        session before the gap."""
+        import dataclasses
+
+        cfg = make_cfg(**{"strategy.hold_over_weekends": True})
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        cfg.strategy.exit_on_regime_flip = False
+        friday = 3
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(session_bar(friday, 0), execution)
+        strategy.on_bar(session_bar(friday, ROLL), execution)  # rolled into Monday
+        assert strategy.portfolio.straddle.expiry == datetime(2025, 6, 16).date()
+
+        strategy.tenor = dataclasses.replace(strategy.tenor, hold_over_weekends=False)
+        strategy.on_bar(session_bar(friday, ROLL + 5), execution)
+        assert strategy.portfolio.straddle is None
+        exits = [e for e in strategy.events if e.kind == "exit"]
+        assert "weekend or holiday" in exits[-1].detail
+
+    def test_a_wider_tenor_never_enters_across_a_gap(self):
+        """From a Tuesday a 5DTE series is the following Tuesday; with the
+        weekend rule on it is refused outright rather than entered and
+        closed on Friday."""
+        cfg = make_cfg(**{**FIVE_DTE, "strategy.hold_over_weekends": False})
+        strategy = drive(cfg, [bar(0)])
+        assert strategy.portfolio.straddle is None
+        assert any(e.gate == BLOCK_WEEKEND_GAP for e in strategy.events)
+
+
+class TestEventBlackout:
+    """Scheduled high-volatility events: out 15 minutes before, flat until
+    15 minutes after, back in afterwards if the read still asks for it."""
+
+    def make(self, **overrides):
+        cfg = make_cfg(**overrides)
+        cfg.strategy.events = ["2025-06-10 11:00 test event"]
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.short_stop_loss_premium_multiple = None
+        cfg.strategy.daily_loss_limit_pct = None
+        return cfg
+
+    def test_the_position_is_closed_at_the_start_of_the_blackout(self):
+        strategy = drive(self.make(), [bar(m) for m in range(0, 50, 5)])
+        exits = [e for e in strategy.events if e.kind == "exit"]
+        assert len(exits) == 1
+        assert exits[0].timestamp.time() == time(10, 45)
+        assert "blackout" in exits[0].detail and "test event" in exits[0].detail
+        assert strategy.portfolio.hedge.quantity == 0
+
+    def test_nothing_is_opened_inside_the_blackout(self):
+        strategy = drive(self.make(), [bar(m) for m in range(0, 80, 5)])
+        blocked = [e for e in strategy.events if e.gate == BLOCK_EVENT_BLACKOUT]
+        assert [e.timestamp.time() for e in blocked] == [
+            time(10, 45), time(10, 50), time(10, 55), time(11, 0),
+            time(11, 5), time(11, 10), time(11, 15),
+        ]
+        inside = [s for s in strategy.bar_states if s.event_blackout]
+        assert len(inside) == 7 and all(s.straddle_contracts == 0 for s in inside)
+
+    def test_the_position_is_put_back_on_after_the_blackout(self):
+        strategy = drive(self.make(), [bar(m) for m in range(0, 90, 5)])
+        entries = [e for e in strategy.events if e.kind == "entry"]
+        assert len(entries) == 2
+        assert entries[1].timestamp.time() == time(11, 20)
+        assert strategy.portfolio.straddle is not None
+
+    def test_the_blackout_exit_is_never_gated(self):
+        cfg = self.make()
+        cfg.gates.ensemble = True
+        cfg.gates.persistence = True
+        cfg.gates.persistence_bars = 2
+        strategy = drive(cfg, [bar(m) for m in range(0, 50, 5)])
+        assert strategy.portfolio.straddle is None
+        assert any("blackout" in e.detail for e in strategy.events if e.kind == "exit")
+
+    def test_the_window_is_configurable(self):
+        cfg = self.make(**{
+            "strategy.event_blackout_minutes_before": 30,
+            "strategy.event_blackout_minutes_after": 5,
+        })
+        strategy = drive(cfg, [bar(m) for m in range(0, 80, 5)])
+        exits = [e for e in strategy.events if e.kind == "exit"]
+        assert exits[0].timestamp.time() == time(10, 30)
+        entries = [e for e in strategy.events if e.kind == "entry"]
+        assert entries[1].timestamp.time() == time(11, 10)
+
+    def test_an_event_on_another_day_changes_nothing(self):
+        cfg = self.make()
+        cfg.strategy.events = ["2025-06-11 11:00 tomorrow's event"]
+        strategy = drive(cfg, [bar(m) for m in range(0, 90, 5)])
+        assert kinds(strategy).count("exit") == 0
+        assert not any(e.gate == BLOCK_EVENT_BLACKOUT for e in strategy.events)
+
+    def test_the_bar_state_names_the_event(self):
+        strategy = drive(self.make(), [bar(45)])
+        assert "test event" in strategy.bar_states[-1].event_blackout

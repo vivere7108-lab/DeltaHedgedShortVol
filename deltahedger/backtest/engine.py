@@ -90,7 +90,9 @@ def run_backtest(
         regime_pnl=strategy.regime_pnl,
         regime_trades=strategy.regime_trades,
         target=cfg.hedge.target,
-        band_width=2.0 * cfg.hedge.band,
+        band_model=cfg.hedge.band_model,
+        risk_aversion=cfg.hedge.risk_aversion,
+        fixed_band=cfg.hedge.band,
         hedge_tick=risk_source.hedge.tick_size,
         hedge_quantum=risk_source.hedge_quantum,
     )

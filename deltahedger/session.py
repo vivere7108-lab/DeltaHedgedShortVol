@@ -171,32 +171,64 @@ class SessionClock:
         """DTE of ``expiry_day`` as of ``moment``, in trading days."""
         return trading_days_between(self.localize(moment).date(), expiry_day)
 
+    def gap_before(self, moment: datetime, expiry_day: date) -> bool:
+        """Whether a weekend or holiday sits between ``moment`` and ``expiry_day``.
+
+        True when any calendar day after today's and up to the expiry is not
+        a session -- equivalently, when the calendar-day count and the
+        trading-day count disagree.  A Friday reads Monday's expiry as
+        across a gap; a Thursday reads Friday's as not, unless Friday is a
+        holiday.  Today itself is never counted, so a moment on a Saturday
+        still reads Monday as across a gap (the weekend is not over yet).
+        """
+        today = self.localize(moment).date()
+        if expiry_day <= today:
+            return False
+        return (expiry_day - today).days != trading_days_between(today, expiry_day)
+
+    def gap_after(self, moment: datetime) -> bool:
+        """Whether the calendar day after ``moment``'s is not a session --
+        i.e. today is the last session before a weekend or a holiday."""
+        return not is_trading_day(self.localize(moment).date() + timedelta(days=1))
+
     def select_expiry(
         self,
         moment: datetime,
         min_days: int,
         max_days: int,
         prefer_days: tuple[int, int] | None = None,
+        min_seconds_to_expiry: float = 0.0,
+        hold_over_gaps: bool = True,
     ) -> date | None:
-        """The listed expiry to trade, or ``None`` if none is in range.
+        """The listed expiry to trade, or ``None`` if none is eligible.
 
         Among the expiries whose DTE falls inside ``[min_days, max_days]``,
-        the one closest to the ``prefer_days`` window is chosen.  The
-        preference exists because the two ends of the range are not
-        equivalent: entering at the short end leaves almost no room before
-        the position has to be closed at the DTE floor, and entering at the
-        long end carries more vega for longer.  ``prefer_days`` names the
-        middle of the range where neither dominates.
+        the one closest to the ``prefer_days`` window is chosen.  Ties break
+        toward the *longer* tenor.
 
-        Ties break toward the *longer* tenor, which is the side that keeps
-        the position away from the expiry-week gamma spike -- the reason
-        the range has a floor at all.
+        Two further filters decide what is eligible at all:
+
+        * a series settling within ``min_seconds_to_expiry`` is skipped.
+          This is what rolls a 0DTE policy into tomorrow's series in the
+          last minutes of today's: today's is still listed, but it is
+          inside the buffer, so the next one is the nearest eligible;
+        * with ``hold_over_gaps`` off, a series on the far side of a
+          weekend or holiday (``gap_before``) is skipped, so a Friday
+          afternoon has nothing to roll into and stays flat.
+
+        No fallback reaches outside the range: if nothing is eligible the
+        answer is "do not trade".
         """
-        listed = [
-            (self.days_to_expiry(moment, expiry), expiry)
-            for expiry in self.candidate_expiries(moment, max_days)
-        ]
-        in_range = [(dte, expiry) for dte, expiry in listed if dte >= min_days]
+        in_range = []
+        for expiry in self.candidate_expiries(moment, max_days):
+            dte = self.days_to_expiry(moment, expiry)
+            if dte < min_days:
+                continue
+            if self.seconds_to_expiry(moment, expiry) <= min_seconds_to_expiry:
+                continue
+            if not hold_over_gaps and self.gap_before(moment, expiry):
+                continue
+            in_range.append((dte, expiry))
         if not in_range:
             return None
         if prefer_days is None:

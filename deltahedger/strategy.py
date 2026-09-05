@@ -27,18 +27,31 @@ Exits run before entry so a regime flip and the re-entry on the other side
 can happen on the same bar, and hedging runs last so it sees the delta the
 other two steps left behind.
 
-The tenor
----------
-The traded series is a listed expiry two to five sessions out, chosen by
-``StrategyConfig.tenor()`` and closed once it decays to the DTE floor.  That
-has three consequences visible in this file:
+The tenor, and the end of the day
+---------------------------------
+The traded series is today's expiry, chosen by ``StrategyConfig.tenor()``.
+The end of the day is where the rules concentrate, and they are all hard
+exits -- nothing in the gate machinery can delay any of them:
 
-  * the position is carried **overnight and across sessions**, so
-    ``_roll_session`` re-marks the book at the new day's first price rather
-    than assuming it starts flat, and the hedge band is session-aware;
-  * the exit ladder is led by the **DTE floor**, not by minutes-to-expiry;
-  * the GEX read is a blend over the front expiries, so a bar reads open
-    interest for several series rather than one.
+  * ``close_before_expiry_minutes`` before settlement the 0DTE position is
+    closed: the last quarter hour is where an ATM straddle's gamma diverges
+    and the hedger cannot keep up;
+  * in that same window the *next* session's series is eligible to be
+    opened (``roll_at_expiry``), outside the entry window but through every
+    GEX gate, and carried overnight to become tomorrow's 0DTE position --
+    so ``_roll_session`` re-marks the book at the new day's first price
+    rather than assuming it starts flat, and the hedge band is
+    session-aware;
+  * a series across a weekend or holiday is never entered and a position
+    on one is closed at the buffer on the last session before the gap
+    (``hold_over_weekends``): a gap with no session in it cannot be hedged;
+  * inside the blackout around a scheduled event -- an FOMC statement, a
+    CPI print -- the position is closed and nothing is opened
+    (``events``, ``event_blackout_minutes_*``), for the same reason.
+
+The GEX read is a blend over the front expiries out to the traded one, so
+during the roll window a bar reads open interest for both today's and
+tomorrow's series rather than one.
 
 The gates
 ---------
@@ -70,6 +83,7 @@ from .broker.base import ExecutionHandler, Fill
 from .chain import StraddleQuote, TenorPolicy, price_option, select_expiry, select_atm_straddle
 from .config import Config
 from .data.base import MarketBar
+from .events import EventCalendar
 from .gex import (
     GATE_ENSEMBLE,
     GATE_ENTRY_WINDOW,
@@ -81,14 +95,22 @@ from .gex import (
     OpenInterestProvider,
     StrikeOpenInterest,
 )
-from .hedger import DeltaHedger
+from .hedger import DeltaHedger, hedge_cost_per_contract
 from .instruments import RiskSource
 from .portfolio import Portfolio, StraddlePosition
-from .session import SessionClock
+from .session import SessionClock, is_trading_day
 from .sizing import MarginModel, build_margin_model, size_straddles
 from .volsurface import VolSurface
 
 log = logging.getLogger(__name__)
+
+#: Two further reasons an entry is refused, named in the event log the way
+#: the GEX gates are so the journal and the sweep can count them by cause.
+#: They are risk rules rather than gates -- neither is switchable from
+#: ``gates:`` and neither can be swept -- but a stand-aside is a stand-aside
+#: and the attribution should say which rule it was.
+BLOCK_EVENT_BLACKOUT = "event_blackout"
+BLOCK_WEEKEND_GAP = "weekend_gap"
 
 
 @dataclass
@@ -154,6 +176,12 @@ class BarState:
     #: Whether the bar fell inside the regular session, which decides which
     #: band width applied to it.
     in_session: bool = True
+    #: The band half-width that applied to this bar, in delta units. Under
+    #: Whalley-Wilmott it is a function of the book's gamma and changes bar
+    #: to bar; this is the number the "in_band" flag was judged against.
+    band_half_width: float = 0.0
+    #: The scheduled event whose blackout this bar fell inside, if any.
+    event_blackout: str = ""
 
 
 class GexStraddleStrategy:
@@ -163,12 +191,17 @@ class GexStraddleStrategy:
         source: RiskSource | None = None,
         margin_model: MarginModel | None = None,
         open_interest: OpenInterestProvider | None = None,
+        events: EventCalendar | None = None,
     ):
         self.cfg = cfg
         self.source = source or cfg.source
         self.clock = SessionClock(self.source)
         self.surface = VolSurface(cfg.vol)
-        self.hedger = DeltaHedger(cfg.hedge, self.source)
+        self.hedger = DeltaHedger(
+            cfg.hedge, self.source,
+            cost_per_contract=hedge_cost_per_contract(cfg.costs, self.source),
+            risk_free_rate=cfg.risk_free_rate,
+        )
         self.margin_model = margin_model or build_margin_model(
             cfg.sizing, self.source, cfg.risk_free_rate
         )
@@ -176,6 +209,11 @@ class GexStraddleStrategy:
             cfg.gex, self.source, self.surface, cfg.risk_free_rate, cfg.gates
         )
         self.tenor: TenorPolicy = cfg.strategy.tenor()
+        #: The event blackout calendar. ``self.events`` is the decision log.
+        self.calendar: EventCalendar = (
+            events if events is not None
+            else EventCalendar.from_config(cfg.strategy, self.clock.tz)
+        )
         self.open_interest = open_interest
         self.portfolio = Portfolio(cfg.starting_equity, self.source)
 
@@ -291,6 +329,48 @@ class GexStraddleStrategy:
             return position.expiry
         return select_expiry(self.clock, moment, self.tenor)
 
+    def _todays_expiry(self, moment: datetime) -> date | None:
+        """Today's series, if today is a session and it has not settled."""
+        day = moment.date()
+        if not is_trading_day(day) or moment >= self.clock.expiry_datetime(day):
+            return None
+        return day
+
+    def _in_buffer(self, moment: datetime) -> bool:
+        """Whether ``moment`` is inside today's pre-settlement buffer.
+
+        This is the window in which today's series is no longer eligible
+        and, with ``roll_at_expiry`` on, tomorrow's may be opened in its
+        place regardless of the entry window.
+        """
+        today = self._todays_expiry(moment)
+        if today is None:
+            return False
+        return self.clock.seconds_to_expiry(moment, today) <= self.tenor.buffer_seconds
+
+    def _in_roll_window(self, moment: datetime) -> bool:
+        return self.cfg.strategy.roll_at_expiry and self._in_buffer(moment)
+
+    def _classification_expiries(self, moment: datetime) -> list[date]:
+        """The series the GEX read is built from.
+
+        Normally the front expiries out to the traded one.  When nothing is
+        eligible to trade -- a Friday afternoon, say, with today's series
+        inside the buffer and Monday's across the weekend -- the read is
+        still worth having, for the journal and for the persistence streak
+        that carries into the next entry, so it falls back to the listed
+        series inside the tenor's range with nothing traded against it.
+        """
+        traded = self._traded_expiry(moment)
+        if traded is not None:
+            return self._blend_expiries(moment, traded)
+        listed = self.clock.candidate_expiries(moment, self.tenor.max_days)
+        if not listed:
+            return []
+        if not self.cfg.gex.blend_front_expiries:
+            return [listed[0]]
+        return listed[: self.cfg.gex.blend_max_expiries]
+
     def _blend_expiries(self, moment: datetime, traded: date) -> list[date]:
         """0DTE out to the traded series, nearest first.
 
@@ -328,10 +408,9 @@ class GexStraddleStrategy:
         """
         if not self.cfg.gex.enabled or self.open_interest is None:
             return None
-        traded = self._traded_expiry(moment)
-        if traded is None:
+        expiries = self._classification_expiries(moment)
+        if not expiries:
             return None
-        expiries = self._blend_expiries(moment, traded)
 
         stale = (
             not self._oi
@@ -453,22 +532,43 @@ class GexStraddleStrategy:
 
         # The entry window is checked here rather than in the bar loop, so
         # the backtest and the live runner cannot disagree about which bars
-        # are eligible. Its purpose is the open-interest print: the exchange
-        # publishes final open interest for the previous session during the
-        # morning, and an entry before that lands is taken on preliminary
-        # numbers. Exits are never windowed.
+        # are eligible. The end-of-day roll is the one exemption: inside
+        # today's pre-settlement buffer the next series may be opened
+        # whatever the window says, because that is the only moment it can
+        # be. Exits are never windowed.
         local = moment.timetz().replace(tzinfo=None)
-        if self.cfg.gates.entry_window and not (
-            cfg.entry_time <= local <= cfg.entry_cutoff_time
-        ):
+        in_window = cfg.entry_time <= local <= cfg.entry_cutoff_time
+        if self.cfg.gates.entry_window and not in_window and not self._in_roll_window(moment):
+            return
+
+        # The event blackout is a risk rule, not a gate: it is checked before
+        # the read is even consulted, and it is recorded so a quiet
+        # afternoon around an FOMC statement is attributable afterwards.
+        event = self.calendar.blackout(moment)
+        if event is not None:
+            self._record(
+                moment, "entry_skipped",
+                f"inside the blackout around {event} "
+                f"(-{cfg.event_blackout_minutes_before}m/+"
+                f"{cfg.event_blackout_minutes_after}m)",
+                gate=BLOCK_EVENT_BLACKOUT,
+            )
             return
 
         expiry = self._traded_expiry(moment)
         if expiry is None:
+            self._record_no_expiry(moment)
+            return
+
+        # With the roll off, nothing is opened inside today's buffer even
+        # when the entry window would allow it: the book stays flat from
+        # the buffer to the next session's window.
+        if not cfg.roll_at_expiry and self._in_buffer(moment) and expiry != moment.date():
             self._record(
                 moment, "entry_skipped",
-                f"no expiry listed between {self.tenor.min_days} and "
-                f"{self.tenor.max_days} trading days out",
+                f"inside today's {cfg.close_before_expiry_minutes}m pre-settlement "
+                "buffer and roll_at_expiry is off; nothing is opened until the "
+                "next session",
             )
             return
 
@@ -481,10 +581,6 @@ class GexStraddleStrategy:
                 f"the {expiry} series is {days_left}DTE, at or below the "
                 f"{self.tenor.close_days}DTE close-out floor",
             )
-            return
-        if self.clock.seconds_to_expiry(moment, expiry) <= (
-            cfg.close_before_expiry_minutes * 60
-        ):
             return
 
         if profile is None:
@@ -583,6 +679,37 @@ class GexStraddleStrategy:
             regime=profile.regime,
         )
 
+    def _record_no_expiry(self, moment: datetime) -> None:
+        """Say *why* nothing is eligible, since two rules can be the cause.
+
+        The weekend rule is the one worth naming: the series exists, it is
+        inside the tenor, and it was refused because it sits on the far
+        side of a gap.  That is a decision the journal should be able to
+        count, not a listing problem.
+        """
+        if not self.tenor.hold_over_weekends:
+            across = self.clock.select_expiry(
+                moment, self.tenor.min_days, self.tenor.max_days,
+                self.tenor.prefer_days,
+                min_seconds_to_expiry=self.tenor.buffer_seconds,
+                hold_over_gaps=True,
+            )
+            if across is not None and self.clock.gap_before(moment, across):
+                self._record(
+                    moment, "entry_skipped",
+                    f"the {across} series is on the far side of a weekend or "
+                    "holiday; no positions are held over a gap",
+                    gate=BLOCK_WEEKEND_GAP,
+                )
+                return
+        self._record(
+            moment, "entry_skipped",
+            f"no expiry eligible between {self.tenor.min_days} and "
+            f"{self.tenor.max_days} trading days out (a series inside the "
+            f"{self.tenor.close_before_expiry_minutes}m pre-settlement buffer "
+            "does not count)",
+        )
+
     def _open_legs(
         self, quote: StraddleQuote, quantity: int, moment: datetime,
         execution: ExecutionHandler,
@@ -664,16 +791,25 @@ class GexStraddleStrategy:
         premium = position.premium_at_risk(self.source.option.multiplier)
         reason: str | None = None
 
-        # The DTE floor leads the ladder and is never gated. It is the whole
-        # point of moving off 0DTE: the position comes off before the tenor
-        # decays into the range where gamma, pin risk and the staleness of
-        # the open-interest print all get worse at once.
-        if self.tenor.should_close(days_left):
+        # The hard exits lead the ladder and none of them is gated. In
+        # order: the pre-settlement buffer (the last quarter hour is where an
+        # ATM straddle's gamma diverges), the DTE floor for a multi-session
+        # tenor, the weekend rule, and the event blackout -- the last two
+        # because a gap with no session in it cannot be hedged.
+        if seconds_left <= self.tenor.buffer_seconds:
+            reason = f"{cfg.close_before_expiry_minutes}m to expiry"
+        elif self.tenor.should_close(days_left):
             reason = (
                 f"{days_left}DTE, at the {self.tenor.close_days}DTE close-out floor"
             )
-        elif seconds_left <= cfg.close_before_expiry_minutes * 60:
-            reason = f"{cfg.close_before_expiry_minutes}m to expiry"
+        elif (gap := self._gap_exit_reason(moment, position)) is not None:
+            reason = gap
+        elif (event := self.calendar.blackout(moment)) is not None:
+            reason = (
+                f"inside the blackout around {event} "
+                f"(-{cfg.event_blackout_minutes_before}m/+"
+                f"{cfg.event_blackout_minutes_after}m)"
+            )
         elif cfg.exit_on_regime_flip and profile is not None:
             reason = self._flip_exit_reason(bar, moment, position, profile)
 
@@ -699,6 +835,28 @@ class GexStraddleStrategy:
         if reason is None:
             return
         self._close_position(bar, moment, quote, execution, reason)
+
+    def _gap_exit_reason(self, moment: datetime, position) -> str | None:
+        """Close before a weekend or holiday a position would otherwise span.
+
+        Fires on the last session before a gap, at the same pre-settlement
+        buffer the 0DTE exit uses, for a position whose series is on the
+        far side of that gap.  At the shipped tenor this cannot happen --
+        such a series is never entered -- so this is the safety net for a
+        wider tenor, or a config that switched the weekend rule on with a
+        position already open.
+        """
+        if self.tenor.hold_over_weekends:
+            return None
+        today = self._todays_expiry(moment)
+        if today is None or position.expiry <= today or not self.clock.gap_after(moment):
+            return None
+        if self.clock.seconds_to_expiry(moment, today) > self.tenor.buffer_seconds:
+            return None
+        return (
+            f"the {position.expiry} series is on the far side of a weekend or "
+            "holiday; no positions are held over a gap"
+        )
 
     def _flip_exit_reason(
         self, bar: MarketBar, moment: datetime, position, profile: GexProfile
@@ -844,17 +1002,46 @@ class GexStraddleStrategy:
     def _flatten_hedge(
         self, bar: MarketBar, moment: datetime, execution: ExecutionHandler
     ) -> None:
-        quantity = -self.portfolio.hedge.quantity
-        fill = execution.execute_hedge(quantity, bar.close, moment)
-        if fill is None:
+        """Take the hedge leg to zero, in orders no larger than the cap.
+
+        A book sized to the margin limit can be carrying well over the
+        per-order cap in MES by the time it is closed -- an ATM straddle's
+        delta runs to +/-100 units per contract near the bell -- and the
+        live broker refuses any single order past it.  So the flatten is
+        sent as a sequence of capped orders rather than one, and stops at
+        the first that does not fill; whatever is left is an orphaned
+        hedge, which the band (zero-width with no straddle behind it)
+        closes on the following passes.
+        """
+        wanted = -self.portfolio.hedge.quantity
+        cap = self.cfg.hedge.max_hedge_contracts
+        remaining, closed, pnl, orders, notional = wanted, 0, 0.0, 0, 0.0
+        while remaining != 0:
+            chunk = max(-cap, min(cap, remaining))
+            fill = execution.execute_hedge(chunk, bar.close, moment)
+            if fill is None or fill.quantity == 0:
+                break
+            self.fills.append(fill)
+            self.portfolio.charge_fees(fill.fees)
+            pnl += self.portfolio.apply_hedge_fill(fill.quantity, fill.price)
+            remaining -= fill.quantity
+            closed += fill.quantity
+            notional += abs(fill.quantity) * fill.price
+            orders += 1
+        if orders == 0:
+            self._record(
+                moment, "hedge_failed",
+                f"could not flatten {abs(wanted)} {self.source.hedge.symbol}; the "
+                "band will close it on the next pass",
+            )
             return
-        self.fills.append(fill)
-        self.portfolio.charge_fees(fill.fees)
-        pnl = self.portfolio.apply_hedge_fill(fill.quantity, fill.price)
+        average = notional / abs(closed)
         self._record(
             moment, "hedge_flatten",
-            f"closed {abs(quantity)} {self.source.hedge.symbol} @ {fill.price:.2f}; "
-            f"hedge P&L ${pnl:,.0f}",
+            f"closed {abs(closed)} {self.source.hedge.symbol} @ {average:.2f}"
+            + (f" in {orders} orders" if orders > 1 else "")
+            + f"; hedge P&L ${pnl:,.0f}"
+            + (f"; {abs(remaining)} left for the band" if remaining else ""),
         )
 
     # -- hedging -----------------------------------------------------------
@@ -873,7 +1060,9 @@ class GexStraddleStrategy:
             else None
         )
         decision = self.hedger.decide(
-            net_delta, elapsed, self.clock.in_session(moment)
+            net_delta, elapsed, self.clock.in_session(moment),
+            gamma_units=self.portfolio.option_gamma_units(quote),
+            time_to_expiry=quote.time_to_expiry if quote else 0.0,
         )
         if not decision.should_hedge:
             return
@@ -906,6 +1095,11 @@ class GexStraddleStrategy:
         net = option_delta + hedge_delta
         in_session = self.clock.in_session(moment)
         expiry = position.expiry if position else self._traded_expiry(moment)
+        gamma_units = self.portfolio.option_gamma_units(quote)
+        band = self.hedger.half_width(
+            gamma_units, quote.time_to_expiry if quote else 0.0, in_session
+        )
+        event = self.calendar.blackout(moment)
         return BarState(
             timestamp=moment,
             future=bar.close,
@@ -919,7 +1113,7 @@ class GexStraddleStrategy:
             option_delta_units=option_delta,
             hedge_delta_units=hedge_delta,
             net_delta_units=net,
-            gamma_units=self.portfolio.option_gamma_units(quote),
+            gamma_units=gamma_units,
             vega_dollars=self.portfolio.option_vega(quote),
             theta_dollars=self.portfolio.option_theta(quote),
             hedge_contracts=self.portfolio.hedge.quantity,
@@ -930,7 +1124,7 @@ class GexStraddleStrategy:
             realised_pnl=self.portfolio.realised_pnl,
             fees_paid=self.portfolio.fees_paid,
             in_band=(
-                self.cfg.hedge.in_band(net, in_session)
+                self.hedger.in_band(net, band)
                 if position or hedge_delta
                 else True
             ),
@@ -945,4 +1139,6 @@ class GexStraddleStrategy:
                 self.clock.days_to_expiry(moment, expiry) if expiry else None
             ),
             in_session=in_session,
+            band_half_width=band,
+            event_blackout=str(event) if event is not None else "",
         )

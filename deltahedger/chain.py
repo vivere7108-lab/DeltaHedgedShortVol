@@ -14,22 +14,25 @@ P&L accounting see one instrument whose sign says whether we are buying
 gamma or selling it.
 
 Which *series* that straddle is on is decided here too, by ``TenorPolicy``
-and ``select_straddle``.  The system used to trade today's expiry and
-nothing else; it now trades a listed expiry a few sessions out and closes
-the position before the tenor decays into the expiry-day gamma spike.  Two
-things pushed the choice off 0DTE:
+and ``select_straddle``.  The system trades **today's expiry** and rolls
+into tomorrow's at the end of the session.  It spent a while on a 2-5 DTE
+tenor instead, for two reasons that are worth recording because one of
+them has gone away and the other is now handled directly:
 
+* open interest -- the only input GEX has -- used to be an end-of-previous-
+  day figure, stalest exactly on the same-day series where most of the
+  flow was.  With intraday open interest from the exchange's MDP 3.0 feed
+  the 0DTE read is built on the book that is actually there;
 * an at-the-money 0DTE straddle's gamma diverges into the bell, so the
   hedger is fighting a position whose delta is unstable on a timescale
-  shorter than the rebalance interval;
-* open interest -- the only input GEX has -- is an end-of-previous-day
-  figure, and on the 0DTE series it is *stalest exactly where most of the
-  flow is*.  A series listed a few days out has had its open interest built
-  over several sessions, so the same stale print describes far more of the
-  book that is actually there.
+  shorter than the rebalance interval.  That is still true, and it is why
+  the position is closed a quarter of an hour before settlement rather
+  than held into it: ``TenorPolicy.close_before_expiry_minutes`` both
+  ends today's position and decides that today's series is no longer the
+  one to enter.
 
-Both arguments are about the tenor, not about the strike, which is why the
-strike rule is unchanged.
+Neither argument is about the strike, which is why the strike rule is
+unchanged.
 """
 
 from __future__ import annotations
@@ -213,23 +216,33 @@ def select_atm_straddle(
 class TenorPolicy:
     """Which listed expiry to trade, and when to be out of it.
 
-    All four numbers are in *trading* days (``session.trading_days_between``).
+    The day counts are in *trading* days (``session.trading_days_between``).
     ``min_days``/``max_days`` bound what may be entered, ``prefer_days``
-    picks between the expiries inside that range, and ``close_days`` is the
-    DTE at which an open position is closed regardless of P&L.
+    picks between the expiries inside that range, and ``close_days`` -- if
+    set -- is the DTE at which an open position is closed regardless of
+    P&L.  ``close_days`` must sit strictly below ``min_days`` or a position
+    would be opened already eligible to close.
 
-    ``close_days`` must sit strictly below ``min_days`` or a position would
-    be opened already eligible to close.  With the shipped 2/5/(3,4)/1 the
-    position is entered three or four sessions out and closed on the first
-    bar of the session before expiry, so it is never carried into the last
-    two sessions where an at-the-money straddle's gamma and pin risk both
-    run away.
+    Two rules act in wall-clock terms rather than in days:
+
+    ``close_before_expiry_minutes``
+        A position is closed this long before its series settles, and a
+        series this close to settlement is never entered.  With the
+        shipped ``0 / 1 / (0, 0)`` that is what turns "today's series" into
+        "tomorrow's" for the last quarter hour of the day -- the roll.
+    ``hold_over_weekends``
+        Off means no series across a weekend or holiday is entered, and a
+        position on one is closed at the buffer on the last session before
+        the gap.  Holidays count as weekends: what matters is that no
+        session -- and no hedge -- sits between now and the expiry.
     """
 
-    min_days: int = 2
-    max_days: int = 5
-    prefer_days: tuple[int, int] = (3, 4)
-    close_days: int = 1
+    min_days: int = 0
+    max_days: int = 1
+    prefer_days: tuple[int, int] = (0, 0)
+    close_days: int | None = None
+    close_before_expiry_minutes: int = 15
+    hold_over_weekends: bool = False
 
     def validate(self) -> None:
         if self.min_days < 0:
@@ -241,15 +254,22 @@ class TenorPolicy:
             raise ValueError(
                 "tenor prefer_days must lie inside [min_days, max_days]"
             )
-        if self.close_days >= self.min_days:
+        if self.close_days is not None and self.close_days >= self.min_days:
             raise ValueError(
                 "tenor close_days must be < min_days, or a position would be "
                 "opened already eligible to close"
             )
+        if self.close_before_expiry_minutes < 0:
+            raise ValueError("tenor close_before_expiry_minutes must be >= 0")
+
+    @property
+    def buffer_seconds(self) -> float:
+        """The pre-settlement buffer, in seconds."""
+        return self.close_before_expiry_minutes * 60.0
 
     def should_close(self, days_to_expiry: int) -> bool:
         """Whether a position at ``days_to_expiry`` has reached the floor."""
-        return days_to_expiry <= self.close_days
+        return self.close_days is not None and days_to_expiry <= self.close_days
 
 
 def select_expiry(clock, moment, policy: TenorPolicy) -> date | None:
@@ -258,12 +278,13 @@ def select_expiry(clock, moment, policy: TenorPolicy) -> date | None:
     A thin seam over ``SessionClock.select_expiry`` so that callers -- the
     strategy, the live runner's vol read, the ``gex`` and ``doctor``
     commands -- all ask the question in exactly one way.  There is no
-    fallback to a nearer or farther series: if nothing is listed inside the
-    range the answer is "do not trade", which is the same answer the 0DTE
-    version gave on a day with no daily series.
+    fallback to a nearer or farther series: if nothing is eligible the
+    answer is "do not trade".
     """
     return clock.select_expiry(
-        moment, policy.min_days, policy.max_days, policy.prefer_days
+        moment, policy.min_days, policy.max_days, policy.prefer_days,
+        min_seconds_to_expiry=policy.buffer_seconds,
+        hold_over_gaps=policy.hold_over_weekends,
     )
 
 

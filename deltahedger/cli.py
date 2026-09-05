@@ -3,6 +3,7 @@
     deltahedger backtest  --config configs/es_default.yaml
     deltahedger fetch     --config configs/es_default.yaml
     deltahedger live      --config configs/es_default.yaml --dry-run
+    deltahedger sweep     --config configs/es_default.yaml --risk-aversions 0.001,0.01,0.1
     deltahedger sweep     --config configs/es_default.yaml --bands 5,10,20
     deltahedger sweep     --config configs/es_default.yaml --gates
     deltahedger gex       --config configs/es_default.yaml --price 5000
@@ -37,7 +38,12 @@ def _load(args: argparse.Namespace) -> Config:
     if args.target is not None:
         cfg.hedge.target = args.target
     if args.band is not None:
+        # A fixed half-width only means something under the fixed model.
         cfg.hedge.band = args.band
+        cfg.hedge.band_model = "fixed"
+    if getattr(args, "risk_aversion", None) is not None:
+        cfg.hedge.risk_aversion = args.risk_aversion
+        cfg.hedge.band_model = "whalley_wilmott"
     if getattr(args, "source", None):
         cfg.data.source = args.source
     if getattr(args, "open_interest", None):
@@ -180,13 +186,18 @@ def cmd_sweep_gates(args: argparse.Namespace) -> int:
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
-    """Run the backtest across several band widths and compare.
+    """Run the backtest across risk aversions (or fixed band widths) and compare.
 
     The two regime columns are the point of the sweep.  A tighter band
     scalps more gamma on the long side and pays away more theta on the
-    short side, so one number cannot be right for both -- seeing where each
-    branch peaks is what tells you whether the single fixed threshold is
-    costing anything worth fixing.
+    short side, so seeing where each branch peaks is what tells you whether
+    the hedger is costing anything worth fixing.
+
+    ``--risk-aversions`` sweeps the Whalley-Wilmott parameter, which is the
+    shipped model; ``--bands`` sweeps fixed half-widths under the fixed
+    model, as the control.  The median half-width column is what makes the
+    two comparable: under Whalley-Wilmott it is what the book was actually
+    held to, under the fixed model it is the number you asked for.
     """
     from .backtest import run_backtest
 
@@ -194,20 +205,40 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return cmd_sweep_gates(args)
 
     cfg = _load(args)
-    widths = [float(w) for w in args.bands.split(",")]
+    if args.bands:
+        label, values = "band", [float(w) for w in args.bands.split(",")]
+        cfg.hedge.band_model = "fixed"
+    else:
+        label = "gamma_ra"
+        values = [
+            float(g)
+            for g in (args.risk_aversions or "0.001,0.003,0.01,0.03,0.1").split(",")
+        ]
+        cfg.hedge.band_model = "whalley_wilmott"
     print(
-        f"{'band':>6} {'return':>9} {'P&L':>11} {'long gamma':>12} "
+        f"{label:>8} {'median band':>11} {'return':>9} {'P&L':>11} {'long gamma':>12} "
         f"{'short gamma':>12} {'hedges':>7} {'fees':>10} {'mean err':>9}"
     )
-    print("-" * 84)
-    for width in widths:
-        cfg.hedge.band = width
+    print("-" * 98)
+    for value in values:
+        if label == "band":
+            cfg.hedge.band = value
+        else:
+            cfg.hedge.risk_aversion = value
         m = run_backtest(cfg).metrics
         print(
-            f"{width:>6.1f} {m.total_return:>8.2%} "
+            f"{value:>8g} {m.band_half_width:>11,.1f} {m.total_return:>8.2%} "
             f"${m.final_equity - m.starting_equity:>10,.0f} "
             f"${m.long_gamma_pnl:>11,.0f} ${m.short_gamma_pnl:>11,.0f} "
             f"{m.hedges:>7} ${m.fees_paid:>9,.0f} {m.mean_abs_delta_error:>9.2f}"
+        )
+    if label == "band":
+        print("\nFixed half-widths, in delta units, under hedge.band_model: fixed.")
+    else:
+        print(
+            "\nWhalley-Wilmott absolute risk aversion, per dollar of wealth. The "
+            "band scales\nas its inverse cube root, so a decade of risk aversion "
+            "is about 2.2x of band."
         )
     return 0
 
@@ -240,8 +271,9 @@ def cmd_gex(args: argparse.Namespace) -> int:
     traded = select_expiry(clock, now, tenor)
     if traded is None:
         print(
-            f"no expiry listed between {tenor.min_days} and {tenor.max_days} "
-            f"trading days of {now:%Y-%m-%d %H:%M}"
+            f"no expiry eligible between {tenor.min_days} and {tenor.max_days} "
+            f"trading days of {now:%Y-%m-%d %H:%M} (inside the pre-settlement "
+            "buffer, across a weekend, or nothing listed)"
         )
         return 1
 
@@ -375,10 +407,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         tenor = cfg.strategy.tenor()
         expiry = select_expiry(clock, now, tenor)
         check(
-            f"a {tenor.min_days}-{tenor.max_days}DTE series is listed",
+            f"a {tenor.min_days}-{tenor.max_days}DTE series is eligible",
             expiry is not None,
             f"{expiry} ({clock.days_to_expiry(now, expiry)}DTE)" if expiry
-            else "none in range -- the strategy stands aside",
+            else "none eligible right now -- inside the pre-settlement buffer, "
+                 "across a weekend, or nothing listed; the strategy stands aside",
+        )
+        calendar = cfg.event_calendar()
+        upcoming = calendar.upcoming(now, limit=3)
+        check(
+            "event calendar loaded", True,
+            (f"{len(calendar)} events; next: "
+             + ", ".join(str(e) for e in upcoming)) if len(calendar)
+            else "no events configured -- nothing will be stood aside for",
         )
 
         if price is None or expiry is None:
@@ -633,9 +674,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deltahedger",
         description=(
-            "GEX-directed, delta-hedged 2-5 DTE straddles on ES futures "
-            "options. Dealer gamma exposure picks the side; a fixed delta "
-            "band holds it neutral."
+            "GEX-directed, delta-hedged 0DTE straddles on ES futures "
+            "options. Dealer gamma exposure picks the side; a Whalley-Wilmott "
+            "delta band holds it neutral."
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -647,10 +688,17 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--equity", type=float, help="starting equity, USD")
     common.add_argument(
         "--buying-power", type=float,
-        help="fraction of equity allocated as margin buying power (default 0.15)",
+        help="fraction of equity allocated as margin buying power (default 0.80)",
     )
     common.add_argument("--target", type=float, help="delta target in delta units")
-    common.add_argument("--band", type=float, help="delta band half-width")
+    common.add_argument(
+        "--band", type=float,
+        help="fixed delta band half-width (switches hedge.band_model to fixed)",
+    )
+    common.add_argument(
+        "--risk-aversion", type=float, dest="risk_aversion",
+        help="Whalley-Wilmott risk aversion per dollar (default 0.01)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -680,17 +728,24 @@ def build_parser() -> argparse.ArgumentParser:
     live.set_defaults(func=cmd_live, source=None, bar_size=None)
 
     sweep = sub.add_parser(
-        "sweep", parents=[common], help="compare backtests across band widths"
+        "sweep", parents=[common],
+        help="compare backtests across risk aversions, band widths or gates"
     )
     sweep.add_argument("--source", choices=["ibkr", "csv", "synthetic"])
     sweep.add_argument("--open-interest", choices=["synthetic", "csv"])
     sweep.add_argument("--bar-size", help='e.g. "5 mins"')
     sweep.add_argument(
-        "--bands", default="5,10,15,20,40", help="comma-separated band half-widths",
+        "--bands", default=None,
+        help="comma-separated fixed band half-widths (uses the fixed band model)",
+    )
+    sweep.add_argument(
+        "--risk-aversions", dest="risk_aversions", default=None,
+        help="comma-separated Whalley-Wilmott risk aversions to sweep "
+             "(default 0.001,0.003,0.01,0.03,0.1)",
     )
     sweep.add_argument(
         "--gates", action="store_true",
-        help="sweep the stand-aside gates one at a time instead of band widths",
+        help="sweep the stand-aside gates one at a time instead of the band",
     )
     sweep.set_defaults(func=cmd_sweep)
 

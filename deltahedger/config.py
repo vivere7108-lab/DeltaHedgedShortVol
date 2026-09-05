@@ -29,50 +29,95 @@ def _parse_time(value: Any) -> time:
     raise TypeError(f"cannot read a time-of-day from {value!r}")
 
 
+#: The two ways the band half-width can be set.
+BAND_WHALLEY_WILMOTT = "whalley_wilmott"
+BAND_FIXED = "fixed"
+
+
 @dataclass
 class HedgeConfig:
-    """The delta band -- a fixed, heuristic threshold.
+    """The delta band: where it sits and how wide it is.
 
-    ``target`` and ``band`` are in delta units (1 unit == 1% of one ES
-    contract).  The position is an ATM straddle, so the target is 0: hold
-    the book delta-neutral and let the straddle express the gamma view.
+    ``target`` is in delta units (1 unit == 1% of one ES contract).  The
+    position is an ATM straddle, so the target is 0: hold the book
+    delta-neutral and let the straddle express the gamma view.
 
-    ``band`` is deliberately a *fixed heuristic* for the initial forward
-    walk.  One MES contract moves net delta by 10 units, so a band narrower
-    than 5 cannot bind (see ``hedger.py``); 10 is the smallest value that
-    both binds and leaves room for a whole contract to land inside it.  A
-    band that scales with gamma or realised vol is the obvious next step and
-    is deliberately *not* in this version -- the paper test is meant to
-    measure one threshold, not a fitted schedule.
+    The half-width comes from one of two models, chosen by ``band_model``:
 
-    ``overnight_band_multiplier`` is the one exception, and it is a
-    consequence of the tenor rather than a fitted schedule.  The position is
-    now carried overnight, and the hours outside the regular session are not
-    the same market: the book is quoted wider, a single MES fill costs
-    proportionally more, and the delta that a hedge would chase is as likely
-    to be reversed by the open as realised.  Outside RTH the band is
-    multiplied by this factor, so only a *larger* breach is hedged; the
-    hedge is not switched off, because an overnight gap is exactly when an
-    unhedged straddle does the most damage.  Set it to 1.0 to hedge
-    identically around the clock.
+    ``whalley_wilmott`` (the default)
+        The Whalley-Wilmott (1997) asymptotic no-transaction band for a
+        hedger with exponential utility and proportional costs::
 
-    Note that the band means opposite things in the two regimes.  Long the
-    straddle (negative GEX) each hedge realises a gamma scalp, so a tighter
-    band scalps more and pays more commission; short the straddle (positive
-    GEX) each hedge locks in a loss against theta, so a tighter band bleeds
-    faster.  One number for both is a simplification, and the results
-    report is written to make its cost visible.
+            H = ( 3/2 * exp(-r*T) * k * S * Gamma^2 / gamma_ra ) ** (1/3)
+
+        where ``k*S`` is the cost of trading one unit of the underlying,
+        ``Gamma`` is the position's gamma in those units per dollar, and
+        ``gamma_ra`` is ``risk_aversion`` -- the absolute risk aversion of
+        the hedger, *per dollar of wealth*.  The band is therefore not a
+        number but a function of the book: it widens as ``Gamma^(2/3)``, so
+        a big book near the money is allowed to drift further in delta
+        units (though less far in *points*) before it is rebalanced, and it
+        narrows as costs fall or risk aversion rises, each as a cube root.
+        ``hedger.py`` spells out the unit conversion into delta units.
+
+        ``risk_aversion`` is dollar-denominated, and that matters for
+        reading the number: ``0.01`` per dollar is a very risk-averse
+        hedger -- on a $250k book it is a relative risk aversion in the
+        thousands -- and it gives a band of a few tens of delta units for
+        a book of a few straddles, a couple of hundred for a book sized to
+        the margin limit.  Raise it to hedge less often.
+
+    ``fixed``
+        The old heuristic: ``band`` delta units either side of the target,
+        whatever the book carries.  Kept as the control -- ``deltahedger
+        sweep --bands`` uses it -- and because a hedger that ignores gamma
+        is the right thing to compare a gamma-aware one against.
+
+    Either way, one MES contract moves net delta by 10 units, so a
+    half-width under 5 cannot bind: the hedger only trades when a whole
+    contract lands closer to target (see ``hedger.py``).  A Whalley-Wilmott
+    band that comes out narrower than that -- a tiny book, or a straddle
+    far from its strike -- simply behaves as +/-5.
+
+    ``overnight_band_multiplier`` widens whichever half-width applies
+    outside the regular session.  The hours outside RTH are not the same
+    market: the book is quoted wider and thinner, and a delta picked up on
+    thin overnight volume is as likely to be handed back by the open as
+    realised.  Under Whalley-Wilmott a wider quote is a larger ``k``, and a
+    band ``m`` times wider corresponds to costs ``m^3`` times higher -- so
+    keep the multiplier modest.  The hedge is never switched off: an
+    overnight gap is exactly when an unhedged straddle does the most damage.
+    Set it to 1.0 to hedge identically around the clock.
+
+    ``hedge_cost_per_contract`` is the ``k*S`` term: the dollar cost of
+    trading one hedge contract, one way.  ``None`` derives it from the
+    costs section (slippage in ticks plus fees) -- and does so whether or
+    not ``costs.enabled`` is on, because the band is a decision rule the
+    live system will run, and a backtest that switches costs off to read
+    the strategy's arithmetic should still hedge the way the live system
+    will.
     """
 
     target: float = 0.0
+    #: ``"whalley_wilmott"`` or ``"fixed"``.
+    band_model: str = BAND_WHALLEY_WILMOTT
+    #: Whalley-Wilmott absolute risk aversion, per dollar of wealth.
+    risk_aversion: float = 0.01
+    #: Dollar cost of one hedge contract traded one way, for the band. None
+    #: derives it from ``costs`` (hedge slippage ticks x tick value + fees).
+    hedge_cost_per_contract: float | None = None
+    #: Half-width in delta units when ``band_model == "fixed"``.
     band: float = 10.0
     #: Widen the band by this factor outside the regular session. 1.0 hedges
     #: overnight exactly as it does intraday.
     overnight_band_multiplier: float = 2.5
     #: Don't send a hedge smaller than this many contracts.
     min_hedge_contracts: int = 1
-    #: Cap on a single hedge order, as a guard against a data glitch.
-    max_hedge_contracts: int = 200
+    #: Cap on a single hedge order, as a guard against a data glitch. A
+    #: book sized to the margin limit can legitimately need several
+    #: hundred MES in one go near expiry; anything the cap holds back is
+    #: sent on the next pass.
+    max_hedge_contracts: int = 500
     #: Seconds to wait between hedges; suppresses churn on noisy quotes.
     min_seconds_between_hedges: float = 0.0
     #: Flatten the hedge in the same order as the straddle, rather than
@@ -83,27 +128,20 @@ class HedgeConfig:
     #: sub-band residual -- under one hedge contract -- is left behind.
     flatten_hedge_on_exit: bool = True
 
-    def effective_band(self, in_session: bool = True) -> float:
-        """The half-width that applies right now."""
-        return self.band if in_session else self.band * self.overnight_band_multiplier
-
-    def bounds(self, in_session: bool = True) -> tuple[float, float]:
-        half = self.effective_band(in_session)
-        return self.target - half, self.target + half
-
     @property
-    def lower(self) -> float:
-        return self.target - self.band
-
-    @property
-    def upper(self) -> float:
-        return self.target + self.band
-
-    def in_band(self, delta_units: float, in_session: bool = True) -> bool:
-        low, high = self.bounds(in_session)
-        return low <= delta_units <= high
+    def is_fixed(self) -> bool:
+        return self.band_model == BAND_FIXED
 
     def validate(self) -> None:
+        if self.band_model not in (BAND_WHALLEY_WILMOTT, BAND_FIXED):
+            raise ValueError(
+                f"hedge.band_model must be '{BAND_WHALLEY_WILMOTT}' or "
+                f"'{BAND_FIXED}', got {self.band_model!r}"
+            )
+        if self.risk_aversion <= 0.0:
+            raise ValueError("hedge.risk_aversion must be > 0")
+        if self.hedge_cost_per_contract is not None and self.hedge_cost_per_contract < 0:
+            raise ValueError("hedge.hedge_cost_per_contract must be >= 0 or null")
         if self.band < 0:
             raise ValueError("hedge.band must be >= 0")
         if self.overnight_band_multiplier < 1.0:
@@ -119,13 +157,30 @@ class HedgeConfig:
 
 @dataclass
 class SizingConfig:
-    """How much of the account to commit to the straddle."""
+    """How much of the account to commit to the straddle.
+
+    The book is sized to the margin limit, less a buffer.  ``buying_power_pct``
+    is the share of equity the strategy may commit as buying power -- margin
+    for a short straddle, the debit for a long one, and the reserve for the
+    hedge leg all come out of it -- and the remainder is the buffer that
+    absorbs variation margin and a margin call on a bad day.  The default
+    leaves 20% untouched.
+
+    Within the allocation, ``hedge_margin_reserve_pct`` is held back for the
+    MES hedge, and the straddle count is what the rest buys at the
+    per-straddle requirement.  With the defaults that is 56% of equity to
+    the straddles, 24% reserved for the hedge, 20% buffer.
+    """
 
     #: Fraction of portfolio equity to allocate as buying power. It covers
-    #: margin for a short straddle and the debit for a long one.
-    buying_power_pct: float = 0.15
-    #: Hard cap on straddles regardless of buying power.
-    max_straddles: int = 25
+    #: margin for a short straddle and the debit for a long one. 1 minus
+    #: this is the buffer the strategy never touches.
+    buying_power_pct: float = 0.80
+    #: Hard cap on straddles regardless of buying power. A backstop against
+    #: a sizing bug rather than a sizing rule -- the buying-power budget is
+    #: what decides the count. Matches the per-order hard ceiling in
+    #: ``broker.ibkr.MAX_ORDER_CONTRACTS``.
+    max_straddles: int = 500
     #: Never open a position smaller than this.
     min_straddles: int = 1
     #: Fraction of the buying-power budget held back for hedge margin and
@@ -336,39 +391,87 @@ class StrategyConfig:
     a parameter -- it is whatever the GEX regime says: long when dealers are
     short gamma, short when they are long it.
 
-    The *tenor* is a parameter, and it is the one that changed.  The system
-    traded 0DTE and now trades a listed expiry two to five sessions out,
-    closing at ``close_at_days_to_expiry``.  All four numbers are trading
-    days, not calendar days (see ``session.trading_days_between``).
+    The tenor
+    ---------
+    The traded series is **today's expiry**, and the position is rolled into
+    tomorrow's at the end of the day.  Concretely:
+
+    * during the session the ATM straddle on the 0DTE series is traded;
+    * ``close_before_expiry_minutes`` before settlement it is closed, whatever
+      it is worth -- the last minutes of an expiring straddle's life are
+      where its gamma diverges and the hedger cannot keep up;
+    * at that moment the next session's series (1DTE) may be opened in its
+      place and carried overnight, becoming the 0DTE position the next
+      morning (``roll_at_expiry``);
+    * unless the next session is across a weekend or a holiday, in which
+      case nothing is opened and the book is flat over the gap
+      (``hold_over_weekends``);
+    * and never inside the blackout around a scheduled high-volatility
+      event: the position is closed ``event_blackout_minutes_before`` the
+      event and nothing is opened until ``event_blackout_minutes_after`` it
+      (``events`` / ``events_path``).
+
+    The four ``*_days_to_expiry`` numbers are what make that a *policy*
+    rather than a hard-coded rule: they bound the expiry that may be
+    entered, in trading days (``session.trading_days_between``), and
+    ``prefer_*`` picks between the ones in range.  ``0 / 1 / (0, 0)`` reads
+    "today's series, or tomorrow's once today's is inside the pre-expiry
+    buffer".  The old multi-session tenor is still reachable by widening
+    them, and ``close_at_days_to_expiry`` -- the DTE floor that closed that
+    tenor early -- is kept for it, disabled by default.
     """
 
     #: Bounds on the expiry that may be entered, in trading days.
-    min_days_to_expiry: int = 2
-    max_days_to_expiry: int = 5
-    #: Inside those bounds, prefer the expiry closest to this window. The
-    #: middle of the range is where neither failure mode bites: entering at
-    #: 2 DTE leaves one session before the close-out, and entering at 5
-    #: carries the most vega for the longest.
-    prefer_min_days_to_expiry: int = 3
-    prefer_max_days_to_expiry: int = 4
+    min_days_to_expiry: int = 0
+    max_days_to_expiry: int = 1
+    #: Inside those bounds, prefer the expiry closest to this window.
+    prefer_min_days_to_expiry: int = 0
+    prefer_max_days_to_expiry: int = 0
     #: Close the position once it has decayed to this DTE, whatever it is
-    #: worth. With the default the exit lands on the first bar of the
-    #: session before expiry, so the book is never carried into the last two
-    #: sessions where an ATM straddle's gamma, its pin risk and the staleness
-    #: of the open-interest print all get worse together.
-    close_at_days_to_expiry: int = 1
-    #: Earliest time of day to open a position (exchange local time).
-    #: Defaults to a morning window that starts after the exchange has
-    #: published final open interest for the previous session -- the input
-    #: GEX is computed from. Before it lands, the profile is built on a
-    #: preliminary print. Gated by ``gates.entry_window``.
-    entry_time: time = time(10, 0)
-    #: Latest time of day to open a position.
-    entry_cutoff_time: time = time(11, 30)
-    #: Backstop close, this many minutes before expiry. With the DTE floor
-    #: above this should never be what closes a position; it is here so that
-    #: a config which disables the floor still cannot hold into settlement.
-    close_before_expiry_minutes: int = 5
+    #: worth. ``None`` disables the floor. At the shipped 0/1 DTE tenor it
+    #: has no work to do -- the pre-expiry buffer below is the exit -- but
+    #: a multi-session tenor wants it (1 with a 2-5 DTE range keeps the
+    #: book out of the last two sessions).
+    close_at_days_to_expiry: int | None = None
+    #: Earliest time of day to open a position (exchange local time). The
+    #: first minutes after the open are skipped: the opening auction leaves
+    #: quotes wide and the chain's vol unsettled. Gated by
+    #: ``gates.entry_window``; the end-of-day roll is exempt (see
+    #: ``roll_at_expiry``).
+    entry_time: time = time(9, 35)
+    #: Latest time of day to open a position. A same-day straddle entered
+    #: late has little premium left and a gamma the hedger will be fighting
+    #: within the hour.
+    entry_cutoff_time: time = time(14, 30)
+    #: Close the position this many minutes before its series settles. This
+    #: leads the exit ladder and nothing can delay it: the last quarter hour
+    #: of an ATM straddle is where its gamma diverges. The same buffer
+    #: decides which series is *entered* -- one inside it is never opened.
+    close_before_expiry_minutes: int = 15
+    #: When today's series is closed at the buffer, allow the next session's
+    #: series to be opened in its place -- outside the entry window, but
+    #: still subject to every GEX gate, the weekend rule and the event
+    #: blackout. Off means nothing is opened inside the buffer, so with the
+    #: entry-window gate on the book is flat from the buffer to the next
+    #: morning's window (with the gate off, an entry after the bell is what
+    #: the config asked for).
+    roll_at_expiry: bool = True
+    #: Carry a position across a weekend or an exchange holiday. Off (the
+    #: default) means a series on the far side of any calendar gap is never
+    #: entered, and a position already on one is closed at the buffer on
+    #: the last session before the gap: an unhedgeable gap is exactly what
+    #: a delta-hedged straddle cannot survive.
+    hold_over_weekends: bool = False
+    #: Scheduled high-volatility events, exchange-local time, as
+    #: ``"YYYY-MM-DD HH:MM label"`` strings (see ``events.py``). The
+    #: position is closed before each and nothing is opened until after.
+    events: list[Any] = field(default_factory=list)
+    #: A text file of the same, one per line. ``configs/events.txt`` ships
+    #: the FOMC statement times.
+    events_path: str | None = None
+    #: The blackout either side of an event, in minutes.
+    event_blackout_minutes_before: int = 15
+    event_blackout_minutes_after: int = 15
     #: SHORT straddle (positive GEX): buy it back if the premium reaches
     #: this multiple of the entry credit. ``None`` disables the stop.
     short_stop_loss_premium_multiple: float | None = 2.5
@@ -405,6 +508,8 @@ class StrategyConfig:
             max_days=self.max_days_to_expiry,
             prefer_days=(self.prefer_min_days_to_expiry, self.prefer_max_days_to_expiry),
             close_days=self.close_at_days_to_expiry,
+            close_before_expiry_minutes=self.close_before_expiry_minutes,
+            hold_over_weekends=self.hold_over_weekends,
         )
 
     def validate(self) -> None:
@@ -412,11 +517,17 @@ class StrategyConfig:
             raise ValueError("strategy.min_days_to_expiry must be >= 0")
         if self.min_days_to_expiry > self.max_days_to_expiry:
             raise ValueError("strategy.min_days_to_expiry > max_days_to_expiry")
+        if self.close_before_expiry_minutes < 0:
+            raise ValueError("strategy.close_before_expiry_minutes must be >= 0")
         self.tenor().validate()
         if self.entry_cutoff_time < self.entry_time:
             raise ValueError("strategy.entry_cutoff_time is before entry_time")
         if self.max_entries_per_session < 1:
             raise ValueError("strategy.max_entries_per_session must be >= 1")
+        if self.event_blackout_minutes_before < 0 or self.event_blackout_minutes_after < 0:
+            raise ValueError("strategy.event_blackout_minutes_* must be >= 0")
+        if not isinstance(self.events, list):
+            raise ValueError("strategy.events must be a list")
 
 
 @dataclass
@@ -663,6 +774,14 @@ class Config:
     def from_yaml(cls, path: str | Path) -> "Config":
         raw = yaml.safe_load(Path(path).read_text()) or {}
         return cls.from_dict(raw)
+
+    def event_calendar(self):
+        """The parsed event blackout calendar, in the exchange's timezone."""
+        from zoneinfo import ZoneInfo
+
+        from .events import EventCalendar
+
+        return EventCalendar.from_config(self.strategy, ZoneInfo(self.source.timezone))
 
     def to_dict(self) -> dict[str, Any]:
         def convert(value: Any) -> Any:

@@ -1,0 +1,38 @@
+# Scheduled high-volatility events the strategy stands aside for.
+#
+# One per line, exchange-local time (America/New_York for ES):
+#
+#     YYYY-MM-DD HH:MM  label
+#
+# The position is closed strategy.event_blackout_minutes_before each one and
+# nothing is opened until strategy.event_blackout_minutes_after it.  The
+# runner polls overnight while it holds a position, so a pre-market event
+# (a CPI print at 08:30, say) is honoured as well as an afternoon one.
+#
+# THIS FILE IS MAINTAINED BY HAND.  Nothing downloads a calendar -- a walk
+# that quietly traded through an FOMC statement because a fetch failed would
+# be worse than one whose calendar needed updating.  Check the dates below
+# against federalreserve.gov before each walk, and add whatever else you
+# consider a gap event (CPI, payrolls, an index rebalance) in the same form.
+#
+# FOMC statement releases, 14:00 ET on the second day of each meeting.
+
+# 2025
+2025-01-29 14:00  FOMC statement
+2025-03-19 14:00  FOMC statement
+2025-05-07 14:00  FOMC statement
+2025-06-18 14:00  FOMC statement
+2025-07-30 14:00  FOMC statement
+2025-09-17 14:00  FOMC statement
+2025-10-29 14:00  FOMC statement
+2025-12-10 14:00  FOMC statement
+
+# 2026
+2026-01-28 14:00  FOMC statement
+2026-03-18 14:00  FOMC statement
+2026-04-29 14:00  FOMC statement
+2026-06-17 14:00  FOMC statement
+2026-07-29 14:00  FOMC statement
+2026-09-16 14:00  FOMC statement
+2026-10-28 14:00  FOMC statement
+2026-12-09 14:00  FOMC statement

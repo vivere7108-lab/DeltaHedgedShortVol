@@ -1,19 +1,21 @@
-# GEX-directed, delta-hedged 2-5 DTE straddles on ES futures options.
+# GEX-directed, delta-hedged 0DTE straddles on ES futures options.
 #
-# Read dealer gamma exposure off the front expiries -- 0DTE through the
-# traded series -- find the gamma flip point, and take the side dealer
-# hedging is forced to supply:
+# Read dealer gamma exposure off the front of the curve, find the gamma flip
+# point, and take the side dealer hedging is forced to supply:
 #
 #   negative GEX -> dealers amplify moves -> LONG the ATM straddle, scalp gamma
 #   positive GEX -> dealers damp moves    -> SHORT the ATM straddle, hold theta
 #   near the flip                         -> stand aside
 #
+# The position is today's expiry, closed 15 minutes before settlement and
+# rolled into tomorrow's series at that moment -- except into a weekend or a
+# holiday, and never inside the blackout around a scheduled event. The book
+# is sized to the margin limit less a 20% buffer and held delta-neutral
+# under a Whalley-Wilmott band.
+#
 # Four gates can additionally stand the strategy aside on a read that is
 # not confident, not corroborated by nearby expiries, has not held, or
-# arrives outside the morning entry window -- see `gates:` below.
-#
-# The delta band is a fixed heuristic for the initial forward walk, widened
-# outside the regular session since the position is now carried overnight.
+# arrives outside the entry window -- see `gates:` below.
 #
 # Generate a fresh copy of this file with:  deltahedger config -o my.yaml
 
@@ -26,24 +28,35 @@ hedge:
   #   long 1 ES  = +100      long 1 MES = +10
   # The position is a straddle, so the target is delta-neutral.
   target: 0.0
-  # THE FIXED HEURISTIC THRESHOLD for the paper test. One MES moves net
-  # delta by 10 units, so anything below 5 cannot bind at all (the hedger
-  # only trades when a whole contract lands closer to target). 10 is the
-  # smallest value that both binds and leaves room to land inside the band.
-  # At the 2-5 DTE tenor this covers a few ES points -- run `deltahedger
-  # backtest` and read "Band feasibility" for what it is at your book size.
-  #
-  # One number is used in both regimes, which is a simplification: hedging
-  # a long straddle realises a gamma scalp, hedging a short one locks in a
-  # loss against theta. `deltahedger sweep` breaks the result out by regime
-  # so the cost of that simplification is visible before it is fixed.
+  # The band half-width comes from the Whalley-Wilmott (1997) formula:
+  #   H = (3/2 * exp(-rT) * cost_per_unit * Gamma^2 / risk_aversion)^(1/3)
+  # so it widens with the book's gamma (as Gamma^(2/3)), narrows as costs
+  # fall or risk aversion rises (each as a cube root), and is the same in
+  # both regimes. `fixed` restores a constant `band` -- the control, and
+  # what `deltahedger sweep --bands` uses.
+  band_model: whalley_wilmott
+  # Absolute risk aversion PER DOLLAR of wealth. 0.01 is very risk-averse
+  # (relative risk aversion in the thousands on a $250k book); it gives a
+  # band of a few tens of delta units for a handful of straddles and a
+  # couple of hundred for a book sized to the margin limit. Raise it to
+  # hedge less often; `deltahedger sweep --risk-aversions` prices the choice.
+  risk_aversion: 0.01
+  # Dollar cost of one hedge contract, one way, for the band. null derives
+  # it from `costs` (hedge slippage ticks x tick value + fees) whether or
+  # not costs.enabled is on.
+  hedge_cost_per_contract: null
+  # Half-width in delta units under band_model: fixed. One MES moves net
+  # delta by 10 units, so anything under 5 cannot bind.
   band: 10.0
   # Outside the regular session the band widens by this factor -- wider
   # spreads and thin volume make a tight overnight hedge expensive and its
   # information short-lived, but a large enough breach is still hedged.
+  # Under Whalley-Wilmott a band m times wider stands for costs m^3 higher.
   overnight_band_multiplier: 2.5
   min_hedge_contracts: 1
-  max_hedge_contracts: 200
+  # Per-order cap. A book at the margin limit can need several hundred MES
+  # near expiry; what the cap holds back goes on the next pass.
+  max_hedge_contracts: 500
   min_seconds_between_hedges: 0.0
   flatten_hedge_on_exit: true
 
@@ -59,12 +72,13 @@ gex:
   flip_search_pct: 0.03       # hypothetical-spot grid for the flip search
   flip_search_steps: 61
   flip_proximity_pct: 0.0015  # right at the flip, the sign is about to change
-  min_hours_to_expiry: 0.5    # keeps the nearest expiry's profile legible
-  refresh_seconds: 900.0      # OI is an end-of-day figure; the profile is
-                              # still recomputed at the live spot every bar
-  # Classify on the aggregate of the front expiries, not the traded series
-  # alone -- a dealer hedges a book, not one series. Capped for the live
-  # market-data-line budget; `deltahedger doctor` reports what it costs.
+  min_hours_to_expiry: 0.5    # keeps the expiring series' profile legible
+                              # through the roll window
+  refresh_seconds: 900.0      # how often open interest is re-read; the
+                              # profile is recomputed at the live spot every bar
+  # Classify on the aggregate of the front expiries out to the traded one.
+  # During the day that is today's series alone; in the roll window it is
+  # today's and tomorrow's together.
   blend_front_expiries: true
   blend_max_expiries: 4
 
@@ -80,33 +94,54 @@ gates:
   persistence: true            # a regime must hold this many bars in a row
   persistence_bars: 3
   entry_window: true           # entries only inside strategy.entry_time/
-                               # entry_cutoff_time; exits are never gated
+                               # entry_cutoff_time, plus the end-of-day roll;
+                               # exits are never gated
 
 sizing:
-  buying_power_pct: 0.15      # margin for a short straddle, debit for a long one
+  # The book is sized to the margin limit, less a buffer. 80% of equity is
+  # the buying power the strategy may commit -- short-straddle margin, long-
+  # straddle debit, and the hedge reserve all come out of it -- and the
+  # remaining 20% is never touched. With the 30% hedge reserve that is 56%
+  # of equity to the straddles and 24% to the MES hedge.
+  buying_power_pct: 0.80
   hedge_margin_reserve_pct: 0.30
   min_straddles: 1
-  max_straddles: 25
+  max_straddles: 500          # a backstop against a sizing bug, not a limit
   margin_model: span_scan     # span_scan | reg_t | fixed
   span_scan_multiplier: 1.0
   span_vol_scan_pct: 0.30
   span_short_option_minimum: 250.0
 
 strategy:
-  # Trade a listed expiry 2-5 trading days out, preferring the middle of
-  # that range, and close at the 1DTE floor -- before the expiry-week
-  # gamma spike and the staleness of the open-interest print both worsen.
-  min_days_to_expiry: 2
-  max_days_to_expiry: 5
-  prefer_min_days_to_expiry: 3
-  prefer_max_days_to_expiry: 4
-  close_at_days_to_expiry: 1
-  # Entries only after the exchange's final open-interest print for the
-  # previous session has landed; exits are always live (gated by
-  # gates.entry_window, not by this window alone).
-  entry_time: '10:00'
-  entry_cutoff_time: '11:30'
-  close_before_expiry_minutes: 5  # backstop only; the DTE floor leads
+  # Today's expiry, or tomorrow's once today's is inside the pre-settlement
+  # buffer. Widen these for a multi-session tenor (2/5/3/4 with
+  # close_at_days_to_expiry: 1 is the old one).
+  min_days_to_expiry: 0
+  max_days_to_expiry: 1
+  prefer_min_days_to_expiry: 0
+  prefer_max_days_to_expiry: 0
+  close_at_days_to_expiry: null   # the DTE floor; only a multi-session tenor needs it
+  # The entry window skips the opening minutes and the late afternoon; the
+  # end-of-day roll below is exempt from it.
+  entry_time: '09:35'
+  entry_cutoff_time: '14:30'
+  # THE END OF THE DAY. Close the 0DTE position this long before settlement
+  # -- the last quarter hour is where an ATM straddle's gamma diverges --
+  # and, in that window, open tomorrow's series in its place and carry it
+  # overnight.
+  close_before_expiry_minutes: 15
+  roll_at_expiry: true            # off: nothing is opened inside the buffer
+  # Never hold across a weekend or an exchange holiday: a gap with no
+  # session in it cannot be hedged. Friday's roll is skipped and the book is
+  # flat until Monday's entry window.
+  hold_over_weekends: false
+  # Scheduled high-volatility events: close 15 minutes before, stay flat
+  # until 15 minutes after. configs/events.txt ships the FOMC statement
+  # times -- verify them, and add CPI/NFP/whatever else you count as a gap.
+  events: []
+  events_path: configs/events.txt
+  event_blackout_minutes_before: 15
+  event_blackout_minutes_after: 15
   # Short straddle: judged on the premium, which is what runs away.
   short_stop_loss_premium_multiple: 2.5
   short_take_profit_pct: 0.60
@@ -118,7 +153,7 @@ strategy:
   daily_loss_limit_pct: 0.05
   exit_on_regime_flip: true   # the whole premise: hold the side dealers must take
   reenter_after_exit: true
-  max_entries_per_session: 3
+  max_entries_per_session: 3  # the end-of-day roll counts as one
 
 vol:
   # iv(K) = atm_iv + slope*ln(K/F) + curvature*ln(K/F)^2

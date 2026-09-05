@@ -17,27 +17,28 @@
 # With both off, a correctly delta-hedged straddle must break even. It will
 # not do so on any single run: an ATM straddle carries several times the
 # gamma of an out-of-the-money put, so rebalancing once per 5-minute bar
-# leaves a path-dependent residual. At this system's 2-5 DTE tenor the
-# position is carried past the close, and the backtest has no bars to
-# rebalance against overnight -- so a single run's residual now runs into
-# the high single digits or more of equity, well past the "a few percent"
-# a same-day-only position leaves. That residual is still discrete-time
-# hedging error (plus, overnight, real unhedged gap risk this backtest
-# cannot rebalance against), it has mean zero, and the intraday component
-# still shrinks when you hedge more often. Average across seeds before
-# concluding anything -- tests/test_backtest.py::TestCorrectness does
-# exactly that, and the README's "A single run does not measure the hedge"
-# has the numbers.
+# leaves a path-dependent residual. The position rolled into tomorrow's
+# series at 15:45 is carried past the close, and the backtest has no bars to
+# rebalance against overnight -- so part of a single run's residual is real
+# unhedged gap risk this backtest cannot rebalance against (the live runner
+# can, and does). It has mean zero either way, and the intraday component
+# shrinks when you hedge more often. Average across seeds before concluding
+# anything -- tests/test_backtest.py::TestCorrectness does exactly that, and
+# the README's "A single run does not measure the hedge" has the numbers.
+#
+# No event calendar here on purpose: the control should trade every session
+# the same way.
 
 risk_source: ES
 starting_equity: 250000.0
 
 hedge:
   target: 0.0
-  band: 10.0
+  band_model: whalley_wilmott
+  risk_aversion: 0.01
 
 sizing:
-  buying_power_pct: 0.15
+  buying_power_pct: 0.80
 
 costs:
   enabled: false

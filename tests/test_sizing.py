@@ -145,29 +145,46 @@ def _single_leg_worst_case(model, leg, t, future, es):
 class TestBuyingPower:
     def test_contracts_scale_with_the_allocation(self, es, span):
         quote = straddle(es)
-        small = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span)
-        big = size_straddles(
+        small = size_straddles(
             250_000, quote, F, SHORT, SizingConfig(buying_power_pct=0.30), es, span
         )
+        big = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span)
         assert big.contracts > small.contracts
 
-    def test_the_default_allocation_is_fifteen_percent(self):
-        assert SizingConfig().buying_power_pct == 0.15
+    def test_the_default_allocation_is_the_margin_limit_less_a_fifth(self):
+        """Everything up to the margin limit, with a 20% buffer left untouched."""
+        assert SizingConfig().buying_power_pct == 0.80
+
+    def test_a_fifth_of_equity_is_never_committed(self, es, span):
+        for direction in (LONG, SHORT):
+            result = size_straddles(
+                250_000, straddle(es), F, direction, SizingConfig(), es, span
+            )
+            assert result.budget <= 0.80 * 250_000 + 1e-6
+            assert result.total_margin <= 0.80 * 250_000
 
     def test_budget_is_equity_times_the_allocation(self, es, span):
         result = size_straddles(200_000, straddle(es), F, SHORT, SizingConfig(), es, span)
-        assert result.budget == pytest.approx(30_000.0)
+        assert result.budget == pytest.approx(160_000.0)
 
     def test_a_reserve_is_held_back_for_the_hedge(self, es, span):
         cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
         result = size_straddles(200_000, straddle(es), F, SHORT, cfg, es, span)
-        assert result.option_budget == pytest.approx(30_000.0 * 0.75)
+        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
 
     def test_the_reserve_applies_to_the_long_side_too(self, es, span):
         """The hedge leg needs margin whichever way the straddle is facing."""
         cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
         result = size_straddles(200_000, straddle(es), F, LONG, cfg, es, span)
-        assert result.option_budget == pytest.approx(30_000.0 * 0.75)
+        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
+
+    def test_the_default_cap_does_not_bind_at_an_ordinary_account_size(self, es, span):
+        """The count is decided by the budget; max_straddles is a backstop
+        against a sizing bug rather than a rule, so at a quarter-million
+        account it must not be what sets the size."""
+        result = size_straddles(250_000, straddle(es), F, SHORT, SizingConfig(), es, span)
+        assert result.ok and "capped" not in result.reason
+        assert result.contracts < SizingConfig().max_straddles
 
     @pytest.mark.parametrize("direction", [LONG, SHORT])
     def test_the_requirement_never_exceeds_the_budget(self, es, span, direction):
@@ -183,8 +200,8 @@ class TestBuyingPower:
         assert "buying power supports" in result.reason
 
     def test_the_reason_names_the_right_kind_of_requirement(self, es, span):
-        long_result = size_straddles(2_000, straddle(es), F, LONG, SizingConfig(), es, span)
-        short_result = size_straddles(2_000, straddle(es), F, SHORT, SizingConfig(), es, span)
+        long_result = size_straddles(500, straddle(es), F, LONG, SizingConfig(), es, span)
+        short_result = size_straddles(500, straddle(es), F, SHORT, SizingConfig(), es, span)
         assert "debit" in long_result.reason
         assert "margin" in short_result.reason
 

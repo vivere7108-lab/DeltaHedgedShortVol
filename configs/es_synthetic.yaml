@@ -15,17 +15,23 @@
 #
 # What it does establish is that both branches are exercised: the generated
 # call share swings across sessions, so a run of any length takes long and
-# short straddles rather than only one side.
+# short straddles rather than only one side. The 40-day window also crosses
+# the 2025-01-29 FOMC statement in configs/events.txt, so the event blackout
+# is exercised too.
 
 risk_source: ES
 starting_equity: 250000.0
 
 hedge:
   target: 0.0
-  band: 10.0
+  band_model: whalley_wilmott
+  risk_aversion: 0.01
 
 sizing:
-  buying_power_pct: 0.15
+  buying_power_pct: 0.80
+
+strategy:
+  events_path: configs/events.txt
 
 data:
   source: synthetic
