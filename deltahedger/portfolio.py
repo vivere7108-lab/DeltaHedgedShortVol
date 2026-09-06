@@ -193,15 +193,32 @@ class Portfolio:
             raise RuntimeError("a straddle position is already open")
         self.straddle = position
 
-    def close_straddle(self, call_price: float, put_price: float) -> float:
-        """Close both legs and realise the straddle's P&L."""
-        if self.straddle is None:
+    def close_straddle(
+        self, call_price: float, put_price: float, straddles: int | None = None
+    ) -> float:
+        """Close ``straddles`` of the position (all of it by default) and
+        realise their P&L.
+
+        A partial close leaves a smaller straddle on the book with the same
+        entry prices -- the legs that remain are the ones that were opened,
+        at what they were opened for.  The count is unsigned; the side is
+        the position's.
+        """
+        position = self.straddle
+        if position is None:
             return 0.0
-        pnl = self.straddle.unrealised(
-            call_price, put_price, self.source.option.multiplier
-        )
+        held = abs(position.quantity)
+        count = held if straddles is None else max(min(int(straddles), held), 0)
+        if count == 0:
+            return 0.0
+        pnl = position.direction * count * (
+            (call_price + put_price) - position.entry_premium
+        ) * self.source.option.multiplier
         self.option_realised += pnl
-        self.straddle = None
+        if count == held:
+            self.straddle = None
+        else:
+            position.quantity = position.direction * (held - count)
         return pnl
 
     def apply_hedge_fill(self, filled_qty: int, fill_price: float) -> float:

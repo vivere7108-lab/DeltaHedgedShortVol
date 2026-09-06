@@ -11,13 +11,17 @@ Differences from the backtest that are worth being explicit about:
   * bars are *polls*, not completed bars, so the strategy sees the market as
     of each poll rather than a settled OHLC;
   * fills come from the exchange and can be partial or missing entirely, so
-    the position is reconciled against IBKR on every cycle;
+    the position is reconciled against IBKR on every connection, and the
+    book is written to the journal's ``state.json`` after every decision so
+    a reconnection -- the daily gateway restart included -- re-adopts the
+    open straddle rather than refusing to start next to it;
   * the ATM implied vol comes from the live chain rather than a historical
     series;
-  * open interest is the exchange's, read through
-    ``IbkrOpenInterestProvider``, rather than generated.  A forward test
-    with a generated OI surface would be measuring the generator, so the
-    live path refuses to fall back to one;
+  * open interest is the exchange's -- intraday, off the MDP 3.0 feed
+    through the snapshot ``deltahedger mdp-feed`` writes (``data.mdp``), or
+    the previous session's close off IBKR's generic tick 101 -- rather
+    than generated.  A forward test with a generated OI surface would be
+    measuring the generator, so the live path refuses to fall back to one;
   * **the loop does not stop at the bell.**  The 0DTE position is rolled
     into tomorrow's series a quarter of an hour before settlement and that
     position is carried overnight, so the runner keeps polling while
@@ -40,11 +44,11 @@ from ..broker.ibkr import (
     IbkrChainProvider,
     IbkrConnection,
     IbkrExecution,
-    IbkrOpenInterestProvider,
     WhatIfMarginModel,
 )
 from ..config import Config
 from ..data.base import MarketBar
+from ..data.openinterest import build_live_open_interest_provider
 from ..sizing import build_margin_model
 from ..strategy import GexStraddleStrategy
 from .journal import JournallingStrategy, SessionJournal
@@ -65,6 +69,7 @@ class LiveRunner:
         self._driver = None
         self._cycles = 0
         self._stop = False
+        self._in_break = False
 
     def request_stop(self, *_: object) -> None:
         log.info("stop requested; finishing the current cycle")
@@ -155,7 +160,9 @@ class LiveRunner:
                 self.cfg,
                 self.source,
                 margin_model,
-                open_interest=IbkrOpenInterestProvider(conn, self.cfg),
+                open_interest=build_live_open_interest_provider(
+                    self.cfg, self.source, conn
+                ),
             )
             self.strategy = strategy
             driver = strategy
@@ -204,9 +211,8 @@ class LiveRunner:
         to keep polling to hedge it -- the widened overnight band is a
         *wider* band, not an absent hedger, and a gap through it is exactly
         what an unhedged straddle cannot survive.  When the book is flat
-        there is nothing outside the session worth waking up for: entries
-        are blocked by the entry window regardless, and the end-of-day
-        roll happens inside the session.
+        the only stretch outside the session worth waking up for is the
+        roll window after the bell, which ``_cycle`` checks separately.
         """
         book = self.strategy.portfolio if self.strategy else None
         if book is None:
@@ -231,7 +237,20 @@ class LiveRunner:
         """
         assert self.strategy is not None
         now = datetime.now(self.strategy.clock.tz)
-        if not self.strategy.clock.in_session(now) and not self._holding():
+        clock = self.strategy.clock
+        if clock.in_maintenance_break(now):
+            # The future is halted: no quote to mark against and nothing to
+            # hedge with. Polling would only fill the log with failures.
+            if not self._in_break:
+                log.info("CME maintenance break at %s; idling until it ends", now)
+                self._in_break = True
+            return
+        self._in_break = False
+        if (
+            not clock.in_session(now)
+            and not self._holding()
+            and not self.strategy._in_roll_window(now)
+        ):
             log.debug("outside the session at %s and flat; idling", now)
             return
 
@@ -302,11 +321,74 @@ class LiveRunner:
 
         Starting a live session with a stale in-memory book is how a hedger
         ends up doubling a position, so the runner trusts the broker, not
-        itself.
+        itself.  The broker knows *which* contracts are open; only the
+        journal's ``state.json`` knows what they were opened for -- entry
+        prices, the regime, the hedge P&L against them so far, the
+        session's loss-limit baseline -- so the two are read together:
+
+        * an option position that matches the recorded straddle leg for
+          leg (expiry, strike, right, signed size) is re-adopted with its
+          record.  This is the rolled position after the daily gateway
+          restart, and refusing it would leave that position unhedged in a
+          reconnect loop every night;
+        * an option position with no matching record is refused, as before.
+          Adopting a half-known straddle is how a book ends up long gamma
+          while the strategy believes it is short it;
+        * a record with no matching broker position is discarded, with a
+          warning: the broker is the truth about what is open;
+        * the hedge leg is always taken from the broker, at the broker's
+          average cost.
         """
         assert self.strategy is not None
+        now = datetime.now(self.strategy.clock.tz)
         positions = conn.ib.positions(conn.account)
         hedge_symbol = self.source.hedge.symbol
+        option_symbol = self.source.option.symbol
+        state = self.journal.read_state() if self.journal is not None else None
+        recorded = (state or {}).get("straddle")
+
+        legs = [
+            p for p in positions
+            if p.contract.secType == "FOP"
+            and p.contract.symbol == option_symbol
+            and int(p.position) != 0
+        ]
+        if legs:
+            problem = _match_legs(recorded, legs)
+            if problem:
+                for p in legs:
+                    log.error(
+                        "an existing %s option position is open (%+d %s %g%s)",
+                        p.contract.symbol, int(p.position),
+                        p.contract.lastTradeDateOrContractMonth,
+                        p.contract.strike, p.contract.right,
+                    )
+                log.error(
+                    "%s. This runner adopts only a straddle its own journal "
+                    "describes leg for leg -- close the position or restart once "
+                    "flat. Adopting a half-known straddle is how a book ends up "
+                    "long gamma while the strategy believes it is short it.",
+                    problem,
+                )
+                raise RuntimeError("refusing to start with an unmanaged option position")
+            self.strategy.restore(state, now, adopt_straddle=True)
+            book = self.strategy.portfolio.straddle
+            log.warning(
+                "re-adopted the open straddle from the journal: %+d %s %g straddle "
+                "opened %s in the %s regime",
+                book.quantity, book.expiry, book.strike,
+                book.entry_time.strftime("%Y-%m-%d %H:%M"), book.regime,
+            )
+        elif state is not None:
+            if recorded:
+                log.warning(
+                    "the journal records an open %+d %s %g straddle but the broker "
+                    "reports no option position; the broker is the truth and the "
+                    "record is discarded",
+                    recorded["quantity"], recorded["expiry"], recorded["strike"],
+                )
+            self.strategy.restore(state, now, adopt_straddle=False)
+
         adopted = 0
         for position in positions:
             contract = position.contract
@@ -321,19 +403,38 @@ class LiveRunner:
                     self.strategy.portfolio.hedge.quantity, hedge_symbol,
                     self.strategy.portfolio.hedge.avg_price,
                 )
-            elif contract.secType == "FOP" and contract.symbol == self.source.option.symbol:
-                log.error(
-                    "an existing %s option position is open (%+d %s %g%s). This "
-                    "runner will not adopt option legs it did not open -- close it "
-                    "or restart once flat. Adopting a half-known straddle is how a "
-                    "book ends up long gamma while the strategy believes it is "
-                    "short it.",
-                    contract.symbol, int(position.position),
-                    contract.lastTradeDateOrContractMonth, contract.strike, contract.right,
-                )
-                raise RuntimeError("refusing to start with an unmanaged option position")
-        if not adopted:
+        if not legs and not adopted:
             log.info("no existing positions to adopt")
+        if self._driver is not None and hasattr(self._driver, "save_state"):
+            self._driver.save_state()
+
+
+def _match_legs(recorded: dict | None, legs: list) -> str:
+    """Why the broker's option legs are not the recorded straddle, or ``""``.
+
+    A match is exactly two legs -- one call, one put -- on the recorded
+    expiry and strike, each held in the recorded signed size.
+    """
+    if not recorded:
+        return "the journal records no open straddle"
+    if len(legs) != 2:
+        return f"the broker reports {len(legs)} option leg(s), a straddle has two"
+    expiry = str(recorded["expiry"]).replace("-", "")
+    strike = float(recorded["strike"])
+    quantity = int(recorded["quantity"])
+    rights = set()
+    for p in legs:
+        c = p.contract
+        if str(c.lastTradeDateOrContractMonth)[:8] != expiry:
+            return f"leg {c.lastTradeDateOrContractMonth} is not on the recorded expiry {expiry}"
+        if abs(float(c.strike) - strike) > 1e-6:
+            return f"leg strike {float(c.strike):g} is not the recorded {strike:g}"
+        if int(p.position) != quantity:
+            return f"leg size {int(p.position):+d} is not the recorded {quantity:+d}"
+        rights.add(str(c.right).upper()[:1])
+    if rights != {"C", "P"}:
+        return "the two legs are not one call and one put"
+    return ""
 
 
 def run_live(cfg: Config, dry_run: bool = False, max_cycles: int | None = None):

@@ -136,6 +136,8 @@ class SessionClock:
         self.expiry_time = _hhmm(source.option_expiry_time)
         self.open_time = _hhmm(source.session_open)
         self.close_time = _hhmm(source.session_close)
+        self.break_start = _hhmm(source.maintenance_break[0])
+        self.break_end = _hhmm(source.maintenance_break[1])
 
     def localize(self, moment: datetime) -> datetime:
         """Interpret a naive timestamp as exchange-local; convert an aware one."""
@@ -252,6 +254,17 @@ class SessionClock:
             is_trading_day(now.date())
             and self.open_time <= now.time() <= self.close_time
         )
+
+    def in_maintenance_break(self, moment: datetime) -> bool:
+        """Whether the future's daily maintenance halt contains ``moment``.
+
+        Nothing trades in it, so nothing can be hedged in it -- and nothing
+        needs to be, because nothing can move.  It is also the one hour a
+        day in which a restart of the gateway or the runner costs the book
+        nothing, which is why the deployment schedules both there.
+        """
+        now = self.localize(moment)
+        return self.break_start <= now.time() < self.break_end
 
     def local_time(self, moment: datetime) -> time:
         return self.localize(moment).time()

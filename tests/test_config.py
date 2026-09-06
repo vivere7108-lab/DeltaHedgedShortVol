@@ -47,10 +47,12 @@ class TestDefaults:
         assert strategy.event_blackout_minutes_after == 15
         assert strategy.events == [] and strategy.events_path is None
 
-    def test_all_four_gates_are_on_by_default(self):
+    def test_the_default_gates(self):
         gates = Config().gates
         assert gates.confidence and gates.flip_distance
-        assert gates.ensemble and gates.persistence and gates.entry_window
+        assert gates.persistence and gates.entry_window
+        # The ensemble is off until a forward walk says it should be on.
+        assert not gates.ensemble
 
     def test_the_overnight_band_widens_by_default(self):
         assert Config().hedge.overnight_band_multiplier > 1.0
@@ -197,9 +199,15 @@ class TestValidation:
         with pytest.raises(ValueError, match="min_confidence_ratio"):
             GatesConfig(min_confidence_ratio=1.0).validate()
 
-    def test_rejects_a_persistence_window_below_one_bar(self):
-        with pytest.raises(ValueError, match="persistence_bars"):
-            GatesConfig(persistence_bars=0).validate()
+    def test_rejects_a_negative_persistence_window(self):
+        with pytest.raises(ValueError, match="persistence_seconds"):
+            GatesConfig(persistence_seconds=-1.0).validate()
+
+    def test_the_old_bar_count_key_is_refused_with_a_hint(self, tmp_path):
+        path = tmp_path / "gates.yaml"
+        path.write_text(yaml.safe_dump({"gates": {"persistence_bars": 3}}))
+        with pytest.raises(ValueError, match="persistence_seconds"):
+            Config.from_yaml(path)
 
     def test_the_ensemble_must_include_the_traded_surface(self):
         with pytest.raises(ValueError, match="ensemble_skew_slope_deltas"):
@@ -207,9 +215,9 @@ class TestValidation:
 
     def test_a_gates_section_round_trips_through_yaml(self, tmp_path):
         path = tmp_path / "gates.yaml"
-        path.write_text(yaml.safe_dump({"gates": {"persistence_bars": 5}}))
+        path.write_text(yaml.safe_dump({"gates": {"persistence_seconds": 300}}))
         cfg = Config.from_yaml(path)
-        assert cfg.gates.persistence_bars == 5
+        assert cfg.gates.persistence_seconds == 300
 
     def test_rejects_a_session_entry_cap_below_one(self):
         with pytest.raises(ValueError, match="max_entries_per_session"):

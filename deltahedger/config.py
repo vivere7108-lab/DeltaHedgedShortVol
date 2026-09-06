@@ -317,10 +317,14 @@ class GatesConfig:
        both perturbed inputs are assumptions the README flags as
        load-bearing, and a regime that reverses under a plausible variation
        of either was never a reading of the market.
-    4. **persistence** -- a regime must hold ``persistence_bars``
-       consecutive bars before it is acted on.  Open interest does not move
-       intraday, so a regime that flickers bar to bar is spot crossing a
-       level rather than positioning changing, and trading it churns.
+    4. **persistence** -- a regime must hold for ``persistence_seconds``
+       of wall-clock time before it is acted on.  Open interest does not
+       move intraday, so a regime that flickers bar to bar is spot crossing
+       a level rather than positioning changing, and trading it churns.
+       The window is in seconds rather than bars because the backtest sees
+       a bar every five minutes and the live runner one every few seconds;
+       a bar count would make the same config mean fifteen minutes in one
+       and fifteen seconds in the other.
 
     Exits on the hard rules -- the DTE floor, the stops, the daily loss
     limit -- are never gated.  A gate can stop the system taking a position
@@ -332,8 +336,10 @@ class GatesConfig:
     min_confidence_ratio: float = 0.15
     #: (2) the fixed distance-to-flip test.
     flip_distance: bool = True
-    #: (3) unanimity across perturbed models.
-    ensemble: bool = True
+    #: (3) unanimity across perturbed models. Off by default: on the
+    #: generated data it never earned its keep, and a forward walk without
+    #: it is the evidence that would say whether it should be on.
+    ensemble: bool = False
     #: Added to ``vol.skew_slope`` to make the ensemble members. The base
     #: surface must be in here (a 0.0 delta) or the ensemble is testing a
     #: model the system does not trade.
@@ -349,9 +355,12 @@ class GatesConfig:
     ensemble_sign_conventions: list[list[float]] = field(
         default_factory=lambda: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
     )
-    #: (4) consecutive bars a regime must hold before it is acted on.
+    #: (4) how long, in seconds of wall-clock time, a regime must have been
+    #: read continuously before it is acted on. Measured from the first bar
+    #: of the streak, so on 5-minute bars 600 confirms on the third bar and
+    #: on a 5-second live poll it takes the same ten minutes.
     persistence: bool = True
-    persistence_bars: int = 3
+    persistence_seconds: float = 600.0
     #: The entry window, ``strategy.entry_time`` to
     #: ``strategy.entry_cutoff_time``. Off means entries may be taken at any
     #: point in the session; the times themselves live in StrategyConfig
@@ -361,8 +370,8 @@ class GatesConfig:
     def validate(self) -> None:
         if not 0.0 <= self.min_confidence_ratio < 1.0:
             raise ValueError("gates.min_confidence_ratio must be in [0, 1)")
-        if self.persistence_bars < 1:
-            raise ValueError("gates.persistence_bars must be >= 1")
+        if self.persistence_seconds < 0.0:
+            raise ValueError("gates.persistence_seconds must be >= 0")
         if not self.ensemble_skew_slope_deltas:
             raise ValueError("gates.ensemble_skew_slope_deltas must not be empty")
         if 0.0 not in [float(d) for d in self.ensemble_skew_slope_deltas]:
@@ -400,9 +409,13 @@ class StrategyConfig:
     * ``close_before_expiry_minutes`` before settlement it is closed, whatever
       it is worth -- the last minutes of an expiring straddle's life are
       where its gamma diverges and the hedger cannot keep up;
-    * at that moment the next session's series (1DTE) may be opened in its
-      place and carried overnight, becoming the 0DTE position the next
-      morning (``roll_at_expiry``);
+    * the book then sits out until today's series has settled.  Inside the
+      ``roll_window_minutes`` after settlement the next session's series
+      (1DTE) may be opened and carried overnight, becoming the 0DTE position
+      the next morning (``roll_at_expiry``).  Waiting for the bell rather
+      than rolling inside the buffer is what keeps the expiring book out of
+      the read that picks the overnight side: at 15:45 the 0DTE gamma is
+      seven times tomorrow's per contract and about to stop existing;
     * unless the next session is across a weekend or a holiday, in which
       case nothing is opened and the book is flat over the gap
       (``hold_over_weekends``);
@@ -448,14 +461,18 @@ class StrategyConfig:
     #: of an ATM straddle is where its gamma diverges. The same buffer
     #: decides which series is *entered* -- one inside it is never opened.
     close_before_expiry_minutes: int = 15
-    #: When today's series is closed at the buffer, allow the next session's
-    #: series to be opened in its place -- outside the entry window, but
-    #: still subject to every GEX gate, the weekend rule and the event
-    #: blackout. Off means nothing is opened inside the buffer, so with the
-    #: entry-window gate on the book is flat from the buffer to the next
-    #: morning's window (with the gate off, an entry after the bell is what
-    #: the config asked for).
+    #: Once today's series has settled, allow the next session's series to
+    #: be opened in its place -- outside the entry window, but still subject
+    #: to every GEX gate, the weekend rule and the event blackout. Nothing
+    #: is ever opened inside the pre-settlement buffer itself. Off means the
+    #: book is flat from the buffer to the next morning's window (with the
+    #: entry-window gate off, an entry after the bell is what the config
+    #: asked for).
     roll_at_expiry: bool = True
+    #: How long after today's settlement the roll may happen, in minutes.
+    #: The window has to close before the CME maintenance break at 17:00
+    #: exchange time, when there is nothing to trade against.
+    roll_window_minutes: int = 45
     #: Carry a position across a weekend or an exchange holiday. Off (the
     #: default) means a series on the far side of any calendar gap is never
     #: entered, and a position already on one is closed at the buffer on
@@ -524,6 +541,8 @@ class StrategyConfig:
             raise ValueError("strategy.entry_cutoff_time is before entry_time")
         if self.max_entries_per_session < 1:
             raise ValueError("strategy.max_entries_per_session must be >= 1")
+        if self.roll_window_minutes < 0:
+            raise ValueError("strategy.roll_window_minutes must be >= 0")
         if self.event_blackout_minutes_before < 0 or self.event_blackout_minutes_after < 0:
             raise ValueError("strategy.event_blackout_minutes_* must be >= 0")
         if not isinstance(self.events, list):
@@ -599,13 +618,22 @@ class DataConfig:
     default_atm_iv: float = 0.15
 
     # -- open interest, which is what GEX is computed from ---------------
-    #: "synthetic" | "csv" | "ibkr". The bar source and the open-interest
-    #: source are separate on purpose: real ES bars with modelled OI is a
-    #: legitimate study, and pretending otherwise would hide which half of
-    #: the result is assumed.
+    #: "synthetic" | "csv" | "mdp" | "ibkr". The bar source and the
+    #: open-interest source are separate on purpose: real ES bars with
+    #: modelled OI is a legitimate study, and pretending otherwise would
+    #: hide which half of the result is assumed. ``mdp`` is the exchange's
+    #: intraday open interest off the MDP 3.0 feed, through the snapshot
+    #: ``deltahedger mdp-feed`` writes; ``ibkr`` is the previous session's
+    #: close off generic tick 101, which is not a 0DTE input.
     open_interest: str = "synthetic"
     #: CSV open interest: a file with date,strike,call_oi,put_oi.
     oi_csv_path: str | None = None
+    #: MDP open interest: the snapshot file the feed process writes and the
+    #: strategy reads (see ``data/mdp.py`` for the format).
+    oi_mdp_path: str | None = None
+    #: MDP open interest: a snapshot older than this, in seconds, is not
+    #: served -- the strategy stands aside rather than read a stale book.
+    oi_max_age_seconds: float = 1800.0
     #: Synthetic OI: total contracts spread across the surface.
     oi_total_contracts: float = 40_000.0
     #: Synthetic OI: Gaussian width of the strike distribution, as a
@@ -744,8 +772,14 @@ class Config:
             known = {f.name: f for f in fields(dc_type)}
             unknown = set(values) - set(known)
             if unknown:
+                hint = ""
+                if "persistence_bars" in unknown:
+                    hint = (
+                        " (persistence_bars was replaced by persistence_seconds: "
+                        "the gate is a wall-clock window, not a bar count)"
+                    )
                 raise ValueError(
-                    f"unknown {dc_type.__name__} keys: {', '.join(sorted(unknown))}"
+                    f"unknown {dc_type.__name__} keys: {', '.join(sorted(unknown))}{hint}"
                 )
             return dc_type(**{k: build(known[k].type, v) for k, v in values.items()})
 

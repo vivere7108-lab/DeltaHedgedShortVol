@@ -143,7 +143,8 @@ class TestEndToEnd:
     def test_todays_position_is_closed_at_the_buffer_and_rolled(self):
         """Every session ends the same way: an exit '15m to expiry' on the
         15:45 bar, and -- when the read allows and tomorrow is a session --
-        an entry into the 1DTE series inside the roll window, never before."""
+        an entry into the 1DTE series once today's has settled, at the
+        16:00 bar, never inside the buffer."""
         result = run_backtest(unlimited(synthetic(days=10)))
         events = result.events
         exits = events[(events["kind"] == "exit") & events["detail"].str.contains("to expiry")]
@@ -151,8 +152,8 @@ class TestEndToEnd:
         assert all(ts.time().isoformat() == "15:45:00" for ts in exits["timestamp"])
         rolls = events[(events["kind"] == "entry") & events["detail"].str.contains("1DTE")]
         assert not rolls.empty
-        assert all(ts.time() >= time(15, 45) for ts in rolls["timestamp"])
-        assert (rolls["timestamp"].dt.time == time(15, 45)).any()
+        assert all(ts.time() >= time(16, 0) for ts in rolls["timestamp"])
+        assert (rolls["timestamp"].dt.time == time(16, 0)).any()
 
     def test_no_position_is_carried_over_a_weekend(self):
         """The generated run starts on Thursday 2025-01-02: the Friday
@@ -437,7 +438,13 @@ class TestHedgeBehaviour:
             lambda column: column.abs().mean()
         )
         assert len(errors) == 2
-        assert errors.max() - errors.min() < 1.0
+        # The same band applied to both sides, and on both sides the
+        # residual sits inside what the contract size allows: mean |error|
+        # under half a hedge contract. (The two means themselves differ
+        # with which bars each side happened to hold -- a small book's
+        # residual is set by the contract, not the branch.)
+        assert result.metrics.band_half_width_long == result.metrics.band_half_width_short == 10.0
+        assert (errors <= result.metrics.hedge_quantum / 2.0).all()
 
     def test_the_band_widens_with_the_gamma_of_the_book(self):
         """The Whalley-Wilmott property, end to end: a book with more gamma

@@ -36,9 +36,10 @@ exits -- nothing in the gate machinery can delay any of them:
   * ``close_before_expiry_minutes`` before settlement the 0DTE position is
     closed: the last quarter hour is where an ATM straddle's gamma diverges
     and the hedger cannot keep up;
-  * in that same window the *next* session's series is eligible to be
-    opened (``roll_at_expiry``), outside the entry window but through every
-    GEX gate, and carried overnight to become tomorrow's 0DTE position --
+  * once today's series has settled, in the ``roll_window_minutes`` after
+    the bell, the *next* session's series is eligible to be opened
+    (``roll_at_expiry``), outside the entry window but through every GEX
+    gate, and carried overnight to become tomorrow's 0DTE position --
     so ``_roll_session`` re-marks the book at the new day's first price
     rather than assuming it starts flat, and the hedge band is
     session-aware;
@@ -77,10 +78,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from .broker.base import ExecutionHandler, Fill
-from .chain import StraddleQuote, TenorPolicy, price_option, select_expiry, select_atm_straddle
+from .chain import (
+    OptionQuote,
+    StraddleQuote,
+    TenorPolicy,
+    price_option,
+    select_atm_straddle,
+    select_expiry,
+)
 from .config import Config
 from .data.base import MarketBar
 from .events import EventCalendar
@@ -226,6 +234,7 @@ class GexStraddleStrategy:
         self.regime_trades: dict[str, int] = {}
 
         self._last_hedge_time: datetime | None = None
+        self._last_moment: datetime | None = None
         self._session_date: date | None = None
         self._session_start_equity = cfg.starting_equity
         self._entries_this_session = 0
@@ -240,25 +249,29 @@ class GexStraddleStrategy:
         #: The books the last profile was built from, kept so the ensemble
         #: gate can re-price the same input without re-reading it.
         self._books: list[ExpiryBook] = []
-        #: The persistence streak: the regime the last few bars have read,
-        #: and how many in a row. ``_confirmed_regime`` is the one the
+        #: The persistence streak: the regime the recent bars have read,
+        #: when that streak began, and how many bars it has run for (the
+        #: count is for the log). ``_confirmed_regime`` is the one the
         #: strategy is allowed to act on.
         self._streak_regime: str = ""
+        self._streak_started: datetime | None = None
         self._streak_bars: int = 0
         self._confirmed_regime: str = NEUTRAL
         # Baselines for measuring one position's P&L, set at each entry.
         self._hedge_realised_at_entry = 0.0
+        self._option_realised_at_entry = 0.0
         self._fees_at_entry = 0.0
 
     # -- main loop ------------------------------------------------------
 
     def on_bar(self, bar: MarketBar, execution: ExecutionHandler) -> BarState:
         moment = self.clock.localize(bar.timestamp)
-        self._roll_session(moment, bar.close)
+        self._last_moment = moment
+        self._roll_session(moment, bar.close, bar.atm_iv)
 
         quote = self._mark_open_straddle(bar, moment)
         profile = self._read_gex(bar, moment)
-        self._update_persistence(profile)
+        self._update_persistence(profile, moment)
 
         self._check_exits(bar, moment, quote, profile, execution)
 
@@ -274,13 +287,18 @@ class GexStraddleStrategy:
 
     # -- session bookkeeping --------------------------------------------
 
-    def _roll_session(self, moment: datetime, future_price: float) -> None:
+    def _roll_session(
+        self, moment: datetime, future_price: float, atm_iv: float
+    ) -> None:
         """Reset per-session state at the first bar of a new trading day.
 
-        The session's opening equity has to be marked at a real price: a
-        hedge carried overnight (``flatten_hedge_on_exit: false``) would be
-        valued against zero otherwise, and the daily loss limit would fire
-        on the first bar of every day.
+        The session's opening equity has to be marked at a real price *and*
+        a real vol.  A hedge carried overnight would be valued against zero
+        without the price; a rolled straddle marked at a default vol rather
+        than the market's would start the day with a phantom gain or loss
+        the size of the vol gap -- tens of thousands of dollars on a book
+        sized to the margin limit -- and the daily loss limit would fire
+        (or fail to fire) on the first bar for a move that never happened.
         """
         day = moment.date()
         if day == self._session_date:
@@ -290,7 +308,7 @@ class GexStraddleStrategy:
         if self.portfolio.straddle is not None:
             quote = self._mark_open_straddle(
                 MarketBar(moment, future_price, future_price, future_price,
-                          future_price, self.cfg.data.default_atm_iv),
+                          future_price, atm_iv),
                 moment,
             )
         self._session_start_equity = self.portfolio.equity(quote, future_price)
@@ -349,7 +367,22 @@ class GexStraddleStrategy:
         return self.clock.seconds_to_expiry(moment, today) <= self.tenor.buffer_seconds
 
     def _in_roll_window(self, moment: datetime) -> bool:
-        return self.cfg.strategy.roll_at_expiry and self._in_buffer(moment)
+        """Whether ``moment`` is inside the post-settlement roll window.
+
+        The window opens when today's series settles and runs for
+        ``roll_window_minutes``.  It is the one stretch outside the entry
+        window in which a series may be opened, because the book was taken
+        off at the buffer and this is the first moment the read is built on
+        tomorrow's book alone.
+        """
+        if not self.cfg.strategy.roll_at_expiry:
+            return False
+        day = moment.date()
+        if not is_trading_day(day):
+            return False
+        settled = self.clock.expiry_datetime(day)
+        window_end = settled + timedelta(minutes=self.cfg.strategy.roll_window_minutes)
+        return settled <= moment <= window_end
 
     def _classification_expiries(self, moment: datetime) -> list[date]:
         """The series the GEX read is built from.
@@ -384,7 +417,20 @@ class GexStraddleStrategy:
         listed = self.clock.candidate_expiries(
             moment, max(self.clock.days_to_expiry(moment, traded), 0)
         )
-        expiries = [e for e in listed if e <= traded]
+        # A series inside its own pre-settlement buffer is dropped unless it
+        # is the one the book is on: its gamma is a spike that stops existing
+        # within the quarter hour, and it says nothing about what dealers
+        # will be hedging once the bell has gone -- which is the question
+        # the read has to answer for a position that is about to be carried
+        # overnight. Keeping it would let the expiring leg outweigh
+        # tomorrow's seven to one and set the overnight side.
+        expiries = [
+            e for e in listed
+            if e <= traded and (
+                e == traded
+                or self.clock.seconds_to_expiry(moment, e) > self.tenor.buffer_seconds
+            )
+        ]
         if traded not in expiries:
             expiries.append(traded)
         return sorted(expiries)[: self.cfg.gex.blend_max_expiries]
@@ -453,8 +499,16 @@ class GexStraddleStrategy:
 
     # -- persistence -----------------------------------------------------
 
-    def _update_persistence(self, profile: GexProfile | None) -> None:
+    def _update_persistence(
+        self, profile: GexProfile | None, moment: datetime
+    ) -> None:
         """Advance the streak, and confirm a regime once it has held.
+
+        The window is wall-clock time from the first bar of the streak, not
+        a bar count: the backtest offers a bar every five minutes and the
+        live runner one every few seconds, and a count would make the same
+        setting mean fifteen minutes in one and fifteen seconds in the
+        other -- on exactly the gate that exists to stop churn.
 
         Without the gate the confirmed regime is simply the current one, so
         every downstream check reads the same field whether or not
@@ -466,20 +520,30 @@ class GexStraddleStrategy:
         it.
         """
         if profile is None:
-            self._streak_regime, self._streak_bars = "", 0
+            self._streak_regime, self._streak_started, self._streak_bars = "", None, 0
             self._confirmed_regime = NEUTRAL
             return
         if not self.cfg.gates.persistence:
-            self._streak_regime, self._streak_bars = profile.regime, 1
+            self._streak_regime, self._streak_started, self._streak_bars = (
+                profile.regime, moment, 1
+            )
             self._confirmed_regime = profile.regime
             return
 
-        if profile.regime == self._streak_regime:
+        if profile.regime == self._streak_regime and self._streak_started is not None:
             self._streak_bars += 1
         else:
-            self._streak_regime, self._streak_bars = profile.regime, 1
-        if self._streak_bars >= self.cfg.gates.persistence_bars:
+            self._streak_regime, self._streak_started, self._streak_bars = (
+                profile.regime, moment, 1
+            )
+        if self._streak_seconds(moment) >= self.cfg.gates.persistence_seconds:
             self._confirmed_regime = profile.regime
+
+    def _streak_seconds(self, moment: datetime) -> float:
+        """How long the current regime has been read, in seconds."""
+        if self._streak_started is None:
+            return 0.0
+        return max((moment - self._streak_started).total_seconds(), 0.0)
 
     def _confirmed_direction(self) -> int:
         """The side the confirmed regime implies, 0 for none."""
@@ -533,9 +597,9 @@ class GexStraddleStrategy:
         # The entry window is checked here rather than in the bar loop, so
         # the backtest and the live runner cannot disagree about which bars
         # are eligible. The end-of-day roll is the one exemption: inside
-        # today's pre-settlement buffer the next series may be opened
-        # whatever the window says, because that is the only moment it can
-        # be. Exits are never windowed.
+        # the window after today's settlement the next series may be opened
+        # whatever the entry window says, because that is the only moment it
+        # can be. Exits are never windowed.
         local = moment.timetz().replace(tzinfo=None)
         in_window = cfg.entry_time <= local <= cfg.entry_cutoff_time
         if self.cfg.gates.entry_window and not in_window and not self._in_roll_window(moment):
@@ -560,15 +624,20 @@ class GexStraddleStrategy:
             self._record_no_expiry(moment)
             return
 
-        # With the roll off, nothing is opened inside today's buffer even
-        # when the entry window would allow it: the book stays flat from
-        # the buffer to the next session's window.
-        if not cfg.roll_at_expiry and self._in_buffer(moment) and expiry != moment.date():
+        # Nothing is opened inside today's pre-settlement buffer, whatever
+        # the entry window says. Today's series is settling and tomorrow's
+        # waits for the bell: the roll happens in the window after it, on a
+        # read built from the book that will still exist tonight.
+        if self._in_buffer(moment) and expiry != moment.date():
             self._record(
                 moment, "entry_skipped",
                 f"inside today's {cfg.close_before_expiry_minutes}m pre-settlement "
-                "buffer and roll_at_expiry is off; nothing is opened until the "
-                "next session",
+                "buffer; " + (
+                    f"the {expiry} series is opened once today's has settled"
+                    if cfg.roll_at_expiry else
+                    "roll_at_expiry is off, so nothing is opened until the next "
+                    "session"
+                ),
             )
             return
 
@@ -600,9 +669,11 @@ class GexStraddleStrategy:
         if direction == 0 or direction != profile.direction:
             self._record(
                 moment, "entry_skipped",
-                f"the {profile.regime} read has held {self._streak_bars} of the "
-                f"{self.cfg.gates.persistence_bars} bars it needs before it "
-                "counts as the regime rather than as spot crossing a level",
+                f"the {profile.regime} read has held for "
+                f"{self._streak_seconds(moment) / 60:.1f} of the "
+                f"{self.cfg.gates.persistence_seconds / 60:.1f} minutes it needs "
+                f"({self._streak_bars} bars) before it counts as the regime "
+                "rather than as spot crossing a level",
                 regime=profile.regime, gate=GATE_PERSISTENCE,
             )
             return
@@ -639,14 +710,22 @@ class GexStraddleStrategy:
             self._record(moment, "entry_skipped", sizing.reason, regime=profile.regime)
             return
 
-        quantity = direction * sizing.contracts
-        fills = self._open_legs(quote, quantity, moment, execution)
-        if fills is None:
-            return
-        call_fill, put_fill = fills
+        # Baselines are taken before the legs are sent, so the entry's own
+        # fees and any unwind of a mismatched leg count against the position
+        # they belong to.
+        hedge_realised_before = self.portfolio.hedge_realised
+        option_realised_before = self.portfolio.option_realised
+        fees_before = self.portfolio.fees_paid
 
-        self._hedge_realised_at_entry = self.portfolio.hedge_realised
-        self._fees_at_entry = self.portfolio.fees_paid - call_fill.fees - put_fill.fees
+        wanted = direction * sizing.contracts
+        opened = self._open_legs(quote, wanted, moment, execution)
+        if opened is None:
+            return
+        call_fill, put_fill, quantity = opened
+
+        self._hedge_realised_at_entry = hedge_realised_before
+        self._option_realised_at_entry = option_realised_before
+        self._fees_at_entry = fees_before
         self.portfolio.open_straddle(
             StraddlePosition(
                 strike=quote.strike,
@@ -667,9 +746,13 @@ class GexStraddleStrategy:
         side = "bought" if direction > 0 else "sold"
         cash = abs(quantity) * (call_fill.price + put_fill.price) * self.source.option.multiplier
         intent = "scalp gamma" if direction > 0 else "collect theta"
+        partial = (
+            f" (asked for {sizing.contracts}; the legs filled short)"
+            if abs(quantity) != sizing.contracts else ""
+        )
         self._record(
             moment, "entry",
-            f"{side} {sizing.contracts} {expiry} ({days_left}DTE) "
+            f"{side} {abs(quantity)}{partial} {expiry} ({days_left}DTE) "
             f"{quote.strike:g} straddle "
             f"@ {call_fill.price + put_fill.price:.2f} "
             f"(C {call_fill.price:.2f} / P {put_fill.price:.2f}, IV {quote.iv:.3f}) "
@@ -713,30 +796,46 @@ class GexStraddleStrategy:
     def _open_legs(
         self, quote: StraddleQuote, quantity: int, moment: datetime,
         execution: ExecutionHandler,
-    ) -> tuple[Fill, Fill] | None:
-        """Fill both legs, or leave the book flat.
+    ) -> tuple[Fill, Fill, int] | None:
+        """Fill both legs at a matched size, or leave the book flat.
 
         A straddle with one leg on is a naked option, not a straddle -- it
         carries the wrong sign of delta and none of the gamma exposure the
         regime called for.  If the second leg does not fill, the first is
-        unwound immediately rather than held.  In the backtest this cannot
+        unwound immediately rather than held.  If the two legs fill at
+        *different* sizes -- a partial on one of them -- the excess on the
+        larger leg is unwound and the position is booked at the matched
+        size, because the book can only ever describe matched straddles
+        and booking the requested size would hedge and later close a
+        position that does not exist.  In the backtest none of this can
         happen; in live it can, which is the case worth writing for.
+
+        Returns the two fills and the signed quantity actually on.
         """
         call_fill = execution.execute_option(quote.call, quantity, moment)
-        if call_fill is None:
+        if call_fill is None or call_fill.quantity == 0:
             self._record(moment, "entry_failed", "the call leg did not fill")
             return None
         self.fills.append(call_fill)
         self.portfolio.charge_fees(call_fill.fees)
 
         put_fill = execution.execute_option(quote.put, quantity, moment)
-        if put_fill is not None:
+        if put_fill is not None and put_fill.quantity != 0:
             self.fills.append(put_fill)
             self.portfolio.charge_fees(put_fill.fees)
-            return call_fill, put_fill
+            matched = min(abs(call_fill.quantity), abs(put_fill.quantity))
+            direction = 1 if quantity > 0 else -1
+            for leg, fill in (("call", call_fill), ("put", put_fill)):
+                excess = abs(fill.quantity) - matched
+                if excess:
+                    self._unwind_excess(
+                        quote.call if leg == "call" else quote.put, leg,
+                        direction * excess, fill.price, moment, execution,
+                    )
+            return call_fill, put_fill, direction * matched
 
         unwind = execution.execute_option(quote.call, -call_fill.quantity, moment)
-        if unwind is None:
+        if unwind is None or unwind.quantity == 0:
             self._record(
                 moment, "entry_failed",
                 f"the put leg did not fill and the {call_fill.quantity:+d} call leg "
@@ -756,6 +855,37 @@ class GexStraddleStrategy:
         )
         return None
 
+    def _unwind_excess(
+        self, leg_quote: OptionQuote, leg: str, held: int, held_price: float,
+        moment: datetime, execution: ExecutionHandler,
+    ) -> None:
+        """Trade away ``held`` contracts of one leg that have no partner.
+
+        ``held`` is signed the way the excess is held (positive long).  The
+        round trip's P&L is realised on the option leg; a failure is
+        recorded loudly, because the book then carries a naked option the
+        portfolio cannot see.
+        """
+        fill = execution.execute_option(leg_quote, -held, moment)
+        if fill is None or fill.quantity == 0:
+            self._record(
+                moment, "entry_failed",
+                f"the legs filled at different sizes and the {held:+d} excess "
+                f"{leg} contracts could not be unwound -- the book is holding a "
+                "naked option and needs manual attention",
+            )
+            return
+        self.fills.append(fill)
+        self.portfolio.charge_fees(fill.fees)
+        self.portfolio.option_realised += (
+            held * (fill.price - held_price) * self.source.option.multiplier
+        )
+        self._record(
+            moment, "entry_trimmed",
+            f"the legs filled at different sizes; unwound the {held:+d} excess "
+            f"{leg} contracts @ {fill.price:.2f}",
+        )
+
     # -- exits -------------------------------------------------------------
 
     def _position_pnl(self, quote: StraddleQuote | None, future_price: float) -> float:
@@ -771,6 +901,7 @@ class GexStraddleStrategy:
         book = self.portfolio
         return (
             book.straddle_unrealised(quote)
+            + (book.option_realised - self._option_realised_at_entry)
             + book.hedge.unrealised(future_price, self.source.hedge.multiplier)
             + (book.hedge_realised - self._hedge_realised_at_entry)
             - (book.fees_paid - self._fees_at_entry)
@@ -839,17 +970,21 @@ class GexStraddleStrategy:
     def _gap_exit_reason(self, moment: datetime, position) -> str | None:
         """Close before a weekend or holiday a position would otherwise span.
 
-        Fires on the last session before a gap, at the same pre-settlement
-        buffer the 0DTE exit uses, for a position whose series is on the
-        far side of that gap.  At the shipped tenor this cannot happen --
+        Fires on the last session before a gap, from the same pre-settlement
+        buffer the 0DTE exit uses onwards (the bell included), for a
+        position whose series is on the far side of that gap.  At the shipped tenor this cannot happen --
         such a series is never entered -- so this is the safety net for a
         wider tenor, or a config that switched the weekend rule on with a
         position already open.
         """
         if self.tenor.hold_over_weekends:
             return None
-        today = self._todays_expiry(moment)
-        if today is None or position.expiry <= today or not self.clock.gap_after(moment):
+        today = moment.date()
+        if (
+            not is_trading_day(today)
+            or position.expiry <= today
+            or not self.clock.gap_after(moment)
+        ):
             return None
         if self.clock.seconds_to_expiry(moment, today) > self.tenor.buffer_seconds:
             return None
@@ -863,7 +998,7 @@ class GexStraddleStrategy:
     ) -> str | None:
         """Close only on a flip the gates are willing to stand behind.
 
-        A regime that has not yet held ``persistence_bars`` is spot crossing
+        A regime that has not yet held ``persistence_seconds`` is spot crossing
         a level rather than positioning changing, and closing on it churns
         the book at exactly the wrong moments -- open interest, the only
         input, has not moved at all.  The same is true of a flip only part
@@ -881,9 +1016,9 @@ class GexStraddleStrategy:
             self._record(
                 moment, "exit_deferred",
                 f"GEX reads {profile.regime} against the open position, but "
-                f"only for {self._streak_bars} of the "
-                f"{self.cfg.gates.persistence_bars} consecutive bars a flip "
-                "needs; holding",
+                f"only for {self._streak_seconds(moment) / 60:.1f} of the "
+                f"{self.cfg.gates.persistence_seconds / 60:.1f} minutes a flip "
+                f"needs ({self._streak_bars} bars); holding",
                 regime=position.regime, gate=GATE_PERSISTENCE,
             )
             return None
@@ -958,46 +1093,115 @@ class GexStraddleStrategy:
         self, bar: MarketBar, moment: datetime, quote: StraddleQuote,
         execution: ExecutionHandler, reason: str,
     ) -> None:
+        """Close the straddle, booking exactly what filled.
+
+        Both legs are sent for the whole position.  What comes back may be
+        less: one leg may not fill, or may fill short.  The book can only
+        describe matched straddles, so the matched part is realised and
+        taken off, any leg closed *beyond* the match is put back on so the
+        remainder is still a straddle, and the remainder stays open for the
+        exit to try again on the next bar.  Retrying the whole close on a
+        half-closed book -- the alternative -- would trade the already-
+        closed leg a second time.
+        """
         position = self.portfolio.straddle
         assert position is not None
         regime = position.regime
         quantity = position.quantity
+        direction = position.direction
+        held = abs(quantity)
 
         call_fill = execution.execute_option(quote.call, -quantity, moment)
         put_fill = execution.execute_option(quote.put, -quantity, moment)
-        if call_fill is None or put_fill is None:
-            filled = "call" if call_fill is not None else "put" if put_fill is not None else "neither"
+        closed = {"call": 0, "put": 0}
+        prices = {"call": quote.call.price, "put": quote.put.price}
+        for leg, fill in (("call", call_fill), ("put", put_fill)):
+            if fill is None or fill.quantity == 0:
+                continue
+            self.fills.append(fill)
+            self.portfolio.charge_fees(fill.fees)
+            closed[leg] = min(abs(fill.quantity), held)
+            prices[leg] = fill.price
+
+        matched = min(closed["call"], closed["put"])
+        for leg in ("call", "put"):
+            excess = closed[leg] - matched
+            if excess:
+                # The leg was closed past its partner: put the excess back
+                # so what remains on the book is still a straddle.
+                self._restore_leg(
+                    quote.call if leg == "call" else quote.put, leg,
+                    direction * excess, prices[leg], moment, execution,
+                )
+
+        if matched == 0:
+            filled = ", ".join(f"{leg} {n}" for leg, n in closed.items() if n) or "neither leg"
             self._record(
                 moment, "exit_failed",
-                f"could not close ({reason}); {filled} leg filled",
+                f"could not close ({reason}); {filled} filled and was put back",
                 regime=regime,
             )
             return
-        for fill in (call_fill, put_fill):
-            self.fills.append(fill)
-            self.portfolio.charge_fees(fill.fees)
 
-        # Attribute the whole position -- straddle and hedge -- before the
-        # book is torn down, so the regime that opened it is charged with
-        # what it actually made.
-        position_pnl = self._position_pnl(quote, bar.close)
-        option_pnl = self.portfolio.close_straddle(call_fill.price, put_fill.price)
+        option_pnl = self.portfolio.close_straddle(
+            prices["call"], prices["put"], matched
+        )
+        if matched < held:
+            self._record(
+                moment, "exit_partial",
+                f"closed {matched} of {held} {position.strike:g} straddles @ "
+                f"{prices['call'] + prices['put']:.2f} ({reason}); straddle P&L "
+                f"${option_pnl:,.0f}; {held - matched} remain and the exit will "
+                "retry",
+                regime=regime,
+            )
+            return
+
+        # Attribute the whole position -- straddle and hedge -- to the
+        # regime that opened it, after the hedge leg has been dealt with so
+        # the flatten's fees and realisations are inside the number.
         self._record(
             moment, "exit",
-            f"closed {abs(quantity)} {position.strike:g} straddle @ "
-            f"{call_fill.price + put_fill.price:.2f} ({reason}); "
-            f"straddle P&L ${option_pnl:,.0f}, position P&L ${position_pnl:,.0f}",
+            f"closed {held} {position.strike:g} straddle @ "
+            f"{prices['call'] + prices['put']:.2f} ({reason}); "
+            f"straddle P&L ${option_pnl:,.0f}, position P&L "
+            f"${self._position_pnl(None, bar.close):,.0f}",
             regime=regime,
         )
-
         if self.cfg.hedge.flatten_hedge_on_exit and self.portfolio.hedge.quantity:
             self._flatten_hedge(bar, moment, execution)
-            position_pnl = (
-                self.portfolio.hedge_realised - self._hedge_realised_at_entry
-                + option_pnl
-                - (self.portfolio.fees_paid - self._fees_at_entry)
-            )
+        position_pnl = self._position_pnl(None, bar.close)
         self.regime_pnl[regime] = self.regime_pnl.get(regime, 0.0) + position_pnl
+
+    def _restore_leg(
+        self, leg_quote: OptionQuote, leg: str, excess: int, closed_price: float,
+        moment: datetime, execution: ExecutionHandler,
+    ) -> None:
+        """Re-open ``excess`` contracts of a leg closed past its partner.
+
+        ``excess`` is signed the way the position holds the leg.  The round
+        trip is realised on the option leg; a failure leaves a naked option
+        the portfolio cannot see, and says so.
+        """
+        fill = execution.execute_option(leg_quote, excess, moment)
+        if fill is None or fill.quantity == 0:
+            self._record(
+                moment, "exit_failed",
+                f"the {leg} leg closed {abs(excess)} contracts past the other and "
+                "they could not be put back -- the book is holding a naked "
+                "option and needs manual attention",
+            )
+            return
+        self.fills.append(fill)
+        self.portfolio.charge_fees(fill.fees)
+        self.portfolio.option_realised += (
+            excess * (closed_price - fill.price) * self.source.option.multiplier
+        )
+        self._record(
+            moment, "exit_trimmed",
+            f"the legs closed at different sizes; put back {abs(excess)} {leg} "
+            f"contracts @ {fill.price:.2f}",
+        )
 
     def _flatten_hedge(
         self, bar: MarketBar, moment: datetime, execution: ExecutionHandler
@@ -1082,6 +1286,134 @@ class GexStraddleStrategy:
             + (f"; realised ${realised:,.0f}" if realised else ""),
             decision.net_delta_after,
         )
+
+    # -- persistence across a restart ---------------------------------------
+
+    def snapshot(self, moment: datetime | None = None) -> dict:
+        """Everything a restarted process needs to carry this book on.
+
+        The runner rebuilds the strategy on every reconnection -- the daily
+        gateway restart included -- and the rolled position is open through
+        exactly that.  What the broker can say is which contracts are held;
+        what only this process knows is what they were opened for, which
+        regime opened them, the hedge P&L scalped against them so far, and
+        how the session's loss limit and entry count stand.  All of it is
+        here, and none of it is a decision: ``restore`` puts it back only
+        when the broker's positions match what it describes.
+        """
+        position = self.portfolio.straddle
+        return {
+            "version": 1,
+            "as_of": (moment or self._last_moment).isoformat()
+            if (moment or self._last_moment) else None,
+            "straddle": None if position is None else {
+                "strike": position.strike,
+                "expiry": position.expiry.isoformat(),
+                "quantity": int(position.quantity),
+                "call_entry": float(position.call_entry),
+                "put_entry": float(position.put_entry),
+                "entry_time": position.entry_time.isoformat(),
+                "entry_future": float(position.entry_future),
+                "entry_iv": float(position.entry_iv),
+                "entry_delta": float(position.entry_delta),
+                "regime": position.regime,
+            },
+            "hedge": {
+                "quantity": int(self.portfolio.hedge.quantity),
+                "avg_price": float(self.portfolio.hedge.avg_price),
+            },
+            "realised": {
+                "option": float(self.portfolio.option_realised),
+                "hedge": float(self.portfolio.hedge_realised),
+                "fees": float(self.portfolio.fees_paid),
+            },
+            "baselines": {
+                "option_realised": float(self._option_realised_at_entry),
+                "hedge_realised": float(self._hedge_realised_at_entry),
+                "fees": float(self._fees_at_entry),
+            },
+            "session": {
+                "date": self._session_date.isoformat() if self._session_date else None,
+                "start_equity": float(self._session_start_equity),
+                "entries": int(self._entries_this_session),
+                "halted": bool(self._halted_for_session),
+            },
+            "streak": {
+                "regime": self._streak_regime,
+                "started": self._streak_started.isoformat() if self._streak_started else None,
+                "bars": int(self._streak_bars),
+                "confirmed": self._confirmed_regime,
+            },
+            "last_hedge_time": (
+                self._last_hedge_time.isoformat() if self._last_hedge_time else None
+            ),
+            "regime_pnl": dict(self.regime_pnl),
+            "regime_trades": dict(self.regime_trades),
+        }
+
+    def restore(
+        self, state: dict, moment: datetime, adopt_straddle: bool = True
+    ) -> None:
+        """Put a ``snapshot`` back, for a book the broker confirms is open.
+
+        ``adopt_straddle`` is the caller's statement that the broker's
+        option positions match the recorded straddle exactly; without it
+        only the tallies come back (realised P&L, fees, the session's loss
+        limit and entry count), so a restart mid-session does not hand the
+        strategy a fresh loss budget.  Session state is restored only when
+        the record is from today's session; the persistence streak only
+        when it is, too -- a regime read yesterday says nothing about
+        whether it held overnight.
+        """
+        book = self.portfolio
+        realised = state.get("realised", {})
+        book.option_realised = float(realised.get("option", 0.0))
+        book.hedge_realised = float(realised.get("hedge", 0.0))
+        book.fees_paid = float(realised.get("fees", 0.0))
+        self.regime_pnl = {k: float(v) for k, v in state.get("regime_pnl", {}).items()}
+        self.regime_trades = {k: int(v) for k, v in state.get("regime_trades", {}).items()}
+
+        recorded = state.get("straddle")
+        if adopt_straddle and recorded:
+            if book.straddle is not None:
+                raise RuntimeError("cannot restore a straddle over an open one")
+            book.straddle = StraddlePosition(
+                strike=float(recorded["strike"]),
+                expiry=date.fromisoformat(recorded["expiry"]),
+                quantity=int(recorded["quantity"]),
+                call_entry=float(recorded["call_entry"]),
+                put_entry=float(recorded["put_entry"]),
+                entry_time=self.clock.localize(datetime.fromisoformat(recorded["entry_time"])),
+                entry_future=float(recorded.get("entry_future", 0.0)),
+                entry_iv=float(recorded.get("entry_iv", 0.0)),
+                entry_delta=float(recorded.get("entry_delta", 0.0)),
+                regime=str(recorded.get("regime", "")),
+            )
+            baselines = state.get("baselines", {})
+            self._option_realised_at_entry = float(baselines.get("option_realised", 0.0))
+            self._hedge_realised_at_entry = float(baselines.get("hedge_realised", 0.0))
+            self._fees_at_entry = float(baselines.get("fees", 0.0))
+            hedge = state.get("hedge", {})
+            book.hedge.quantity = int(hedge.get("quantity", 0))
+            book.hedge.avg_price = float(hedge.get("avg_price", 0.0))
+
+        today = self.clock.localize(moment).date()
+        session = state.get("session", {})
+        if session.get("date") == today.isoformat():
+            self._session_date = today
+            self._session_start_equity = float(session.get("start_equity", book.starting_equity))
+            self._entries_this_session = int(session.get("entries", 0))
+            self._halted_for_session = bool(session.get("halted", False))
+            streak = state.get("streak", {})
+            started = streak.get("started")
+            if started:
+                self._streak_regime = str(streak.get("regime", ""))
+                self._streak_started = self.clock.localize(datetime.fromisoformat(started))
+                self._streak_bars = int(streak.get("bars", 0))
+                self._confirmed_regime = str(streak.get("confirmed", NEUTRAL))
+        last_hedge = state.get("last_hedge_time")
+        if last_hedge:
+            self._last_hedge_time = self.clock.localize(datetime.fromisoformat(last_hedge))
 
     # -- reporting ---------------------------------------------------------
 

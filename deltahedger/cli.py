@@ -330,7 +330,10 @@ def cmd_gex(args: argparse.Namespace) -> int:
     print(f"  regime         {profile.regime}"
           + (f" (blocked by the {profile.gate} gate)" if profile.gate else ""))
     print(f"  because        {profile.reason}")
-    print(f"  ensemble       {ensemble.detail}")
+    print(
+        f"  ensemble       {ensemble.detail}"
+        + ("" if cfg.gates.ensemble else " (gate off; shown for information)")
+    )
     print(f"  would          {intent}\n")
     print(profile.expiry_table())
     print()
@@ -355,6 +358,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _is_paper_account,
     )
     from .chain import select_expiry
+    from .data.openinterest import build_live_open_interest_provider
     from .gex import GexCalculator
     from .session import SessionClock
     from .volsurface import VolSurface
@@ -439,28 +443,54 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"{straddle.strike:g} @ {straddle.price:.2f} (IV {straddle.iv:.3f})",
             )
 
-        provider = IbkrOpenInterestProvider(connection, cfg)
-        rows = provider.open_interest(now, price, expiry)
-        total = sum(r.call_oi + r.put_oi for r in rows)
+        oi_kind = cfg.data.open_interest.lower()
+        if oi_kind == "mdp":
+            from .data.mdp import describe_snapshot
+
+            provider = build_live_open_interest_provider(cfg, source, connection)
+            rows = provider.open_interest(now, price, expiry)
+            total = sum(r.call_oi + r.put_oi for r in rows)
+            check(
+                "open interest (MDP 3.0 snapshot)", bool(rows) and total > 0,
+                describe_snapshot(cfg.data.oi_mdp_path, now, expiry)
+                + ("" if rows else " -- stale or missing: is `deltahedger mdp-feed` "
+                   "running? GEX cannot be computed and the strategy will stand aside"),
+            )
+        else:
+            check(
+                "open interest is intraday", False,
+                f"data.open_interest is {cfg.data.open_interest!r}: generic tick 101 "
+                "is the previous session's close, not a 0DTE input. Run "
+                "`deltahedger mdp-feed` and set data.open_interest: mdp.",
+            )
+            provider = IbkrOpenInterestProvider(connection, cfg)
+            rows = provider.open_interest(now, price, expiry)
+            total = sum(r.call_oi + r.put_oi for r in rows)
+            check(
+                "open interest (generic tick 101)", bool(rows) and total > 0,
+                f"{len(rows)} strikes, {total:,.0f} contracts" if rows
+                else "none returned -- GEX cannot be computed and the strategy "
+                     "will stand aside on every bar",
+            )
+            # The blend reads one chain per front expiry, and each chain
+            # costs two market-data lines per listed strike. That is the
+            # number most likely to hit an account's simultaneous-line
+            # limit, so say it out loud before a walk rather than after.
+            lines = 2 * len(rows) * (
+                cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1
+            )
+            check(
+                "open-interest subscription budget", True,
+                f"~{lines} market-data lines per refresh "
+                f"({cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1} "
+                f"expiries x {len(rows)} strikes x 2 rights), requested in batches "
+                f"of {IbkrOpenInterestProvider.MAX_CONCURRENT}",
+            )
+        break_start, break_end = source.maintenance_break
         check(
-            "open interest (generic tick 101)", bool(rows) and total > 0,
-            f"{len(rows)} strikes, {total:,.0f} contracts" if rows
-            else "none returned -- GEX cannot be computed and the strategy "
-                 "will stand aside on every bar",
-        )
-        # The blend reads one chain per front expiry, and each chain costs
-        # two market-data lines per listed strike. That is the number most
-        # likely to hit an account's simultaneous-line limit, so say it out
-        # loud before a walk rather than after.
-        lines = 2 * len(rows) * (
-            cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1
-        )
-        check(
-            "open-interest subscription budget", True,
-            f"~{lines} market-data lines per refresh "
-            f"({cfg.gex.blend_max_expiries if cfg.gex.blend_front_expiries else 1} "
-            f"expiries x {len(rows)} strikes x 2 rights), requested in batches "
-            f"of {IbkrOpenInterestProvider.MAX_CONCURRENT}",
+            "restart window", True,
+            f"CME maintenance break {break_start}-{break_end} exchange time; the "
+            "gateway's daily restart belongs inside it (IBC AutoRestartTime)",
         )
 
         if rows and total > 0:
@@ -662,6 +692,36 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mdp_feed(args: argparse.Namespace) -> int:
+    """Run the MDP 3.0 open-interest feed, writing the snapshot the live
+    runner reads.
+
+    A separate process from the runner on purpose: a hiccup in the feed
+    must not take the hedger with it, and the snapshot is one file the
+    strategy reads rather than a socket it depends on. Under systemd this
+    is ``deltahedger-oi.service``, next to the runner's unit.
+    """
+    import signal
+
+    from .data.mdp import DatabentoOpenInterestFeed
+
+    cfg = _load(args)
+    path = args.out or cfg.data.oi_mdp_path
+    if not path:
+        raise ValueError(
+            "set data.oi_mdp_path in the config (or pass --out) so the runner and "
+            "the feed agree on where the snapshot lives"
+        )
+    feed = DatabentoOpenInterestFeed(
+        cfg.source, path, api_key=args.api_key, write_seconds=args.write_seconds
+    )
+    signal.signal(signal.SIGINT, feed.request_stop)
+    signal.signal(signal.SIGTERM, feed.request_stop)
+    print(f"writing intraday open interest for {cfg.source.option.symbol} options to {path}")
+    feed.run()
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     cfg = Config()
     path = Path(args.out)
@@ -774,6 +834,21 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--day", help="one session, YYYY-MM-DD (default: all)")
     report.add_argument("--show-events", action="store_true")
     report.set_defaults(func=cmd_report, source=None, bar_size=None)
+
+    feed = sub.add_parser(
+        "mdp-feed", parents=[common],
+        help="run the MDP 3.0 open-interest feed that writes data.oi_mdp_path",
+    )
+    feed.add_argument("--out", help="snapshot path (default: data.oi_mdp_path)")
+    feed.add_argument(
+        "--api-key", dest="api_key",
+        help="Databento API key (default: the DATABENTO_API_KEY environment variable)",
+    )
+    feed.add_argument(
+        "--write-seconds", dest="write_seconds", type=float, default=30.0,
+        help="how often to rewrite the snapshot while updates arrive",
+    )
+    feed.set_defaults(func=cmd_mdp_feed, source=None, bar_size=None)
 
     conf = sub.add_parser("config", help="write a default config file")
     conf.add_argument("-o", "--out", default="config.yaml")

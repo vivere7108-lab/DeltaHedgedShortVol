@@ -1,0 +1,40 @@
+[Unit]
+Description=DeltaHedgedShortVol -- MDP 3.0 intraday open-interest feed
+After=network-online.target
+Wants=network-online.target
+# Not bound to deltahedger.service in either direction. The runner reads a
+# snapshot file and stands aside when it goes stale; the feed writes that
+# file and knows nothing about the runner. Either can restart without the
+# other noticing anything but a gap.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_USER@
+WorkingDirectory=@INSTALL_DIR@
+
+# DATABENTO_API_KEY and DELTAHEDGER_CONFIG live here.
+EnvironmentFile=/etc/deltahedger.env
+
+ExecStart=@INSTALL_DIR@/.venv/bin/deltahedger mdp-feed -c $DELTAHEDGER_CONFIG
+
+Restart=always
+RestartSec=30
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deltahedger-oi
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@INSTALL_DIR@/runs
+
+[Install]
+WantedBy=multi-user.target

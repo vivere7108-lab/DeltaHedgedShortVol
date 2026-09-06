@@ -70,6 +70,10 @@ class RiskSource:
     session_close: str = "16:00"
     #: Settlement time of the shortest-dated (daily) option series.
     option_expiry_time: str = "16:00"
+    #: The exchange's daily maintenance break, when the future does not
+    #: trade and nothing can be quoted or hedged. CME equity index futures
+    #: halt 17:00-18:00 exchange (New York) time.
+    maintenance_break: tuple[str, str] = ("17:00", "18:00")
     #: Typical strike spacing of the daily series, in underlying points.
     strike_increment: float = 5.0
     #: Approximate initial margin per short future contract, USD. Used by the

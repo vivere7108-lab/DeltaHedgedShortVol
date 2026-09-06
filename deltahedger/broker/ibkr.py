@@ -508,6 +508,8 @@ class IbkrExecution:
     cfg: Config
     dry_run: bool = False
     fill_timeout: float = 30.0
+    #: How long each wait for a cancel acknowledgement lasts, seconds.
+    cancel_timeout: float = 2.0
 
     def execute_option(
         self, quote: OptionQuote, quantity: int, moment: datetime
@@ -563,13 +565,30 @@ class IbkrExecution:
             if not self.connection.ib.waitOnUpdate(timeout=self.fill_timeout):
                 break
 
+        if not trade.isDone():
+            # Whatever has not filled by now is cancelled before the fill
+            # is read, so a remainder cannot fill later behind the book's
+            # back. The cancel is given a moment to be acknowledged, and
+            # the quantity booked is whatever the final status says.
+            log.warning(
+                "order timed out after %.0fs: %s %d %s (status %s, %s filled); "
+                "cancelling the remainder",
+                self.fill_timeout, action, size,
+                getattr(contract, "localSymbol", instrument),
+                trade.orderStatus.status, trade.orderStatus.filled,
+            )
+            self.connection.ib.cancelOrder(order)
+            deadline = 3
+            while not trade.isDone() and deadline > 0:
+                self.connection.ib.waitOnUpdate(timeout=self.cancel_timeout)
+                deadline -= 1
+
         if not trade.orderStatus.filled:
             log.error(
                 "order not filled: %s %d %s (status %s)",
                 action, size, getattr(contract, "localSymbol", instrument),
                 trade.orderStatus.status,
             )
-            self.connection.ib.cancelOrder(order)
             return None
 
         filled = int(trade.orderStatus.filled)

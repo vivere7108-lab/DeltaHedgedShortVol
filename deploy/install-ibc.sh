@@ -219,9 +219,13 @@ settings = {
     # Accept the API connection from localhost without a dialog.
     "AcceptIncomingConnectionAction": "accept",
     "AllowBlindTrading": "yes",
-    # The forced daily restart: let IBC drive it rather than a human.
-    # 02:00 is after the CME close and before the next session.
-    "AutoRestartTime": "02:00 AM",
+    # The forced daily restart: let IBC drive it rather than a human, and
+    # put it inside the CME maintenance break (17:00-18:00 New York), when
+    # the future does not trade. The rolled straddle is open through the
+    # night and the runner re-adopts it from its journal on reconnection,
+    # but a restart while the market is halted is the one that can cost
+    # the book nothing: there is no quote to miss and no move to hedge.
+    "AutoRestartTime": "05:05 PM",
     # Do not let the gateway close itself on a schedule; the restart above
     # is the only interruption we want.
     "ClosedownAt": "",

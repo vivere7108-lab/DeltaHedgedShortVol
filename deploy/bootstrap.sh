@@ -77,13 +77,13 @@ echo "  now at $(as_owner -C "${INSTALL_DIR}" log -1 --format='%h %s')"
 log "python environment"
 sudo -u "${SERVICE_USER}" python3 -m venv "${INSTALL_DIR}/.venv"
 sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/pip" install --quiet --upgrade pip
-sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/pip" install --quiet -e "${INSTALL_DIR}[ibkr]"
+sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/pip" install --quiet -e "${INSTALL_DIR}[ibkr,mdp]"
 
 log "run directory"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 750 "${INSTALL_DIR}/runs"
 
 log "systemd units"
-for unit in ibc.service deltahedger.service; do
+for unit in ibc.service deltahedger.service deltahedger-oi.service; do
     sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" \
         -e "s|@SERVICE_USER@|${SERVICE_USER}|g" \
         "${INSTALL_DIR}/deploy/${unit}" > "/etc/systemd/system/${unit}"

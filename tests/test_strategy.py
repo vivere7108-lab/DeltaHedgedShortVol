@@ -47,8 +47,10 @@ NY = ZoneInfo("America/New_York")
 #: Inside the default entry window (09:35-14:30) so a test that leaves the
 #: entry-window gate on does not also have to move this. A Tuesday.
 OPEN = datetime(2025, 6, 10, 10, 0, tzinfo=NY)
-#: Minutes from OPEN to the 15:45 roll window (15 minutes before the bell).
+#: Minutes from OPEN to the 15:45 pre-settlement buffer, where today's
+#: position comes off, and to the 16:00 bell, where tomorrow's goes on.
 ROLL = 345
+BELL = 360
 
 
 class FixedRegime:
@@ -738,7 +740,7 @@ class TestGates:
     def test_persistence_gate_blocks_entry_until_the_regime_holds(self):
         cfg = make_cfg(**{"gex.refresh_seconds": 0.0})
         cfg.gates.persistence = True
-        cfg.gates.persistence_bars = 3
+        cfg.gates.persistence_seconds = 600.0
         strategy = drive(cfg, [bar(m) for m in range(0, 15, 5)], regime=POSITIVE)
         entries = [e for e in strategy.events if e.kind == "entry"]
         assert len(entries) == 1
@@ -753,7 +755,7 @@ class TestGates:
         next 2, one short of the 3 the flip itself needs."""
         cfg = make_cfg(**{"gex.refresh_seconds": 0.0})
         cfg.gates.persistence = True
-        cfg.gates.persistence_bars = 3
+        cfg.gates.persistence_seconds = 600.0
         provider = self.Flipping(switch_after=4)
         strategy = drive(cfg, [bar(m) for m in range(0, 30, 5)], provider=provider)
 
@@ -764,11 +766,11 @@ class TestGates:
         assert position is not None and position.regime == POSITIVE
 
     def test_the_flip_closes_once_the_new_regime_has_held_long_enough(self):
-        """The other half: once the flip itself has held ``persistence_bars``
-        bars, the deferred exit fires."""
+        """The other half: once the flip itself has held ``persistence_seconds``,
+        the deferred exit fires."""
         cfg = make_cfg(**{"gex.refresh_seconds": 0.0})
         cfg.gates.persistence = True
-        cfg.gates.persistence_bars = 3
+        cfg.gates.persistence_seconds = 600.0
         provider = self.Flipping(switch_after=4)
         bars = [bar(m) for m in range(0, 45, 5)]  # 4 positive, 5 negative
         strategy = drive(cfg, bars, provider=provider)
@@ -874,41 +876,80 @@ class TestEndOfDay:
         assert exits[0].timestamp.time() == time(15, 45)
         assert "15m to expiry" in exits[0].detail
 
-    def test_the_exit_rolls_into_tomorrows_series(self):
-        """On the same bar today's position is closed, tomorrow's is
-        opened -- outside the entry window, through the GEX gates."""
+    def test_the_exit_rolls_into_tomorrows_series_once_today_has_settled(self):
+        """Today's position is closed at the buffer; nothing is opened
+        inside it; tomorrow's is opened at the bell -- outside the entry
+        window, through the GEX gates."""
         cfg = make_cfg()
-        cfg.gates.entry_window = True  # 09:35-14:30; 15:45 is outside it
+        cfg.gates.entry_window = True  # 09:35-14:30; 16:00 is outside it
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.short_stop_loss_premium_multiple = None
         cfg.strategy.daily_loss_limit_pct = None
-        strategy = drive(cfg, [bar(0), bar(ROLL - 5), bar(ROLL), bar(ROLL + 5)])
+        strategy = drive(
+            cfg, [bar(0), bar(ROLL - 5), bar(ROLL), bar(ROLL + 5), bar(BELL)]
+        )
         entries = [e for e in strategy.events if e.kind == "entry"]
         assert len(entries) == 2
-        assert entries[1].timestamp.time() == time(15, 45)
+        assert entries[1].timestamp.time() == time(16, 0)
         assert "1DTE" in entries[1].detail
+        assert strategy.bar_states[-2].straddle_contracts == 0  # flat at 15:50
         position = strategy.portfolio.straddle
         assert position is not None
         assert position.expiry == datetime(2025, 6, 11).date()
-        assert strategy.clock.days_to_expiry(bar(ROLL).timestamp, position.expiry) == 1
+        assert strategy.clock.days_to_expiry(bar(BELL).timestamp, position.expiry) == 1
+
+    def test_the_roll_read_excludes_the_expiring_series(self):
+        """Inside the buffer the flat book's read is built on tomorrow's
+        series alone: today's is a gamma spike about to stop existing and
+        would otherwise outweigh tomorrow's seven to one."""
+        cfg = make_cfg()
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5)])
+        assert strategy.portfolio.straddle is None
+        assert [b.expiry for b in strategy._books] == [datetime(2025, 6, 11).date()]
+        skipped = details(strategy, "entry_skipped")
+        assert skipped and "pre-settlement buffer" in skipped[-1]
+        assert "opened once today's has settled" in skipped[-1]
+
+    def test_the_roll_window_closes(self):
+        cfg = make_cfg(**{"strategy.roll_window_minutes": 30})
+        cfg.gates.entry_window = True
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL), bar(BELL + 35)])
+        assert strategy.portfolio.straddle is None
+        assert kinds(strategy).count("entry") == 1
 
     def test_the_rolled_position_is_hedged_from_the_first_bar(self, es):
         cfg = make_cfg()
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.daily_loss_limit_pct = None
-        strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5, 4990.0), bar(ROLL + 10, 4980.0)])
+        strategy = drive(
+            cfg,
+            [bar(0), bar(ROLL), bar(BELL), bar(BELL + 5, 4990.0), bar(BELL + 10, 4980.0)],
+        )
         assert strategy.portfolio.straddle is not None
         assert inside_band(strategy.bar_states[-2:], es)
 
     def test_the_roll_can_be_switched_off(self):
-        """With the roll off nothing is opened inside the buffer, whether or
-        not the entry window would have allowed it (it is off here)."""
+        """With the roll off nothing is opened inside the buffer or after
+        the bell, whether or not the entry window would have allowed it (it
+        is off here)."""
         cfg = make_cfg(**{"strategy.roll_at_expiry": False})
+        cfg.gates.entry_window = True
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.daily_loss_limit_pct = None
+        strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5), bar(BELL)])
+        assert strategy.portfolio.straddle is None
+        assert kinds(strategy).count("entry") == 1
+
+    def test_the_buffer_is_closed_to_entries_whatever_the_window_says(self):
+        cfg = make_cfg(**{"strategy.roll_at_expiry": False})  # entry window off
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.daily_loss_limit_pct = None
         strategy = drive(cfg, [bar(0), bar(ROLL), bar(ROLL + 5)])
         assert strategy.portfolio.straddle is None
-        assert kinds(strategy).count("entry") == 1
         assert "roll_at_expiry is off" in " ".join(details(strategy, "entry_skipped"))
 
     def test_a_flat_friday_afternoon_still_reads_gex(self):
@@ -927,7 +968,7 @@ class TestEndOfDay:
         cfg = make_cfg()
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.daily_loss_limit_pct = None
-        strategy = drive(cfg, [bar(ROLL), bar(ROLL + 5)])
+        strategy = drive(cfg, [bar(ROLL), bar(ROLL + 5), bar(BELL)])
         position = strategy.portfolio.straddle
         assert position is not None and position.expiry > OPEN.date()
 
@@ -938,7 +979,10 @@ class TestEndOfDay:
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.daily_loss_limit_pct = None
         friday = 3  # sessions after Tuesday's OPEN
-        bars = [session_bar(friday, 0), session_bar(friday, ROLL), session_bar(friday, ROLL + 5)]
+        bars = [
+            session_bar(friday, 0), session_bar(friday, ROLL),
+            session_bar(friday, ROLL + 5), session_bar(friday, BELL),
+        ]
         strategy = drive(cfg, bars)
         assert strategy.portfolio.straddle is None
         assert strategy.portfolio.hedge.quantity == 0
@@ -953,7 +997,7 @@ class TestEndOfDay:
         eve = datetime(2025, 7, 3, 10, 0, tzinfo=NY)
         bars = [
             MarketBar(eve + timedelta(minutes=m), 5000.0, 5000.0, 5000.0, 5000.0, 0.15)
-            for m in (0, ROLL, ROLL + 5)
+            for m in (0, ROLL, ROLL + 5, BELL)
         ]
         strategy = drive(cfg, bars)
         assert strategy.portfolio.straddle is None
@@ -964,7 +1008,9 @@ class TestEndOfDay:
         cfg.strategy.short_take_profit_pct = None
         cfg.strategy.daily_loss_limit_pct = None
         friday = 3
-        strategy = drive(cfg, [session_bar(friday, 0), session_bar(friday, ROLL)])
+        strategy = drive(
+            cfg, [session_bar(friday, 0), session_bar(friday, ROLL), session_bar(friday, BELL)]
+        )
         position = strategy.portfolio.straddle
         assert position is not None and position.expiry == datetime(2025, 6, 16).date()
 
@@ -983,11 +1029,12 @@ class TestEndOfDay:
         strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
         execution = SimulatedExecution(cfg.costs, cfg.source)
         strategy.on_bar(session_bar(friday, 0), execution)
-        strategy.on_bar(session_bar(friday, ROLL), execution)  # rolled into Monday
+        strategy.on_bar(session_bar(friday, ROLL), execution)  # today's comes off
+        strategy.on_bar(session_bar(friday, BELL), execution)  # rolled into Monday
         assert strategy.portfolio.straddle.expiry == datetime(2025, 6, 16).date()
 
         strategy.tenor = dataclasses.replace(strategy.tenor, hold_over_weekends=False)
-        strategy.on_bar(session_bar(friday, ROLL + 5), execution)
+        strategy.on_bar(session_bar(friday, BELL + 5), execution)
         assert strategy.portfolio.straddle is None
         exits = [e for e in strategy.events if e.kind == "exit"]
         assert "weekend or holiday" in exits[-1].detail
@@ -1043,7 +1090,7 @@ class TestEventBlackout:
         cfg = self.make()
         cfg.gates.ensemble = True
         cfg.gates.persistence = True
-        cfg.gates.persistence_bars = 2
+        cfg.gates.persistence_seconds = 300.0
         strategy = drive(cfg, [bar(m) for m in range(0, 50, 5)])
         assert strategy.portfolio.straddle is None
         assert any("blackout" in e.detail for e in strategy.events if e.kind == "exit")

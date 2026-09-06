@@ -108,8 +108,8 @@ def patch_session(monkeypatch, runner, moment=OPEN):
     """Pin the clock inside the session and stub the IBKR-only pieces."""
     import deltahedger.live.runner as module
 
-    monkeypatch.setattr(module, "IbkrOpenInterestProvider",
-                        lambda conn, cfg: FakeOpenInterest())
+    monkeypatch.setattr(module, "build_live_open_interest_provider",
+                        lambda cfg, source, conn=None: FakeOpenInterest())
     monkeypatch.setattr(module, "IbkrExecution",
                         lambda conn, cfg, dry_run=False: _NoExecution())
     monkeypatch.setattr(module, "IbkrChainProvider", lambda conn, cfg: _NoChain())
@@ -266,6 +266,9 @@ class _StubStrategy:
         self._Fill, self._Event, self._State = Fill, StrategyEvent, BarState
         self._n = 0
 
+    def snapshot(self, moment=None):
+        return {"version": 1, "as_of": None, "straddle": None, "n": self._n}
+
     def on_bar(self, bar, execution):
         self._n += 1
         moment = OPEN + timedelta(minutes=self._n)
@@ -323,3 +326,157 @@ class TestFailureBudget:
         with pytest.raises(Exception):
             runner.run(max_cycles=100)
         assert connects["n"] <= 5
+
+
+# -- the book across a restart -------------------------------------------
+
+
+class _Contract:
+    def __init__(self, secType, symbol, expiry="", strike=0.0, right=""):
+        self.secType = secType
+        self.symbol = symbol
+        self.lastTradeDateOrContractMonth = expiry
+        self.strike = strike
+        self.right = right
+
+
+class _Position:
+    def __init__(self, contract, position, avgCost=0.0):
+        self.contract = contract
+        self.position = position
+        self.avgCost = avgCost
+
+
+def open_a_straddle(cfg):
+    """A strategy that has just sold a straddle and hedged it, driven for real."""
+    from deltahedger.broker.paper import SimulatedExecution
+    from deltahedger.data.base import MarketBar
+    from deltahedger.strategy import GexStraddleStrategy
+
+    cfg.gates.ensemble = False
+    cfg.gates.persistence = False
+    cfg.gates.entry_window = False
+    strategy = GexStraddleStrategy(cfg, open_interest=FakeOpenInterest())
+    execution = SimulatedExecution(cfg.costs, cfg.source)
+    for minutes, price in ((0, 5000.0), (5, 4992.0), (10, 4985.0)):
+        moment = OPEN + timedelta(minutes=minutes)
+        strategy.on_bar(MarketBar(moment, price, price, price, price, 0.15), execution)
+    assert strategy.portfolio.straddle is not None
+    return strategy
+
+
+def legs_for(strategy):
+    position = strategy.portfolio.straddle
+    expiry = position.expiry.strftime("%Y%m%d")
+    return [
+        _Position(_Contract("FOP", "ES", expiry, position.strike, right), position.quantity)
+        for right in ("C", "P")
+    ]
+
+
+class TestTheBookSurvivesARestart:
+    """The rolled position is open through the nightly gateway restart, so
+    a reconnection has to re-adopt it -- from the journal's record, and
+    only when the broker's legs match that record exactly."""
+
+    def test_a_snapshot_restores_the_same_book(self, tmp_path):
+        from deltahedger.strategy import GexStraddleStrategy
+
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        before = open_a_straddle(cfg)
+        state = before.snapshot(OPEN + timedelta(minutes=10))
+        assert state["straddle"]["quantity"] == before.portfolio.straddle.quantity
+
+        after = GexStraddleStrategy(cfg, open_interest=FakeOpenInterest())
+        after.restore(state, OPEN + timedelta(minutes=11))
+        assert after.portfolio.straddle == before.portfolio.straddle
+        assert after.portfolio.hedge.quantity == before.portfolio.hedge.quantity
+        assert after.portfolio.realised_pnl == before.portfolio.realised_pnl
+        assert after.portfolio.fees_paid == before.portfolio.fees_paid
+        assert after._session_start_equity == before._session_start_equity
+        assert after._entries_this_session == before._entries_this_session
+        price = 4985.0
+        assert after._position_pnl(None, price) == pytest.approx(
+            before._position_pnl(None, price)
+        )
+
+    def test_the_journal_writes_the_state_after_a_decision(self, tmp_path):
+        from deltahedger.broker.paper import SimulatedExecution
+        from deltahedger.data.base import MarketBar
+        from deltahedger.strategy import GexStraddleStrategy
+
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        cfg.gates.ensemble = cfg.gates.persistence = cfg.gates.entry_window = False
+        journal = SessionJournal(tmp_path)
+        driver = JournallingStrategy(
+            GexStraddleStrategy(cfg, open_interest=FakeOpenInterest()), journal
+        )
+        driver.on_bar(MarketBar(OPEN, 5000.0, 5000.0, 5000.0, 5000.0, 0.15),
+                      SimulatedExecution(cfg.costs, cfg.source))
+        state = journal.read_state()
+        assert state is not None and state["straddle"] is not None
+        assert state["straddle"]["expiry"] == OPEN.date().isoformat()
+
+    def test_a_matching_broker_position_is_re_adopted(self, tmp_path, monkeypatch):
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        held = open_a_straddle(cfg)
+        SessionJournal(tmp_path).write_state(held.snapshot(OPEN + timedelta(minutes=10)))
+
+        runner = build_runner(tmp_path)
+        patch_session(monkeypatch, runner, OPEN + timedelta(minutes=15))
+        runner.connection.ib.positions = lambda *_: legs_for(held) + [
+            _Position(_Contract("FUT", "MES"), held.portfolio.hedge.quantity, 5000.0 * 5)
+        ]
+        runner.run(max_cycles=1)
+        book = runner.strategy.portfolio
+        assert book.straddle == held.portfolio.straddle
+        assert book.hedge.quantity == held.portfolio.hedge.quantity
+        assert runner.connection.connects == 1
+
+    def test_an_unmatched_broker_position_is_still_refused(self, tmp_path, monkeypatch):
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        held = open_a_straddle(cfg)
+        # The record says one size; the broker holds another.
+        state = held.snapshot(OPEN + timedelta(minutes=10))
+        state["straddle"]["quantity"] -= 1
+        SessionJournal(tmp_path).write_state(state)
+
+        runner = build_runner(tmp_path, reconnect=False)
+        patch_session(monkeypatch, runner, OPEN + timedelta(minutes=15))
+        runner.connection.ib.positions = lambda *_: legs_for(held)
+        with pytest.raises(RuntimeError, match="unmanaged option position"):
+            runner.run(max_cycles=1)
+
+    def test_a_record_with_no_broker_position_is_discarded(self, tmp_path, monkeypatch):
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        held = open_a_straddle(cfg)
+        SessionJournal(tmp_path).write_state(held.snapshot(OPEN + timedelta(minutes=10)))
+
+        runner = build_runner(tmp_path)
+        patch_session(monkeypatch, runner, OPEN + timedelta(minutes=15))
+        runner.run(max_cycles=1)
+        book = runner.strategy.portfolio
+        assert book.straddle is None
+        # The tallies still carry: the fees and realised P&L are real.
+        assert book.fees_paid == held.portfolio.fees_paid
+        assert runner.strategy._entries_this_session == held._entries_this_session
+
+    def test_the_position_is_hedged_through_a_reconnection(self, tmp_path, monkeypatch):
+        """The whole point: a drop with the straddle open comes back with
+        the straddle, not with a reconnect loop next to it."""
+        cfg = Config()
+        cfg.starting_equity = 250_000.0
+        held = open_a_straddle(cfg)
+        SessionJournal(tmp_path).write_state(held.snapshot(OPEN + timedelta(minutes=10)))
+
+        runner = build_runner(tmp_path, drop_after=2)
+        patch_session(monkeypatch, runner, OPEN + timedelta(minutes=15))
+        runner.connection.ib.positions = lambda *_: legs_for(held)
+        runner.run(max_cycles=6)
+        assert runner.connection.connects >= 2
+        assert runner.strategy.portfolio.straddle == held.portfolio.straddle

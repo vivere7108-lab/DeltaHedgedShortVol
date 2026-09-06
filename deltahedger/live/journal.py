@@ -18,9 +18,17 @@ Three files per session date, under ``live.journal_dir``:
     This is the series you need to answer "was the band ever binding?" or
     "how long did the regime hold?" after the fact.
 
+``state.json``
+    The book as of the last decision: the open straddle and what it was
+    opened for, the hedge, the realised tallies, the session's loss-limit
+    baseline and entry count.  Rewritten whole whenever any of it changes.
+    This is what lets the runner re-adopt its own position after the
+    daily gateway restart instead of refusing to start next to it.
+
 Appending rather than rewriting is deliberate: a restart mid-session adds to
 the day's files instead of truncating them, so an interrupted forward walk
-loses the position but not the history.  ``deltahedger report`` reads them
+loses nothing -- the history is in the ``.jsonl`` files and the position
+is in ``state.json``.  ``deltahedger report`` reads them
 back into the same frames the backtest produces, so a paper session and a
 backtest are analysed with one set of tools.
 """
@@ -47,6 +55,13 @@ def _plain(value: Any) -> Any:
         return [_plain(v) for v in value]
     if isinstance(value, float) and value != value:  # NaN
         return None
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        # A numpy scalar (np.float64, np.bool_) leaks in from the greeks;
+        # json refuses them, and they mean exactly what the builtin does.
+        try:
+            return _plain(value.item())
+        except (AttributeError, ValueError):
+            return value
     return value
 
 
@@ -90,6 +105,37 @@ class SessionJournal:
     def counts(self) -> dict[str, int]:
         return dict(self._written)
 
+    # -- the book, for a restart ------------------------------------------
+
+    @property
+    def state_path(self) -> Path:
+        return self.directory / "state.json"
+
+    def write_state(self, state: dict) -> None:
+        """Replace the recorded book with ``state``, atomically.
+
+        Written whole and renamed into place, so a process killed mid-write
+        leaves the previous record rather than half of a new one.  Never
+        raises, for the same reason the record writers do not.
+        """
+        try:
+            tmp = self.state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(_plain(state), indent=1), encoding="utf-8")
+            tmp.replace(self.state_path)
+        except OSError as exc:
+            log.error("could not write the book's state (%s)", exc)
+
+    def read_state(self) -> dict | None:
+        """The recorded book, or ``None`` when there is none or it is unreadable."""
+        path = self.state_path
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("could not read the book's state at %s (%s)", path, exc)
+            return None
+
 
 class JournallingStrategy:
     """Wraps a strategy so everything it decides is written down.
@@ -105,6 +151,7 @@ class JournallingStrategy:
         self.journal = journal
         self._events_seen = 0
         self._fills_seen = 0
+        self._last_state: str | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.strategy, name)
@@ -120,7 +167,24 @@ class JournallingStrategy:
             self.journal.record_fill(fill)
         self._fills_seen = len(self.strategy.fills)
         self.journal.record_bar(state)
+        self.save_state()
         return state
+
+    def save_state(self) -> None:
+        """Write the book's state when it has changed since the last write.
+
+        The snapshot is what a restarted process re-adopts the position
+        from, so it has to be current to the last decision -- but a poll
+        that decided nothing has nothing new to say, and rewriting the same
+        file every few seconds is noise.
+        """
+        snapshot = self.strategy.snapshot()
+        key = json.dumps(_plain({k: v for k, v in snapshot.items() if k != "as_of"}),
+                         sort_keys=True)
+        if key == self._last_state:
+            return
+        self._last_state = key
+        self.journal.write_state(snapshot)
 
 
 def read_journal(directory: str | Path, kind: str, day: date | None = None):

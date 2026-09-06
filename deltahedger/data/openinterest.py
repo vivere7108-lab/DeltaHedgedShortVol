@@ -25,7 +25,10 @@ GEX calculator cannot tell them apart:
 ``CsvOpenInterest``
     Replays real open interest you already have, keyed by expiry date.
 
-The IBKR provider lives in ``broker.ibkr`` with the rest of the live path.
+The live providers are elsewhere: the MDP 3.0 intraday snapshot in
+``data.mdp`` (the one the 0DTE read is built on), and the IBKR generic-tick
+provider in ``broker.ibkr`` (the previous session's close).
+``build_live_open_interest_provider`` picks between them for the runner.
 
 A note on the anchor
 --------------------
@@ -238,6 +241,12 @@ def build_open_interest_provider(cfg, source: RiskSource):
         return SyntheticOpenInterest(cfg.data, source)
     if kind == "csv":
         return CsvOpenInterest(cfg.data, source)
+    if kind == "mdp":
+        raise ValueError(
+            "data.open_interest == 'mdp' is the live intraday snapshot; it is "
+            "available in `deltahedger live`, not in a backtest. Use 'csv' to "
+            "replay real open interest historically."
+        )
     if kind == "ibkr":
         raise ValueError(
             "data.open_interest == 'ibkr' needs a live IBKR connection; it is "
@@ -246,5 +255,35 @@ def build_open_interest_provider(cfg, source: RiskSource):
         )
     raise ValueError(
         f"unknown open-interest source {cfg.data.open_interest!r}; use "
-        "'synthetic', 'csv' or 'ibkr'"
+        "'synthetic', 'csv', 'mdp' or 'ibkr'"
+    )
+
+
+def build_live_open_interest_provider(cfg, source: RiskSource, connection=None):
+    """The provider for ``deltahedger live``: the MDP snapshot, or IBKR's.
+
+    ``mdp`` is the one the 0DTE read is defensible on.  ``ibkr`` is kept
+    reachable, with a warning, because it is what an account without a
+    feed has -- but it is the previous session's close, and a walk on it
+    is a walk on a stale book.
+    """
+    kind = cfg.data.open_interest.lower()
+    if kind == "mdp":
+        from .mdp import MdpOpenInterest
+
+        return MdpOpenInterest(cfg.data, source)
+    if kind == "ibkr":
+        if connection is None:
+            raise ValueError("data.open_interest == 'ibkr' needs the IBKR connection")
+        from ..broker.ibkr import IbkrOpenInterestProvider
+
+        log.warning(
+            "data.open_interest is 'ibkr': generic tick 101 is the previous "
+            "session's open interest, not an intraday print. The 0DTE read is "
+            "built on a stale book; use 'mdp' with `deltahedger mdp-feed`."
+        )
+        return IbkrOpenInterestProvider(connection, cfg)
+    raise ValueError(
+        f"data.open_interest == {cfg.data.open_interest!r} is not a live source; "
+        "`deltahedger live` needs 'mdp' (the intraday feed) or 'ibkr'"
     )

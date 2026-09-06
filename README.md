@@ -106,7 +106,7 @@ would trade 2026-09-08 (0DTE, 5.5h), IV 0.140, spot 5,000.00
   peak gamma     5,010
   regime         positive
   because        GEX +924.2M/1% at 5,000.00, flip 4,972.5 (29% of gross): dealers are long gamma ...
-  ensemble       all 9 ensemble members read positive
+  ensemble       all 9 ensemble members read positive (gate off; shown for information)
   would          SHORT the ATM straddle and collect theta
 ```
 
@@ -116,14 +116,18 @@ A dealer does not hedge a series; they hedge a book, and their delta is the
 sum over everything they carry. `gex.blend_front_expiries` (on by default)
 reads the profile as the sum across every listed expiry from today's out to
 the traded one, capped by `gex.blend_max_expiries` (4). For most of the day
-that is today's series alone. In the roll window — the last quarter hour,
-when tomorrow's series is the one being entered — it is today's and
-tomorrow's together, and today's expiring gamma is still the larger part of
-what dealers are hedging:
+that is today's series alone. A series inside its own pre-settlement buffer
+is dropped from the blend unless the book is on it: from 15:45 the flat
+book's read is built on tomorrow's series alone, which is the book that
+will still exist tonight and the one the overnight position is chosen
+against. (Kept in, the expiring leg would outweigh tomorrow's about seven
+to one per contract, floor and all, and pick the overnight side on gamma
+that stops existing at the bell.) With a wider tenor several series sit in
+the blend at once:
 
 ```
-would trade 2026-09-09 (1DTE, 24.2h), IV 0.140, spot 5,000.00
-  regime read on 2 front expiries
+would trade 2026-09-10 (2DTE, 48.2h), IV 0.140, spot 5,000.00
+  regime read on 3 front expiries
 ```
 
 No weighting is applied: GEX is already gamma-weighted, and gamma scales
@@ -147,11 +151,16 @@ result here can mean:
    believed, and the ensemble gate (below) turns that variation into a
    trading rule rather than a one-off stress test.
 2. **OI is only as fresh as the feed.** With intraday open interest from the
-   MDP 3.0 feed the same-day print describes the book that is there, which
-   is what makes trading the 0DTE series on it defensible. On a feed that
-   only carries the previous session's close it is stalest exactly where
-   most of the flow is, and nothing in the GEX layer can tell the
-   difference. `gex.refresh_seconds` is how often the print is re-read.
+   exchange's MDP 3.0 feed (`data.open_interest: mdp`, through the snapshot
+   `deltahedger mdp-feed` writes — see "Where open interest comes from")
+   the same-day print describes the book that is there, which is what makes
+   trading the 0DTE series on it defensible. IBKR's generic tick 101
+   (`ibkr`) only carries the previous session's close: stalest exactly
+   where most of the flow is, and nothing in the GEX layer can tell the
+   difference, so `deltahedger doctor` fails a walk configured on it.
+   `gex.refresh_seconds` is how often the print is re-read; a snapshot
+   older than `data.oi_max_age_seconds` reads as no open interest and the
+   strategy stands aside rather than read a stale book.
 3. **Expiring gamma is a spike.** Near expiry, gamma concentrates at the
    money and vanishes elsewhere, so the 0DTE leg of the blend can be
    dominated by two or three strikes and get noisy. `gex.min_hours_to_expiry`
@@ -177,8 +186,8 @@ entitled to make:
    `0.15`) — `|total GEX| / gross GEX` on a 0–1 scale. A book with matched
    call and put gamma nets to nothing, and its sign is then decided by noise
    in the open-interest print.
-2. **Ensemble invariance** (`gates.ensemble`) — recompute the regime over a
-   small grid of `vol.skew_slope` perturbations
+2. **Ensemble invariance** (`gates.ensemble`, **off by default**) —
+   recompute the regime over a small grid of `vol.skew_slope` perturbations
    (`gates.ensemble_skew_slope_deltas`) and dealer sign-convention
    perturbations (`gates.ensemble_sign_conventions`), and trade only when
    every member agrees, NEUTRAL included. Both perturbed inputs are the
@@ -187,11 +196,19 @@ entitled to make:
    the market. The sign-convention members are re-weightings of the
    standard assumption, not inversions of it — an inverted member flips the
    answer by construction, which would make unanimity unreachable and the
-   gate mean "never trade."
-3. **Persistence** (`gates.persistence`, `gates.persistence_bars`, default
-   `3`) — a regime must hold this many consecutive bars before it counts as
-   an entry or exit trigger. A regime that flickers bar to bar is spot
-   crossing a level, not positioning changing, and trading it churns.
+   gate mean "never trade." It ships off: on generated data it never earned
+   its keep, and a forward walk without it is the evidence that would say
+   whether it should be on. (Note that the members are the *shipped*
+   conventions, not re-weightings of whatever `gex.call_sign`/`put_sign`
+   are set to, so with the gate on an inverted convention never trades.)
+3. **Persistence** (`gates.persistence`, `gates.persistence_seconds`,
+   default `600`) — a regime must have been read continuously for this
+   long, in wall-clock seconds from the first bar of the streak, before it
+   counts as an entry or exit trigger. Seconds rather than bars because the
+   backtest offers a bar every five minutes and the live runner one every
+   five seconds; a bar count would make the same setting mean fifteen
+   minutes in one and fifteen seconds in the other. A regime that flickers
+   is spot crossing a level, not positioning changing, and trading it churns.
    Applies symmetrically to entries *and* to the regime-flip exit: a flip
    that has not yet held is recorded (`exit_deferred`) and the position
    stays open, never silently dropped.
@@ -200,9 +217,11 @@ entitled to make:
    window: the opening minutes are skipped for wide quotes and an unsettled
    chain, and a same-day straddle entered late in the afternoon has little
    premium left and a gamma the hedger will be fighting within the hour.
-   **The end-of-day roll is exempt** — inside today's pre-settlement buffer
-   the next series may be opened whatever the window says, because that is
-   the only moment it can be. Exits are **never** gated by the window, and
+   **The end-of-day roll is exempt** — inside the `roll_window_minutes`
+   after today's settlement the next series may be opened whatever the
+   window says, because that is the only moment it can be. Nothing is ever
+   opened inside the pre-settlement buffer itself. Exits are **never** gated
+   by the window, and
    none of the four gates ever blocks a hard exit — a gate can delay a side
    change; it can never keep a position past where the end-of-day rules say
    it has to come off. Wired into `strategy._try_entry` rather than the bar
@@ -399,14 +418,24 @@ interval. The same buffer decides which series may be *entered*: one
 inside it is never opened, so `select_expiry` never hands the strategy a
 position already due to close.
 
-**The roll.** With `strategy.roll_at_expiry` (on) the moment today's series
-is closed the next session's is eligible to be opened in its place, and
-carried overnight to become tomorrow's 0DTE position. It goes through every
-GEX gate — the read is blended over today's and tomorrow's books in that
-window — through the sizing, and through the two rules below; it is exempt
-only from the entry window, because 15:45 is the one moment the roll can
+**The roll.** With `strategy.roll_at_expiry` (on), once today's series has
+settled the next session's is eligible to be opened in its place — inside
+`strategy.roll_window_minutes` (45) after the bell, so from 16:00 to 16:45,
+before the CME maintenance break — and carried overnight to become
+tomorrow's 0DTE position. The book sits out the quarter hour between the
+buffer and the bell: nothing is opened inside the buffer, whatever the
+entry window says, because the read there would still be dominated by an
+expiring book whose gamma is about to stop existing. The roll goes through
+every GEX gate — the read is built on tomorrow's book alone — through the
+sizing, and through the two rules below; it is exempt only from the entry
+window, because the window after the bell is the one moment the roll can
 happen. It counts against `max_entries_per_session`. Off, the book is flat
 from the buffer to the next morning's window.
+
+The backtest exercises the roll only where its bars reach the bell: the
+synthetic source stamps a bar at 16:00, RTH-only history from IBKR stamps
+its last bar at 15:55, so on real history the roll and the overnight carry
+are exercised by the forward walk alone.
 
 **No positions over a gap.** With `strategy.hold_over_weekends` off (the
 default) a series on the far side of a weekend or an exchange holiday is
@@ -654,9 +683,11 @@ The suite has 530 tests. The load-bearing ones:
   that bar was held to or half a contract, whichever is wider;
 - **the zero-edge panel**, **the overnight-inclusive panel**, and **the
   frequency scaling**, described above;
-- **the end of the day** — the 15:45 exit, the roll into tomorrow's series
-  on the same bar, that the roll is exempt from the entry window and
-  nothing else, that Friday and the eve of a holiday do not roll, that a
+- **the end of the day** — the 15:45 exit, that nothing is opened inside
+  the buffer and the read there excludes the expiring series, the roll into
+  tomorrow's series at the 16:00 bar, that the roll is exempt from the
+  entry window and nothing else and that its window closes, that Friday
+  and the eve of a holiday do not roll, that a
   position across a gap is closed before it, and that the blackout closes,
   blocks and then lets the position back on
   (`tests/test_strategy.py::TestEndOfDay`, `::TestEventBlackout`,
@@ -829,10 +860,18 @@ Stated plainly, because they bound what the backtest can tell you:
 9. **The event calendar is maintained by hand.** `configs/events.txt`
    lists FOMC statements; nothing verifies it against the Fed, and nothing
    in it knows about CPI or payrolls unless you add them.
-10. **The open-interest blend reads several expiries at once.** Live, each
-    one is a separate subscription batch (`IbkrOpenInterestProvider`,
-    capped at `MAX_CONCURRENT` lines per batch), so the blended read in the
-    roll window is built from open interest sampled a few seconds apart.
+10. **The open-interest snapshot is only as current as the feed process.**
+    `deltahedger mdp-feed` rewrites it every thirty seconds while updates
+    arrive; the strategy re-reads it on `gex.refresh_seconds` and refuses
+    one older than `data.oi_max_age_seconds`. The Databento adapter that
+    writes it is written against their published API and exercised here
+    only with synthetic records — run `deltahedger doctor` against a live
+    snapshot before trusting a walk to it.
+11. **Live entries and exits are priced off the model, not the book.** The
+    live path reads the ATM vol off the chain and marks the position with
+    the vol surface at that level; a stop or target on a strike that has
+    moved away from the money is judged on a modelled mark, and the market
+    order that follows fills wherever the market is.
 
 ## Running unattended
 
@@ -842,9 +881,17 @@ backtest never sees, and produce evidence that outlives it.
 - **IBKR force-restarts the gateway once a day**, dropping every API
   connection. The runner reconnects with exponential backoff and
   re-reconciles against the broker's positions rather than resuming a stale
-  in-memory book. The failure budget counts *consecutive* failures, so a
-  walk that reconnects cleanly every night is not eventually killed for
-  having worked.
+  in-memory book. The rolled straddle is open through exactly that, so the
+  book is written to the journal's `state.json` after every decision and
+  **re-adopted** on reconnection when the broker's legs match the record
+  exactly — entry prices, regime, hedge P&L so far, the session's
+  loss-limit baseline and entry count all carry over. An option position
+  the record does not describe is still refused. The deployment puts the
+  restart inside the **CME maintenance break** (17:00–18:00 New York), when
+  the future is halted: the runner idles through the break rather than
+  polling a dead quote, so a restart there costs the book nothing. The
+  failure budget counts *consecutive* failures, so a walk that reconnects
+  cleanly every night is not eventually killed for having worked.
 - **Every decision is journalled to disk as it happens** — JSON Lines,
   flushed per record, appended rather than rewritten, under
   `live.journal_dir`. Each bar record carries the band that applied to it
@@ -853,14 +900,17 @@ backtest never sees, and produce evidence that outlives it.
 - **`deltahedger doctor`** checks the connection, the account type, contract
   qualification, the ATM quote, whether a series is eligible right now,
   the event calendar, and — the one most likely to waste a week — whether
-  the account actually receives **generic tick 101 (option open interest)**.
+  the **MDP 3.0 open-interest snapshot** is present, fresh and covers the
+  traded expiry. A config still on generic tick 101 fails the check by
+  name.
 - **A heartbeat every five minutes**, so a quiet log and a stalled process
   can be told apart.
 - **The loop does not stop at the bell.** The rolled position is carried
   overnight, so `LiveRunner` keeps polling and hedging (under the widened
   overnight band) for as long as anything is open, honours a pre-market
-  event blackout on the way, and only idles outside RTH once the book is
-  flat — which, with the weekend rule on, is every Friday from 15:45.
+  event blackout on the way, wakes for the roll window after the bell, and
+  otherwise idles outside RTH once the book is flat — which, with the
+  weekend rule on, is every Friday from 15:45.
 
 ## Live trading safety
 
@@ -909,8 +959,31 @@ number.
 
 ## Requirements
 
-Python 3.10+, `numpy`, `scipy`, `pandas`, `PyYAML`. Live trading, history
-and live open interest also need `ib_async` and a running TWS or IB Gateway
-with CME market data. Reading open interest needs the market-data permission
-that carries generic tick 101; without it the live runner logs that GEX
-cannot be computed and stands aside rather than guessing a side.
+Python 3.10+, `numpy`, `scipy`, `pandas`, `PyYAML`. Live trading and history
+also need `ib_async` and a running TWS or IB Gateway with CME market data.
+Intraday open interest needs the `databento` package (`pip install -e
+'.[mdp]'`) and a Databento key with access to `GLBX.MDP3`; without a fresh
+snapshot the live runner logs that GEX cannot be computed and stands aside
+rather than guessing a side.
+
+## Where open interest comes from
+
+GEX has one input. Four providers produce the same `StrikeOpenInterest`
+rows and the calculator cannot tell them apart:
+
+| `data.open_interest` | what it is | where it runs |
+|---|---|---|
+| `mdp` | the exchange's **intraday** open interest off the MDP 3.0 feed, via the snapshot `deltahedger mdp-feed` writes to `data.oi_mdp_path` | `live`, `doctor` |
+| `ibkr` | IBKR generic tick 101 — the **previous session's close**; kept for an account with no feed, and `doctor` says so | `live` |
+| `csv` | real open interest you already have, keyed by expiry | `backtest` |
+| `synthetic` | a generated surface, for exercising the machinery | `backtest` |
+
+`deltahedger mdp-feed -c configs/es_paper.yaml` runs as its own process
+(`deploy/deltahedger-oi.service`): it subscribes to every ES option on
+Databento's `GLBX.MDP3` (`definition` for what each instrument is,
+`statistics` for its open interest) and rewrites the snapshot every thirty
+seconds. The runner reads the file, never the socket, so a feed hiccup
+cannot take the hedger with it, and a snapshot older than
+`data.oi_max_age_seconds` reads as no open interest — the strategy stands
+aside rather than read a stale book. Any other MDP 3.0 consumer can write
+the same file; `deltahedger/data/mdp.py` documents the format.

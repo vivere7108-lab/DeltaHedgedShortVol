@@ -1,5 +1,5 @@
 # The forward walk: IBKR paper account, real bars, real open interest,
-# 0DTE straddles rolled at the bell, sized to the margin limit, hedged
+# 0DTE straddles rolled after the bell, sized to the margin limit, hedged
 # under a Whalley-Wilmott band.
 #
 #   deltahedger live -c configs/es_paper.yaml --dry-run     # decides, places nothing
@@ -49,7 +49,8 @@ strategy:
   entry_time: '09:35'
   entry_cutoff_time: '14:30'
   close_before_expiry_minutes: 15  # out before the expiry gamma spike ...
-  roll_at_expiry: true             # ... and into tomorrow's series
+  roll_at_expiry: true             # ... and into tomorrow's series once
+  roll_window_minutes: 45          #     today's has settled, 16:00-16:45
   hold_over_weekends: false        # flat from Friday 15:45 to Monday 09:35
   events_path: configs/events.txt  # FOMC statements; verify before a walk
   event_blackout_minutes_before: 15
@@ -60,7 +61,14 @@ strategy:
 
 data:
   source: ibkr
-  open_interest: ibkr              # the exchange's OI, not a generated surface
+  # Intraday open interest off the exchange's MDP 3.0 feed, through the
+  # snapshot `deltahedger mdp-feed` writes (Databento GLBX.MDP3; needs
+  # DATABENTO_API_KEY). This is the input the 0DTE read is defensible on.
+  # `ibkr` (generic tick 101) is the previous session's close and is kept
+  # only as a fallback for an account with no feed.
+  open_interest: mdp
+  oi_mdp_path: runs/live/open_interest.json
+  oi_max_age_seconds: 1800         # a staler snapshot reads as no OI: stand aside
   bar_size: 5 mins
 
 ibkr:

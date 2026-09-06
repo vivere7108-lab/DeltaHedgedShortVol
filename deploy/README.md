@@ -16,11 +16,14 @@ tell you which.
   IB Gateway is a Java desktop app and wants about 1 GB on its own.
 - An **IBKR paper account** with CME futures market data. The username and
   password go on the box; plan for that before you start.
-- The market-data permission that carries **generic tick 101 (option open
-  interest)**. Without it there is no GEX, and the strategy stands aside on
-  every bar — correctly, but you will have deployed a system that does
-  nothing. `doctor` checks this explicitly because it is the failure most
-  likely to waste a week.
+- A **Databento** key with access to `GLBX.MDP3`, for the intraday open
+  interest the GEX read is built on (`deltahedger mdp-feed`, run as
+  `deltahedger-oi.service`). Without a fresh snapshot there is no GEX, and
+  the strategy stands aside on every bar — correctly, but you will have
+  deployed a system that does nothing. `doctor` checks the snapshot's age
+  and coverage explicitly because it is the failure most likely to waste a
+  week. IBKR's generic tick 101 is *not* a substitute: it is the previous
+  session's close.
 - Timezone sanity: the exchange calendar is America/New_York and the code
   converts, but a VPS whose clock is wrong will enter at the wrong time.
   Check `timedatectl` and make sure NTP is on.
@@ -54,6 +57,13 @@ human to type a password, and **IBKR forces it to restart every day**. IBC
 handles both. Without it your walk dies at the first restart and the
 strategy log looks completely healthy while it happens.
 
+The forced restart is scheduled at **17:05 New York** (`AutoRestartTime` in
+`/etc/ibc/config.ini`), inside the CME maintenance break (17:00–18:00) when
+the future is halted. The rolled straddle is open through the night and the
+runner re-adopts it from its journal on reconnection, but a restart while
+nothing trades is the one that can cost the book nothing: no quote to miss,
+no move to hedge. Keep it inside that hour.
+
 Then put your credentials in:
 
 ```bash
@@ -74,6 +84,14 @@ reboot needs you present, which defeats the point.
 ```bash
 sudo systemctl enable --now ibc
 sudo journalctl -u ibc -f
+```
+
+The open-interest feed needs its key in `/etc/deltahedger.env`
+(`DATABENTO_API_KEY`), then:
+
+```bash
+sudo systemctl enable --now deltahedger-oi
+sudo journalctl -u deltahedger-oi -f
 ```
 
 First login usually triggers **two-factor on your phone**. Approve it. IBKR
@@ -248,30 +266,36 @@ pointed at paper until the walk has earned a live account.
 ## What runs, and what it survives
 
 ```
-  ibc.service ──── IB Gateway under Xvfb, auto-login, daily self-restart
+  ibc.service ──── IB Gateway under Xvfb, auto-login, restarts 17:05 (the CME break)
        │
        │ API on 127.0.0.1:4002 (paper)
        ▼
   deltahedger.service ──── polls every 5s, journals every decision
-       │
+       │        ▲
+       │        │ reads runs/live/open_interest.json (stands aside if stale)
+       │   deltahedger-oi.service ──── MDP 3.0 open interest via Databento
        ▼
   /opt/deltahedger/runs/live/{events,fills,bars}-YYYY-MM-DD.jsonl
+  /opt/deltahedger/runs/live/state.json          the book, for a restart
 ```
 
-The two are ordered but **not bound**. The runner reconnects on its own with
-exponential backoff, so the daily gateway restart costs it a few seconds and
-nothing else; binding the units would restart the strategy every night for
-an event it already handles.
+The units are ordered but **not bound**. The runner reconnects on its own
+with exponential backoff, so the daily gateway restart costs it a few
+seconds and nothing else; binding the units would restart the strategy every
+night for an event it already handles. The feed and the runner share a file,
+not a process.
 
 | Failure | What happens |
 |---|---|
-| Daily gateway restart | Runner reconnects, backing off 15s → 300s. Logged. |
+| Daily gateway restart (17:05, in the CME break) | Runner reconnects, backing off 15s → 300s, and **re-adopts the open straddle** from `state.json` when the broker's legs match it. Logged. |
 | Network blip | Same path. |
 | Gateway crashes | systemd restarts `ibc` after 60s; runner reconnects when it returns. |
-| Strategy process dies | systemd restarts it after 30s; it re-reconciles positions against the broker rather than trusting a stale book. |
-| VPS reboot | Both units are enabled, so both come back. IBKR may want 2FA. |
+| Strategy process dies | systemd restarts it after 30s; it re-reconciles positions against the broker and re-adopts its own straddle from `state.json`, with its entry prices, regime, hedge P&L and the session's loss-limit baseline. |
+| Open-interest feed dies | systemd restarts it after 30s. Meanwhile the snapshot ages; past `data.oi_max_age_seconds` the runner reads no open interest and **stands aside** rather than trade on a stale book. An open position is still hedged. |
+| CME maintenance break (17:00–18:00) | Runner idles: no quote, nothing to hedge, nothing that can move. |
+| VPS reboot | All units are enabled, so all come back. IBKR may want 2FA. |
 | Journal write fails | Logged as an error; **trading continues**. Losing the log must not take the position with it. |
-| An option position it did not open | Refuses to start. Adopting a half-known straddle is how a book ends up long gamma while the strategy believes it is short it. |
+| An option position `state.json` does not describe leg for leg | Refuses to start. Adopting a half-known straddle is how a book ends up long gamma while the strategy believes it is short it. |
 
 Restart limits are deliberate on both units (5 starts per 10 minutes). A
 login loop against IBKR gets the account locked, which is much worse than
@@ -281,6 +305,7 @@ being down for a few minutes.
 
 ```bash
 sudo journalctl -u deltahedger -f                       # live decisions
+sudo journalctl -u deltahedger-oi --since today         # open-interest feed
 sudo journalctl -u ibc --since today                    # gateway health
 deltahedger report -c configs/es_paper.yaml             # session summary
 deltahedger report -c configs/es_paper.yaml --day 2025-09-02 --show-events
@@ -290,9 +315,9 @@ The runner logs a heartbeat every 5 minutes even when nothing happens, so a
 quiet log and a stalled process can be told apart.
 
 The journal is JSON Lines and append-only. A restart mid-session adds to the
-day's files rather than truncating them, so an interrupted walk loses the
-position but never the history. Analyse it with the same tools as a
-backtest:
+day's files rather than truncating them, and `state.json` carries the open
+position across it, so an interrupted walk loses neither the position nor
+the history. Analyse it with the same tools as a backtest:
 
 ```python
 from deltahedger.live.journal import read_journal
@@ -311,10 +336,11 @@ Not `git pull` as root — see "detected dubious ownership" above. Bootstrap
 prints the commit it landed on, so a stale checkout is visible rather than
 inferred.
 
-Do it outside market hours. A restart mid-session is safe — positions are
-re-read from the broker — but it drops the in-memory session P&L baselines
-the position-P&L exits are measured against, so an open long straddle would
-have its stop reset.
+Do it in the CME maintenance break (17:00–18:00 New York) if you can. A
+restart mid-session is safe — positions are re-read from the broker and the
+runner's own straddle is re-adopted from `state.json` with the baselines
+its exits are measured against — but nothing is gained by restarting while
+there is a quote to miss.
 
 ## Before you read anything into the results
 

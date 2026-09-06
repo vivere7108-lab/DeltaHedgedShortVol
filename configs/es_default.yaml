@@ -88,11 +88,14 @@ gates:
   confidence: true            # |total|/gross GEX below this reads as noise
   min_confidence_ratio: 0.15
   flip_distance: true         # spot within flip_proximity_pct of the flip
-  ensemble: true               # unanimous across a skew/sign-convention grid
+  ensemble: false              # unanimity across a skew/sign-convention grid;
+                               # off: it has not earned its keep, and a walk
+                               # without it is the evidence either way
   ensemble_skew_slope_deltas: [-0.5, 0.0, 0.5]
   ensemble_sign_conventions: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
-  persistence: true            # a regime must hold this many bars in a row
-  persistence_bars: 3
+  persistence: true            # a regime must have held this long, in seconds
+                               # of wall-clock time, before it is acted on
+  persistence_seconds: 600.0
   entry_window: true           # entries only inside strategy.entry_time/
                                # entry_cutoff_time, plus the end-of-day roll;
                                # exits are never gated
@@ -127,10 +130,15 @@ strategy:
   entry_cutoff_time: '14:30'
   # THE END OF THE DAY. Close the 0DTE position this long before settlement
   # -- the last quarter hour is where an ATM straddle's gamma diverges --
-  # and, in that window, open tomorrow's series in its place and carry it
-  # overnight.
+  # sit out until it settles, then open tomorrow's series in its place and
+  # carry it overnight.
   close_before_expiry_minutes: 15
-  roll_at_expiry: true            # off: nothing is opened inside the buffer
+  # Once today's series has settled, open tomorrow's inside this window
+  # after the bell (before the 17:00 CME maintenance break). Nothing is
+  # ever opened inside the buffer itself: the expiring book's gamma is a
+  # spike about to stop existing and must not pick the overnight side.
+  roll_at_expiry: true            # off: nothing is opened after the buffer
+  roll_window_minutes: 45
   # Never hold across a weekend or an exchange holiday: a gap with no
   # session in it cannot be hedged. Friday's roll is skipped and the book is
   # flat until Monday's entry window.
@@ -179,11 +187,14 @@ data:
   bar_size: 5 mins
   cache_dir: data_cache
   default_atm_iv: 0.15
-  # Where open interest comes from. `ibkr` is only available in
-  # `deltahedger live`; a backtest needs `csv` for real OI, or `synthetic`
-  # to exercise the machinery.
+  # Where open interest comes from. `mdp` (the exchange's intraday print,
+  # via `deltahedger mdp-feed`) and `ibkr` (the previous close) are only
+  # available in `deltahedger live`; a backtest needs `csv` for real OI, or
+  # `synthetic` to exercise the machinery.
   open_interest: synthetic
   oi_csv_path: null
+  oi_mdp_path: null               # e.g. runs/live/open_interest.json
+  oi_max_age_seconds: 1800.0      # an older mdp snapshot reads as no OI
 
 ibkr:
   host: 127.0.0.1

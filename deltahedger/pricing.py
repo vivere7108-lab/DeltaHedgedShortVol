@@ -119,7 +119,9 @@ def black76(
     sqrt_t = math.sqrt(t)
     pdf_d1 = norm.pdf(d1)
 
-    # Shared across rights.
+    # Shared across rights. The rate term below carries the same sign for
+    # both rights: theta = -dV/dT and V = e^{-rT} * (...), so the discount
+    # contributes +r*V whichever way round the payoff is.
     gamma = discount * pdf_d1 / (f * sigma * sqrt_t)
     vega = discount * f * pdf_d1 * sqrt_t
     time_decay = -discount * f * pdf_d1 * sigma / (2.0 * sqrt_t)
@@ -131,7 +133,7 @@ def black76(
     else:
         price = discount * (f * norm.cdf(d1) - k * norm.cdf(d2))
         delta = discount * norm.cdf(d1)
-        theta = time_decay - r * discount * (f * norm.cdf(d1) - k * norm.cdf(d2))
+        theta = time_decay + r * discount * (f * norm.cdf(d1) - k * norm.cdf(d2))
 
     return Greeks(
         price=price,
