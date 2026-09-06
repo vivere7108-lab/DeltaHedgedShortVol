@@ -95,6 +95,7 @@ def run_backtest(
         fixed_band=cfg.hedge.band,
         hedge_tick=risk_source.hedge.tick_size,
         hedge_quantum=risk_source.hedge_quantum,
+        sizing_binds=strategy.sizing_binds,
     )
     return BacktestResult(
         metrics=metrics,

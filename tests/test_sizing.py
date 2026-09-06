@@ -5,6 +5,7 @@ import pytest
 from deltahedger.chain import select_atm_straddle
 from deltahedger.config import SizingConfig, VolConfig
 from deltahedger.sizing import (
+    BIND_CAPITAL, BIND_GAMMA, BIND_MAX, BIND_RISK,
     FixedMarginModel, RegTMarginModel, SpanScanMarginModel,
     build_margin_model, size_straddles, straddle_debit,
 )
@@ -142,80 +143,160 @@ def _single_leg_worst_case(model, leg, t, future, es):
     return max(worst, model.short_option_minimum)
 
 
-class TestBuyingPower:
-    def test_contracts_scale_with_the_allocation(self, es, span):
-        quote = straddle(es)
-        small = size_straddles(
-            250_000, quote, F, SHORT, SizingConfig(buying_power_pct=0.30), es, span
-        )
-        big = size_straddles(250_000, quote, F, SHORT, SizingConfig(), es, span)
+#: What one straddle loses at its branch stop, as a fraction of the entry
+#: premium: 50% of the debit long, (2.5 - 1) x the credit short.
+LONG_STOP, SHORT_STOP = 0.50, 1.50
+
+
+def sized(es, span, equity=250_000, direction=SHORT, cfg=None, **kwargs):
+    stop = LONG_STOP if direction > 0 else SHORT_STOP
+    return size_straddles(
+        equity, straddle(es), F, direction, cfg or SizingConfig(), es, span,
+        stop_fraction=kwargs.pop("stop_fraction", stop), **kwargs,
+    )
+
+
+class TestTheThreeConstraints:
+    """The count is the smallest any constraint allows, and which one bound
+    is recorded. Each guards a different failure, so each is tested as the
+    one that binds."""
+
+    def test_the_risk_budget_binds_at_the_shipped_defaults(self, es, span):
+        """The point of the whole rule: at the margin limit the branch stops
+        were 5-8x the daily loss limit, so the daily limit was the only stop
+        that ever fired. The risk budget is what makes them reachable."""
+        for direction in (LONG, SHORT):
+            result = sized(es, span, direction=direction)
+            assert result.binding == BIND_RISK
+            assert result.limits[BIND_RISK] < result.limits[BIND_CAPITAL]
+
+    def test_a_full_stop_out_costs_about_the_risk_budget(self, es, span):
+        for direction, stop in ((LONG, LONG_STOP), (SHORT, SHORT_STOP)):
+            result = sized(es, span, direction=direction)
+            loss = result.contracts * result.risk_per_straddle
+            assert loss <= 0.05 * 250_000 + result.risk_per_straddle
+            assert result.risk_per_straddle == pytest.approx(
+                stop * straddle(es).price * es.option.multiplier
+            )
+
+    def test_a_wider_stop_earns_a_smaller_position(self, es, span):
+        """Risk-based sizing's defining property: the further away the stop,
+        the fewer contracts the same budget buys."""
+        near = sized(es, span, direction=SHORT, stop_fraction=0.5)
+        far = sized(es, span, direction=SHORT, stop_fraction=3.0)
+        assert near.contracts > far.contracts
+
+    def test_the_gamma_ceiling_binds_when_the_risk_budget_is_loose(self, es, span):
+        cfg = SizingConfig(risk_budget_pct=0.50)
+        result = sized(es, span, cfg=cfg)
+        assert result.binding == BIND_GAMMA
+        gamma = result.contracts * result.gamma_per_straddle
+        assert gamma <= cfg.gamma_ceiling_units_per_100k * 2.5 + result.gamma_per_straddle
+
+    def test_the_gamma_ceiling_holds_the_bet_steady_across_the_day(self, es, span):
+        """A cheap late straddle risks less per contract and carries more
+        gamma, so a risk budget alone lets the bet grow into the afternoon.
+        The ceiling is what stops it."""
+        morning, afternoon = straddle(es, t=T), straddle(es, t=1.5 / 24 / 365)
+        cfg = SizingConfig()
+        sizes = [
+            size_straddles(250_000, q, F, LONG, cfg, es, span, stop_fraction=LONG_STOP)
+            for q in (morning, afternoon)
+        ]
+        gammas = [r.contracts * r.gamma_per_straddle for r in sizes]
+        assert max(gammas) / min(gammas) < 2.0
+        without = SizingConfig(gamma_ceiling_units_per_100k=None)
+        loose = [
+            size_straddles(250_000, q, F, LONG, without, es, span, stop_fraction=LONG_STOP)
+            for q in (morning, afternoon)
+        ]
+        unbounded = [r.contracts * r.gamma_per_straddle for r in loose]
+        assert max(unbounded) / min(unbounded) > 3.0
+
+    def test_the_capital_cap_binds_once_the_others_are_off(self, es, span):
+        cfg = SizingConfig(risk_budget_pct=None, gamma_ceiling_units_per_100k=None)
+        result = sized(es, span, cfg=cfg)
+        assert result.binding == BIND_CAPITAL
+        assert result.total_margin <= result.budget
+
+    def test_with_the_others_off_the_count_scales_with_the_allocation(self, es, span):
+        off = dict(risk_budget_pct=None, gamma_ceiling_units_per_100k=None)
+        small = sized(es, span, cfg=SizingConfig(buying_power_pct=0.30, **off))
+        big = sized(es, span, cfg=SizingConfig(buying_power_pct=0.80, **off))
         assert big.contracts > small.contracts
 
+    def test_the_hard_cap_applies(self, es, span):
+        cfg = SizingConfig(max_straddles=3)
+        result = sized(es, span, equity=5_000_000, cfg=cfg)
+        assert result.contracts == 3
+        assert result.binding == BIND_MAX
+
+    def test_every_constraint_reports_what_it_would_have_allowed(self, es, span):
+        result = sized(es, span)
+        assert set(result.limits) == {BIND_RISK, BIND_GAMMA, BIND_CAPITAL, BIND_MAX}
+        assert result.contracts == min(result.limits.values())
+        assert f"risk {result.limits[BIND_RISK]}" in result.describe_limits()
+
+    def test_a_disabled_stop_falls_back_to_the_requirement(self, es, span):
+        """With no branch stop the loss being bounded is the requirement
+        itself -- the debit is a long straddle's maximum loss, and the SPAN
+        scan is the short's one-day adverse move."""
+        for direction in (LONG, SHORT):
+            result = sized(es, span, direction=direction, stop_fraction=None)
+            assert result.risk_per_straddle == pytest.approx(result.margin_per_contract)
+
+
+class TestBuyingPower:
     def test_the_default_allocation_is_the_margin_limit_less_a_fifth(self):
         """Everything up to the margin limit, with a 20% buffer left untouched."""
         assert SizingConfig().buying_power_pct == 0.80
 
     def test_a_fifth_of_equity_is_never_committed(self, es, span):
         for direction in (LONG, SHORT):
-            result = size_straddles(
-                250_000, straddle(es), F, direction, SizingConfig(), es, span
-            )
+            result = sized(es, span, direction=direction)
             assert result.budget <= 0.80 * 250_000 + 1e-6
             assert result.total_margin <= 0.80 * 250_000
 
     def test_budget_is_equity_times_the_allocation(self, es, span):
-        result = size_straddles(200_000, straddle(es), F, SHORT, SizingConfig(), es, span)
-        assert result.budget == pytest.approx(160_000.0)
+        assert sized(es, span, equity=200_000).budget == pytest.approx(160_000.0)
 
-    def test_a_reserve_is_held_back_for_the_hedge(self, es, span):
-        cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
-        result = size_straddles(200_000, straddle(es), F, SHORT, cfg, es, span)
-        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
-
-    def test_the_reserve_applies_to_the_long_side_too(self, es, span):
-        """The hedge leg needs margin whichever way the straddle is facing."""
-        cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
-        result = size_straddles(200_000, straddle(es), F, LONG, cfg, es, span)
-        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
+    def test_the_hedge_leg_has_room_without_a_reserve(self, es, span):
+        """The reserve is gone: with the risk budget binding, the straddle
+        takes about a tenth of equity, so the unused capital cap covers the
+        hedge even for a fully in-the-money book at the buffer."""
+        result = sized(es, span, direction=LONG)
+        worst_case_hedge = (
+            result.contracts * 100.0 / es.hedge_quantum * es.hedge_initial_margin
+        )
+        assert result.total_margin + worst_case_hedge < result.budget
 
     def test_the_default_cap_does_not_bind_at_an_ordinary_account_size(self, es, span):
-        """The count is decided by the budget; max_straddles is a backstop
-        against a sizing bug rather than a rule, so at a quarter-million
-        account it must not be what sets the size."""
-        result = size_straddles(250_000, straddle(es), F, SHORT, SizingConfig(), es, span)
-        assert result.ok and "capped" not in result.reason
+        """max_straddles is a backstop against a sizing bug rather than a
+        rule, so at a quarter-million account it must not set the size."""
+        result = sized(es, span)
+        assert result.ok and result.binding != BIND_MAX
         assert result.contracts < SizingConfig().max_straddles
 
     @pytest.mark.parametrize("direction", [LONG, SHORT])
     def test_the_requirement_never_exceeds_the_budget(self, es, span, direction):
         for equity in (50_000, 137_500, 400_000, 2_000_000):
-            result = size_straddles(
-                equity, straddle(es), F, direction, SizingConfig(), es, span
-            )
-            assert result.total_margin <= result.option_budget
+            result = sized(es, span, equity=equity, direction=direction)
+            assert result.total_margin <= result.budget
 
-    def test_too_little_buying_power_declines_with_a_reason(self, es, span):
-        result = size_straddles(2_000, straddle(es), F, SHORT, SizingConfig(), es, span)
+    def test_too_little_capital_declines_with_a_reason(self, es, span):
+        result = sized(es, span, equity=2_000)
         assert not result.ok
-        assert "buying power supports" in result.reason
+        assert "minimum is" in result.reason and "at risk" in result.reason
 
     def test_the_reason_names_the_right_kind_of_requirement(self, es, span):
-        long_result = size_straddles(500, straddle(es), F, LONG, SizingConfig(), es, span)
-        short_result = size_straddles(500, straddle(es), F, SHORT, SizingConfig(), es, span)
-        assert "debit" in long_result.reason
-        assert "margin" in short_result.reason
-
-    def test_the_hard_cap_applies(self, es, span):
-        cfg = SizingConfig(max_straddles=3)
-        result = size_straddles(5_000_000, straddle(es), F, SHORT, cfg, es, span)
-        assert result.contracts == 3
-        assert "capped" in result.reason
+        assert "debit" in sized(es, span, equity=500, direction=LONG).reason
+        assert "margin" in sized(es, span, equity=500, direction=SHORT).reason
 
     def test_zero_equity_trades_nothing(self, es, span):
-        assert not size_straddles(0.0, straddle(es), F, SHORT, SizingConfig(), es, span).ok
+        assert not sized(es, span, equity=0.0).ok
 
     def test_no_direction_sizes_nothing(self, es, span):
-        result = size_straddles(250_000, straddle(es), F, 0, SizingConfig(), es, span)
+        result = sized(es, span, direction=0)
         assert not result.ok
         assert "no direction" in result.reason
 

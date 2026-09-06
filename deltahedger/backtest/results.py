@@ -107,6 +107,11 @@ class Metrics:
     # Gate attribution: blocked entries and blocked flip exits by gate.
     gate_blocks: dict[str, int] = field(default_factory=dict)
     gate_blocked_exits: dict[str, int] = field(default_factory=dict)
+    #: Which sizing constraint decided each entry's size, and the median
+    #: straddle count held. A book always bound by ``capital`` is one whose
+    #: stop ladder cannot fire before the daily loss limit.
+    sizing_binds: dict[str, int] = field(default_factory=dict)
+    median_straddles: float = 0.0
 
     def summary(self) -> str:
         pct = lambda x: f"{x * 100:,.2f}%"  # noqa: E731
@@ -147,6 +152,8 @@ class Metrics:
                 "",
                 "Trading",
                 f"  entries              {self.entries}",
+                f"  median straddles     {self.median_straddles:,.0f}"
+                f"  (size bound by {self._sizing_line()})",
                 f"  median tenor traded  {self.median_days_to_expiry:,.1f} DTE",
                 f"  winning / losing days {self.winning_days} / {self.losing_days}"
                 f"  ({pct(self.win_rate)})",
@@ -180,6 +187,17 @@ class Metrics:
                 self._feasibility_note(),
                 self._branch_note(),
             ]
+        )
+
+    def _sizing_line(self) -> str:
+        """Which constraint set the size, and how often."""
+        if not self.sizing_binds:
+            return "nothing -- no entry was sized"
+        return ", ".join(
+            f"{name} {count}"
+            for name, count in sorted(
+                self.sizing_binds.items(), key=lambda row: -row[1]
+            )
         )
 
     def _band_heading(self) -> str:
@@ -228,9 +246,10 @@ class Metrics:
         )
         return (
             f"  -> the {heavier} branch carried {ratio:.1f}x the gamma of the "
-            "other, because\n     the two are sized by different constraints "
-            "(debit vs SPAN margin). Some\n     of any P&L difference between "
-            "them is position size, not signal."
+            "other. The two are sized\n     by the same three constraints but "
+            "on different numbers -- a stop-out costs\n     half the debit one "
+            "way and 1.5x the credit the other. Some of any P&L\n     "
+            "difference between them is position size, not signal."
         )
 
     def _regime_note(self) -> str:
@@ -448,9 +467,11 @@ def compute_metrics(
     fixed_band: float = 10.0,
     hedge_tick: float = 0.25,
     hedge_quantum: float = 0.0,
+    sizing_binds: dict[str, int] | None = None,
 ) -> Metrics:
     regime_pnl = regime_pnl or {}
     regime_trades = regime_trades or {}
+    sizing_binds = dict(sizing_binds or {})
     if bars.empty:
         return Metrics(
             starting_equity=starting_equity, final_equity=starting_equity,
@@ -635,6 +656,10 @@ def compute_metrics(
         event_exits=event_exits,
         gate_blocks=gate_blocks,
         gate_blocked_exits=gate_blocked_exits,
+        sizing_binds=sizing_binds,
+        median_straddles=(
+            float(held["straddle_contracts"].abs().median()) if not held.empty else 0.0
+        ),
     )
 
 

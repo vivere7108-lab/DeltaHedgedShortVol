@@ -101,13 +101,27 @@ gates:
                                # exits are never gated
 
 sizing:
-  # The book is sized to the margin limit, less a buffer. 80% of equity is
-  # the buying power the strategy may commit -- short-straddle margin, long-
-  # straddle debit, and the hedge reserve all come out of it -- and the
-  # remaining 20% is never touched. With the 30% hedge reserve that is 56%
-  # of equity to the straddles and 24% to the MES hedge.
+  # The straddle count is the SMALLEST of three constraints. Each guards a
+  # different failure and each one alone fails; `deltahedger sweep --sizing`
+  # prices them.
+  #
+  # 1. risk_budget_pct -- what normally binds. Size so a full stop-out costs
+  #    this much of equity: risk budget / what one straddle loses at its
+  #    branch stop. Sized to capital instead, the branch stops are 5-8x the
+  #    daily loss limit, so the daily limit fires first every time and the
+  #    exit ladder never runs.
+  # 2. gamma_ceiling_units_per_100k -- delta units of gamma per point per
+  #    $100k. The risk budget holds premium flat and lets gamma run: the
+  #    same budget buys 118 units of gamma at 09:35 and 512 at 14:30,
+  #    because a cheap late straddle risks less and carries more gamma.
+  # 3. buying_power_pct -- the capital cap, and now only a cap. The other
+  #    20% of equity is the buffer that is never touched. There is no hedge
+  #    reserve any more: with the risk budget binding the straddle takes
+  #    about a tenth of equity, so what the cap leaves unused covers the MES
+  #    margin even for a fully in-the-money book at the buffer.
   buying_power_pct: 0.80
-  hedge_margin_reserve_pct: 0.30
+  risk_budget_pct: 0.05            # null drops the constraint
+  gamma_ceiling_units_per_100k: 60.0   # null drops the constraint
   min_straddles: 1
   max_straddles: 500          # a backstop against a sizing bug, not a limit
   margin_model: span_scan     # span_scan | reg_t | fixed

@@ -284,19 +284,38 @@ class TestEntry:
     def test_the_short_position_respects_the_margin_budget(self):
         cfg = make_cfg(**{"sizing.buying_power_pct": 0.15})
         strategy = drive(cfg, [bar(0)], regime=POSITIVE)
-        budget = cfg.starting_equity * 0.15 * (1 - cfg.sizing.hedge_margin_reserve_pct)
+        budget = cfg.starting_equity * 0.15
         quote = _entry_quote(strategy)
         per = strategy.margin_model.straddle_requirement(quote, 5000.0, cfg.source, -1)
         assert abs(strategy.portfolio.straddle.quantity) * per <= budget * 1.001
 
     def test_the_long_position_never_spends_more_than_the_budget(self):
-        """A long straddle is paid for in cash; the debit is the constraint."""
+        """A long straddle is paid for in cash; the debit is the cap."""
         cfg = make_cfg(**{"sizing.buying_power_pct": 0.15})
         strategy = drive(cfg, [bar(0)], regime=NEGATIVE)
-        budget = cfg.starting_equity * 0.15 * (1 - cfg.sizing.hedge_margin_reserve_pct)
+        budget = cfg.starting_equity * 0.15
         position = strategy.portfolio.straddle
         debit = position.premium_at_risk(cfg.source.option.multiplier)
         assert 0 < debit <= budget * 1.001
+
+    def test_the_position_is_sized_so_its_stop_fires_before_the_daily_limit(self):
+        """The rule the risk budget exists for: a full stop-out has to cost
+        less than the daily loss limit, or the stop ladder never runs and
+        the daily limit is the only exit that ever fires."""
+        for regime, stop in ((NEGATIVE, 0.50), (POSITIVE, 1.50)):
+            cfg = make_cfg()
+            strategy = drive(cfg, [bar(0)], regime=regime)
+            position = strategy.portfolio.straddle
+            assert position is not None
+            premium = position.premium_at_risk(cfg.source.option.multiplier)
+            limit = cfg.strategy.daily_loss_limit_pct * cfg.starting_equity
+            assert stop * premium <= limit
+
+    def test_the_entry_records_which_constraint_set_the_size(self):
+        strategy = drive(make_cfg(), [bar(0)], regime=POSITIVE)
+        detail = details(strategy, "entry")[0]
+        assert "bound by risk" in detail and "at risk to its stop" in detail
+        assert strategy.sizing_binds == {"risk": 1}
 
     def test_open_interest_is_cached_rather_than_re_read_every_bar(self):
         """One read per expiry in the blend on the first bar, then nothing
@@ -573,10 +592,10 @@ class TestHedging:
 
     def test_the_band_is_a_property_of_the_book(self):
         """Under Whalley-Wilmott the band scales with gamma, so a bigger
-        allocation -- more straddles -- is held to a wider band in delta
-        units, and a flat book to none at all."""
-        small = drive(make_cfg(**{"sizing.buying_power_pct": 0.10}), [bar(0), bar(5)])
-        large = drive(make_cfg(**{"sizing.buying_power_pct": 0.80}), [bar(0), bar(5)])
+        risk budget -- more straddles, more gamma -- is held to a wider band
+        in delta units, and a flat book to none at all."""
+        small = drive(make_cfg(**{"sizing.risk_budget_pct": 0.01}), [bar(0), bar(5)])
+        large = drive(make_cfg(**{"sizing.risk_budget_pct": 0.20}), [bar(0), bar(5)])
         assert large.bar_states[-1].band_half_width > small.bar_states[-1].band_half_width > 0
         flat = drive(make_cfg(), [bar(0)], regime=NEUTRAL)
         assert flat.bar_states[-1].band_half_width == 0.0

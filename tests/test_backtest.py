@@ -63,10 +63,8 @@ def ungated(cfg: Config) -> Config:
     P&L accounting, the sign of the greeks -- the same way
     ``costs.enabled = False`` isolates it from commissions and
     ``pin_implied_vol`` isolates it from vega drift.  The gates are a
-    fourth thing that can differ between two otherwise-identical runs, and
-    one of them (``persistence``) counts *bars*, which would silently
-    confound a test that varies the bar size on purpose -- see
-    ``test_the_hedging_residual_shrinks_with_rebalance_frequency``.  With a
+    fourth thing that can differ between two otherwise-identical runs.
+    With a
     handful of gated trades over a run, a single differing entry can also
     swing a small-sample comparison either way, which is what the other
     three fixed here were actually catching.
@@ -265,10 +263,6 @@ class TestCorrectness:
                 )
             return (sum(v * v for v in values) / len(values)) ** 0.5
 
-        # Gated, ``persistence`` counts bars rather than time, so changing
-        # the bar size changes what "3 in a row" means in wall-clock terms
-        # and would pick a different set of entries at each frequency --
-        # confounding the one thing this test varies on purpose.
         assert rms("1 min") < rms("5 mins") < rms("15 mins")
 
     def test_the_overnight_gap_is_unbiased_even_though_it_is_unhedged(self):
@@ -357,9 +351,9 @@ class TestCorrectness:
         cfg.starting_equity = 3_000.0
         result = run_backtest(cfg)
         skipped = result.events[result.events["kind"] == "entry_skipped"]
-        assert skipped["detail"].str.contains("buying power supports").any()
+        assert skipped["detail"].str.contains("minimum is").any()
         for row in result.events[result.events["kind"] == "entry"].itertuples():
-            assert "of $" in row.detail  # every entry states the budget it fit inside
+            assert "bound by" in row.detail  # every entry names its constraint
 
 
 def uncapped(cfg: Config) -> Config:
@@ -448,10 +442,10 @@ class TestHedgeBehaviour:
 
     def test_the_band_widens_with_the_gamma_of_the_book(self):
         """The Whalley-Wilmott property, end to end: a book with more gamma
-        is held to a wider band in delta units, so a bigger allocation --
+        is held to a wider band in delta units, so a bigger risk budget --
         more straddles, more gamma -- gets a wider median band."""
-        small = run_backtest(synthetic(days=10, **{"sizing.buying_power_pct": 0.10}))
-        large = run_backtest(synthetic(days=10, **{"sizing.buying_power_pct": 0.80}))
+        small = run_backtest(synthetic(days=10, **{"sizing.risk_budget_pct": 0.01}))
+        large = run_backtest(synthetic(days=10, **{"sizing.risk_budget_pct": 0.20}))
         assert large.metrics.band_half_width > small.metrics.band_half_width
 
     def test_a_higher_risk_aversion_hedges_more_often(self):

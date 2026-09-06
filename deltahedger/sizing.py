@@ -1,11 +1,54 @@
 """Capital requirements and buying-power based position sizing.
 
-The number of straddles is driven by buying power, not by the delta target:
-``buying_power_pct`` (80% by default -- the margin limit less a 20% buffer)
-of portfolio equity is the budget, part of it is reserved for the hedge
-leg, and the remainder divided by the per-straddle requirement gives the
-count.  The delta band then absorbs whatever delta that position happens
-to carry.
+The number of straddles is the smallest count three constraints allow, and
+the delta band then absorbs whatever delta that position happens to carry::
+
+    contracts = min(risk budget      / loss per straddle at its branch stop,
+                    gamma ceiling    / gamma per straddle,
+                    capital cap      / margin or debit per straddle,
+                    max_straddles)
+
+**Why three.**  Sizing to the capital cap alone -- what this did until now,
+80% of equity less a hedge reserve -- makes the exit ladder decoration.  At
+$250k, spot 5000, 15 vol, a 0DTE book sized that way is 173 long straddles
+($140k of debit, 56% of equity) or 83 short ($139k of margin), and against
+a 5% daily loss limit:
+
+===========================  ==================  ========================
+branch                       its stop needs      the daily limit is
+===========================  ==================  ========================
+long, 50% of the debit       5.6x the limit      1.3 vol points of IV
+short, 2.5x the credit       8.1x the limit      2.8 vol points of IV
+short 1DTE at the roll       19.4x the limit     1.2 vol points of IV
+===========================  ==================  ========================
+
+So the daily loss limit fired first every time and halted the session --
+on generated data, 27 of 56 positions ended that way against 7 on a branch
+rule.  A book carrying $9,300 of vega per point against a $12,500 daily
+limit is sized so that ordinary intraday noise ends the day.
+
+The **risk budget** fixes that by inverting the question: rather than "how
+much capital may we commit", it asks "how much may a stop-out cost", and
+divides.  What one straddle loses at its stop is ``long_stop_loss_pct`` of
+the debit, or ``short_stop_loss_premium_multiple - 1`` times the credit;
+with the branch stop disabled it falls back to the requirement itself,
+which is the right number either way -- for a long straddle the debit *is*
+the maximum loss, and for a short one the SPAN scan is a one-day adverse
+move, which is exactly the loss being bounded.
+
+The **gamma ceiling** is there because the risk budget alone holds premium
+flat and lets gamma run: the same budget buys 30 straddles carrying 118
+delta units per point at 09:35 and 63 carrying 512 at 14:30, since a cheap
+late straddle risks less per contract and carries more gamma.  Gamma is
+what the strategy is a bet on, so the bet would silently grow into the end
+of the day.  Targeting gamma *alone* fails the other way -- at the 1DTE
+roll, where gamma per straddle is small, a flat gamma target buys 46% of
+equity in premium -- which is why the capital cap and the risk budget stay.
+
+The hedge leg has no reserve carved out for it any more.  With the risk
+budget binding, the straddle takes about a tenth of equity, and the unused
+part of the capital cap covers the MES margin even for a fully in-the-money
+book at the pre-settlement buffer.
 
 The requirement means different things in the two regimes, and conflating
 them would misstate the risk in both directions:
@@ -42,33 +85,43 @@ the tenor of what you are holding.  What changes is how much the straddle
 is worth *after* that move relative to what it is worth now, and a
 longer-dated straddle has already collected most of the value that move
 would create.  So the short branch's margin per straddle is close to flat
-across the range (measured at 5000, 15 vol, a 250k account)::
+across the range, while the debit roughly doubles from the morning's 0DTE
+entry to the afternoon's 1DTE roll.
 
-    tenor   premium   SPAN margin   debit    straddles short / long
-    0DTE      15.66        $1,699    $783                 15 / 25*
-    2DTE      46.97        $1,324   $2,349                 19 / 11
-    3DTE      56.45        $1,373   $2,822                 19 /  9
-    5DTE      71.73        $1,502   $3,586                 17 /  7
+Under the three constraints neither of those is what usually decides the
+count.  Measured at 5000, 15 vol, a $250k account, on the shipped
+settings::
 
-    (* capped by max_straddles rather than by the budget)
+    moment                premium   SPAN    debit   short n         long n
+    0DTE at 09:35 (6.4h)    16.17  $1,679    $809   10  risk    30  risk
+    0DTE at 12:00 (4.0h)    12.79  $1,822    $639   13  risk    30  gamma
+    0DTE at 14:30 (1.5h)     7.83  $2,063    $392   18  gamma   18  gamma
+    1DTE at the roll        31.32  $1,352  $1,566    5  risk    15  risk
 
-The **long branch is a different story**, because its requirement is the
-debit and the debit roughly doubles between the morning's 0DTE entry and
-the afternoon's 1DTE roll.  So the same ``buying_power_pct`` buys a short
-book of roughly the same size at either moment and a long book about half
-as big at the roll, and the two branches do not carry comparable gamma.
-That is a real asymmetry, it is a property of the requirement rather than
-of the signal, and the backtest's band section reports median gamma and
-band per branch so a regime comparison cannot mistake it for one.
+The short branch is smaller than the long one at the same risk budget, and
+that is the rule working rather than a bias: its stop sits 2.5x the credit
+away, so a stop-out costs 1.5x the premium against the long side's 0.5x,
+and a wider stop earns fewer contracts.  If that reads as too small, the
+lever is ``short_stop_loss_premium_multiple`` -- now that it is reachable,
+it is a real parameter rather than decoration -- not the budget.
+
+By the afternoon the gamma ceiling takes over from the risk budget on both
+sides, which is what it is for: a cheap late straddle risks little per
+contract and carries a lot of gamma, so the risk budget alone would let the
+size of the bet grow into the end of the session.  The backtest's band
+section still reports median gamma and band per branch, so a regime
+comparison can see what size difference remains.
 
 A one-day scan is a conservative charge against a 0DTE position that will
 be flat by the bell, and exactly the horizon a rolled 1DTE position is
 carried over.
 
-At the default 80% allocation the long branch spends more than half of
-equity on a same-day straddle's debit.  That is the maximum loss on the
-option leg, and it can be reached in a single session; the daily loss
-limit in ``StrategyConfig`` is the rule that stops it getting there.
+Under the risk budget the long branch spends about a tenth of equity on a
+same-day straddle's debit rather than more than half of it.  That debit is
+still the maximum loss on the option leg and can still be reached in a
+single session -- the daily loss limit in ``StrategyConfig`` remains the
+backstop -- but it is now a backstop rather than the only stop that ever
+fires.
 
 ``RegTMarginModel`` is the 15%-of-notional equity-option rule.  It is
 included because it is what most people reach for, and it overstates ES
@@ -81,7 +134,7 @@ impact of the actual order before it is sent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .chain import OptionQuote, StraddleQuote
@@ -271,15 +324,39 @@ def build_margin_model(
     )
 
 
+#: The four things that can decide the count, as they appear in the entry
+#: event and in ``deltahedger sweep --sizing``.
+BIND_RISK = "risk"
+BIND_GAMMA = "gamma"
+BIND_CAPITAL = "capital"
+BIND_MAX = "max_straddles"
+BINDING_NAMES = (BIND_RISK, BIND_GAMMA, BIND_CAPITAL, BIND_MAX)
+
+
+def describe_limits(limits: dict[str, int]) -> str:
+    """``risk 30, gamma 38, capital 173`` -- what each constraint allowed."""
+    return ", ".join(
+        f"{name} {limits[name]}" for name in BINDING_NAMES if name in limits
+    )
+
+
 @dataclass(frozen=True)
 class SizingResult:
     contracts: int
     margin_per_contract: float
     total_margin: float
     budget: float
-    option_budget: float
     direction: int = 0
     reason: str = ""
+    #: Which constraint decided the count -- one of ``BINDING_NAMES``.
+    binding: str = ""
+    #: What each constraint would have allowed on its own, so a size can be
+    #: explained rather than inferred.
+    limits: dict[str, int] = field(default_factory=dict)
+    #: Dollars one straddle loses if its branch stop fires.
+    risk_per_straddle: float = 0.0
+    #: Delta units per point one straddle carries.
+    gamma_per_straddle: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -288,6 +365,10 @@ class SizingResult:
     @property
     def requirement_kind(self) -> str:
         return "debit" if self.direction > 0 else "margin"
+
+    def describe_limits(self) -> str:
+        """``risk 30, gamma 38, capital 173`` -- the count each one allowed."""
+        return describe_limits(self.limits)
 
 
 def size_straddles(
@@ -298,44 +379,84 @@ def size_straddles(
     cfg: SizingConfig,
     source: RiskSource,
     model: MarginModel,
+    stop_fraction: float | None = None,
 ) -> SizingResult:
-    """How many straddles the buying-power allocation supports.
+    """How many straddles to trade: the smallest count any constraint allows.
 
     ``direction`` is the sign the GEX regime asked for: +1 buys the
     straddle, -1 sells it.  It changes what is being budgeted -- a debit
-    against cash or margin against collateral -- but not how the budget is
-    carved up, so the same reserve still stands behind the hedge leg in
-    both cases.
+    against cash or margin against collateral -- and what a stop-out costs,
+    but not the shape of the rule.
+
+    ``stop_fraction`` is the fraction of the entry premium one straddle
+    loses when its branch stop fires: ``long_stop_loss_pct`` on the long
+    side, ``short_stop_loss_premium_multiple - 1`` on the short.  ``None``
+    (or a non-positive value, meaning the stop is switched off) falls back
+    to the per-straddle requirement, which bounds the same loss -- the
+    debit is a long straddle's maximum loss, and the SPAN scan is the
+    short's one-day adverse move.  See the module docstring for why the
+    risk budget rather than the capital cap is what should normally bind.
     """
     if direction == 0:
-        return SizingResult(0, 0.0, 0.0, 0.0, 0.0, 0, "no direction to size")
+        return SizingResult(0, 0.0, 0.0, 0.0, 0, "no direction to size")
 
-    budget = max(equity, 0.0) * cfg.buying_power_pct
-    option_budget = budget * (1.0 - cfg.hedge_margin_reserve_pct)
+    equity = max(equity, 0.0)
+    budget = equity * cfg.buying_power_pct
     per_contract = model.straddle_requirement(quote, future_price, source, direction)
     kind = "debit" if direction > 0 else "margin"
 
     if per_contract <= 0.0:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget, direction,
+            0, per_contract, 0.0, budget, direction,
             f"the {kind} model returned a non-positive requirement",
         )
 
-    raw = int(option_budget // per_contract)
-    contracts = min(raw, cfg.max_straddles)
+    premium = quote.price * source.option.multiplier
+    risk_per_straddle = (
+        stop_fraction * premium
+        if stop_fraction is not None and stop_fraction > 0.0 and premium > 0.0
+        else per_contract
+    )
+    gamma_per_straddle = quote.gamma * source.delta_units_per_contract(source.option)
+
+    limits: dict[str, int] = {BIND_CAPITAL: int(budget // per_contract)}
+    if cfg.risk_budget_pct is not None and risk_per_straddle > 0.0:
+        limits[BIND_RISK] = int(equity * cfg.risk_budget_pct // risk_per_straddle)
+    if cfg.gamma_ceiling_units_per_100k is not None and gamma_per_straddle > 0.0:
+        ceiling = cfg.gamma_ceiling_units_per_100k * equity / 100_000.0
+        limits[BIND_GAMMA] = int(ceiling // gamma_per_straddle)
+    limits[BIND_MAX] = cfg.max_straddles
+
+    # A disabled constraint is absent from ``limits`` rather than infinite,
+    # so only the ones actually in play are compared. ``min`` keeps the
+    # first of a tie, and ``BINDING_NAMES`` is the order they are worth
+    # naming in: what a bad day costs, then how big the bet is, then what
+    # the account can carry.
+    binding = min(
+        (name for name in BINDING_NAMES if name in limits), key=limits.__getitem__
+    )
+    contracts = limits[binding]
+
+    common = dict(
+        budget=budget, direction=direction, limits=limits,
+        risk_per_straddle=risk_per_straddle, gamma_per_straddle=gamma_per_straddle,
+    )
     if contracts < cfg.min_straddles:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget, direction,
-            f"buying power supports {raw} straddles, minimum is "
-            f"{cfg.min_straddles} (${per_contract:,.0f} {kind} each vs "
-            f"${option_budget:,.0f} available)",
+            0, per_contract, 0.0, reason=(
+                f"{binding} allows {contracts} straddles, minimum is "
+                f"{cfg.min_straddles} (${per_contract:,.0f} {kind}, "
+                f"${risk_per_straddle:,.0f} at risk and "
+                f"{gamma_per_straddle:.1f} delta units of gamma each; "
+                f"{describe_limits(limits)})"
+            ),
+            binding=binding, **common,
         )
     return SizingResult(
         contracts=contracts,
         margin_per_contract=per_contract,
         total_margin=contracts * per_contract,
-        budget=budget,
-        option_budget=option_budget,
-        direction=direction,
-        reason="capped by max_straddles" if raw > contracts else "",
+        reason=f"bound by {binding}",
+        binding=binding,
+        **common,
     )

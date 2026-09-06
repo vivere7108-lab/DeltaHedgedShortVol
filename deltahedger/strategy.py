@@ -8,7 +8,8 @@ One bar (or one live poll) at a time, in this order:
   3. check exits -- the DTE floor, a *confirmed* regime flip, the
      directional stop/target, the daily loss limit
   4. check entry -- if flat, inside the entry window and past every gate,
-     take the side the regime implies
+     take the side the regime implies, sized to whichever of the risk
+     budget, the gamma ceiling and the capital cap allows least
   5. check the delta band and hedge
 
 The direction is not a parameter.  It is whatever dealer positioning says::
@@ -107,7 +108,7 @@ from .hedger import DeltaHedger, hedge_cost_per_contract
 from .instruments import RiskSource
 from .portfolio import Portfolio, StraddlePosition
 from .session import SessionClock, is_trading_day
-from .sizing import MarginModel, build_margin_model, size_straddles
+from .sizing import BINDING_NAMES, MarginModel, build_margin_model, size_straddles
 from .volsurface import VolSurface
 
 log = logging.getLogger(__name__)
@@ -232,6 +233,10 @@ class GexStraddleStrategy:
         #: opened it. This is the number that says whether reading GEX paid.
         self.regime_pnl: dict[str, float] = {}
         self.regime_trades: dict[str, int] = {}
+        #: Which sizing constraint decided each entry's size. A book that is
+        #: always bound by the capital cap is one whose stop ladder cannot
+        #: fire, which is what the risk budget exists to prevent.
+        self.sizing_binds: dict[str, int] = {}
 
         self._last_hedge_time: datetime | None = None
         self._last_moment: datetime | None = None
@@ -704,7 +709,7 @@ class GexStraddleStrategy:
         equity = self.portfolio.equity(None, bar.close)
         sizing = size_straddles(
             equity, quote, bar.close, direction, self.cfg.sizing, self.source,
-            self.margin_model,
+            self.margin_model, stop_fraction=self._stop_fraction(direction),
         )
         if not sizing.ok:
             self._record(moment, "entry_skipped", sizing.reason, regime=profile.regime)
@@ -742,6 +747,10 @@ class GexStraddleStrategy:
         )
         self._entries_this_session += 1
         self.regime_trades[profile.regime] = self.regime_trades.get(profile.regime, 0) + 1
+        if sizing.binding:
+            self.sizing_binds[sizing.binding] = (
+                self.sizing_binds.get(sizing.binding, 0) + 1
+            )
 
         side = "bought" if direction > 0 else "sold"
         cash = abs(quantity) * (call_fill.price + put_fill.price) * self.source.option.multiplier
@@ -757,8 +766,10 @@ class GexStraddleStrategy:
             f"@ {call_fill.price + put_fill.price:.2f} "
             f"(C {call_fill.price:.2f} / P {put_fill.price:.2f}, IV {quote.iv:.3f}) "
             f"for ${cash:,.0f} {'debit' if direction > 0 else 'credit'}; "
-            f"{sizing.requirement_kind} ${sizing.total_margin:,.0f} of "
-            f"${sizing.budget:,.0f} budget -- {profile.reason}, so {intent}",
+            f"{sizing.requirement_kind} ${sizing.total_margin:,.0f}, "
+            f"${sizing.contracts * sizing.risk_per_straddle:,.0f} at risk to its "
+            f"stop, bound by {sizing.binding} ({sizing.describe_limits()}) "
+            f"-- {profile.reason}, so {intent}",
             regime=profile.regime,
         )
 
@@ -1038,6 +1049,22 @@ class GexStraddleStrategy:
             f"GEX flipped to {profile.regime}: {profile.reason}. The position "
             f"is on the wrong side of dealer hedging"
         )
+
+    def _stop_fraction(self, direction: int) -> float | None:
+        """Fraction of the entry premium one straddle loses at its stop.
+
+        This is what the risk budget divides into, so it has to be read off
+        the very rules the sizing is trying to make reachable: the long
+        stop is a fraction of the debit, the short stop a multiple of the
+        credit (so the *loss* is that multiple less one). ``None`` when the
+        branch has no stop -- the sizing then falls back to the per-straddle
+        requirement, which bounds the same loss.
+        """
+        cfg = self.cfg.strategy
+        if direction > 0:
+            return cfg.long_stop_loss_pct
+        multiple = cfg.short_stop_loss_premium_multiple
+        return None if multiple is None else multiple - 1.0
 
     def _long_exit_reason(self, cfg, pnl: float, premium: float) -> str | None:
         """Stops for the long (negative-GEX) side, measured on position P&L."""

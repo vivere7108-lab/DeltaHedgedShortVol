@@ -36,8 +36,12 @@ gex:
                                    # market-data-line cost of raising this
 
 sizing:
-  buying_power_pct: 0.80           # the margin limit less a 20% buffer
-  hedge_margin_reserve_pct: 0.30
+  # The count is the smallest of the three: a stop-out costs 5% of equity,
+  # gamma is capped at 60 units per point per $100k, and no more than 80% of
+  # equity is ever committed. See es_default.yaml for why all three.
+  risk_budget_pct: 0.05
+  gamma_ceiling_units_per_100k: 60.0
+  buying_power_pct: 0.80           # the capital cap: margin limit less 20%
   max_straddles: 500
 
 strategy:

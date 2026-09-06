@@ -159,23 +159,56 @@ class HedgeConfig:
 class SizingConfig:
     """How much of the account to commit to the straddle.
 
-    The book is sized to the margin limit, less a buffer.  ``buying_power_pct``
-    is the share of equity the strategy may commit as buying power -- margin
-    for a short straddle, the debit for a long one, and the reserve for the
-    hedge leg all come out of it -- and the remainder is the buffer that
-    absorbs variation margin and a margin call on a bad day.  The default
-    leaves 20% untouched.
+    Three constraints, and the size is the smallest count any of them
+    allows.  They guard different things and each one alone fails:
 
-    Within the allocation, ``hedge_margin_reserve_pct`` is held back for the
-    MES hedge, and the straddle count is what the rest buys at the
-    per-straddle requirement.  With the defaults that is 56% of equity to
-    the straddles, 24% reserved for the hedge, 20% buffer.
+    ``risk_budget_pct`` -- **what usually binds.**  Size so that a full
+        stop-out costs about this fraction of equity: the straddle count is
+        ``risk_budget / (what one straddle loses when its branch stop
+        fires)``.  Sized any other way the branch stops are decoration --
+        at the margin limit a 0DTE book's 50%-of-debit long stop is 5.6x
+        the daily loss limit and the 2.5x-credit short stop is 8.1x it, so
+        the daily limit fires first every time and the exit ladder never
+        runs.  Set to ``None`` to drop the constraint.
+
+    ``gamma_ceiling_units_per_100k`` -- the position's gamma, in delta
+        units per point per $100k of equity.  The risk budget alone holds
+        *premium* flat, which lets gamma run: the same budget buys 30
+        straddles carrying 118 units of gamma at 09:35 and 63 carrying 512
+        at 14:30, because a cheap late straddle risks less per contract and
+        carries more gamma.  Since gamma is what the strategy is a bet on,
+        the ceiling keeps the size of the bet steady across the day.  Set
+        to ``None`` to drop it.
+
+    ``buying_power_pct`` -- the capital cap, and now only a cap: the share
+        of equity that may be committed as margin for a short straddle or
+        paid as the debit for a long one.  The remainder is the buffer that
+        absorbs variation margin and a margin call on a bad day.
+
+    The hedge leg has no reserve of its own.  It does not need one: with
+    the risk budget binding, the straddle takes about a tenth of equity
+    rather than the 56% the old reserve was carved out of, so the unused
+    part of the capital cap (some 70% of equity at the defaults) covers the
+    MES margin even in the worst case -- a fully in-the-money book at the
+    pre-settlement buffer, which is around 29% of equity in hedge margin.
     """
 
-    #: Fraction of portfolio equity to allocate as buying power. It covers
-    #: margin for a short straddle and the debit for a long one. 1 minus
-    #: this is the buffer the strategy never touches.
+    #: Fraction of portfolio equity that may be committed as buying power:
+    #: margin for a short straddle, the debit for a long one. A cap rather
+    #: than a target -- the risk budget below is what normally decides the
+    #: count. 1 minus this is the buffer the strategy never touches.
     buying_power_pct: float = 0.80
+    #: Fraction of equity a full stop-out may cost. The straddle count is
+    #: the risk budget divided by what one straddle loses when its branch
+    #: stop fires, so the stops are reachable before the daily loss limit.
+    #: ``None`` drops the constraint (and with it any guarantee that the
+    #: stop ladder can fire).
+    risk_budget_pct: float | None = 0.05
+    #: Ceiling on the position's gamma, in delta units per point per
+    #: $100,000 of equity, so the size of the bet is steady across entry
+    #: times rather than growing into the cheap high-gamma end of the day.
+    #: ``None`` drops the constraint.
+    gamma_ceiling_units_per_100k: float | None = 60.0
     #: Hard cap on straddles regardless of buying power. A backstop against
     #: a sizing bug rather than a sizing rule -- the buying-power budget is
     #: what decides the count. Matches the per-order hard ceiling in
@@ -183,9 +216,6 @@ class SizingConfig:
     max_straddles: int = 500
     #: Never open a position smaller than this.
     min_straddles: int = 1
-    #: Fraction of the buying-power budget held back for hedge margin and
-    #: variation margin. The straddle sizing sees the remainder.
-    hedge_margin_reserve_pct: float = 0.30
     #: Margin model: "span_scan", "reg_t" or "fixed". See ``sizing.py`` --
     #: "span_scan" reproduces CME SPAN methodology and is the right default
     #: for futures options; "reg_t" is the equity-option rule and will
@@ -207,8 +237,15 @@ class SizingConfig:
     def validate(self) -> None:
         if not 0.0 < self.buying_power_pct <= 1.0:
             raise ValueError("sizing.buying_power_pct must be in (0, 1]")
-        if not 0.0 <= self.hedge_margin_reserve_pct < 1.0:
-            raise ValueError("sizing.hedge_margin_reserve_pct must be in [0, 1)")
+        if self.risk_budget_pct is not None and not 0.0 < self.risk_budget_pct <= 1.0:
+            raise ValueError("sizing.risk_budget_pct must be in (0, 1] or null")
+        if (
+            self.gamma_ceiling_units_per_100k is not None
+            and self.gamma_ceiling_units_per_100k <= 0.0
+        ):
+            raise ValueError(
+                "sizing.gamma_ceiling_units_per_100k must be > 0 or null"
+            )
         if self.margin_model not in ("span_scan", "reg_t", "fixed"):
             raise ValueError(
                 "sizing.margin_model must be one of 'span_scan', 'reg_t', 'fixed'"
@@ -777,6 +814,13 @@ class Config:
                     hint = (
                         " (persistence_bars was replaced by persistence_seconds: "
                         "the gate is a wall-clock window, not a bar count)"
+                    )
+                if "hedge_margin_reserve_pct" in unknown:
+                    hint = (
+                        " (hedge_margin_reserve_pct is gone: the straddle count "
+                        "is now the smallest of the risk budget, the gamma "
+                        "ceiling and the capital cap, which leaves the hedge "
+                        "leg funded without carving out a reserve)"
                     )
                 raise ValueError(
                     f"unknown {dc_type.__name__} keys: {', '.join(sorted(unknown))}{hint}"

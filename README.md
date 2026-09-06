@@ -6,8 +6,8 @@ strategy code.
 
 **What it does.** Reads dealer gamma exposure off the front of the curve,
 locates the gamma flip point, and takes the side dealer hedging is forced
-to supply. The position is today's ATM straddle, sized to the margin limit
-less a 20% buffer, held delta-neutral by trading MES micro futures under a
+to supply. The position is today's ATM straddle, sized so that a stop-out
+costs 5% of equity, held delta-neutral by trading MES micro futures under a
 Whalley-Wilmott band — a half-width that follows the book's gamma and the
 cost of hedging rather than a fixed number. Fifteen minutes before
 settlement, where an expiring straddle's gamma diverges, it is closed and
@@ -62,6 +62,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[ibkr,dev]'
 
 # Price each stand-aside gate on its own, then all of them together.
 .venv/bin/deltahedger sweep -c configs/es_synthetic.yaml --gates
+
+# Price each sizing constraint on its own, then the levels of each.
+.venv/bin/deltahedger sweep -c configs/es_synthetic.yaml --sizing
+.venv/bin/deltahedger sweep -c configs/es_synthetic.yaml --risk-budgets 0.01,0.02,0.05,0.10
 
 # Preflight the live path before letting it trade -- places no orders.
 .venv/bin/deltahedger doctor -c configs/es_paper.yaml
@@ -238,13 +242,13 @@ afterwards even though neither is a gate that can be switched off:
 ```
          gates entries    return   long gamma  (n)  short gamma  (n)                   blocked by
 ------------------------------------------------------------------------------------------------
-      no gates      69   -61.48% $   -198,930   23 $     46,332   46 confidence 26, weekend_gap 12
-    confidence      43   -41.20% $   -102,752   12 $        593   31 confidence 591, weekend_gap 16
- flip distance      55   -55.34% $   -155,697   17 $     17,915   38 confidence 26, flip_distance 75, weekend_gap 16
-      ensemble      43   -58.41% $   -139,700   14 $     -5,463   29 confidence 26, ensemble 387, weekend_gap 16
-   persistence      57   -20.92% $   -118,224   18 $     66,847   39 confidence 26, persistence 15, weekend_gap 16
-  entry window      64   -53.98% $   -162,155   22 $     28,249   42 confidence 26, weekend_gap 12
-     all gates      32   -24.94% $   -130,595   11 $     68,501   21 confidence 662, ensemble 238, event_blackout 7, persistence 59, weekend_gap 18
+      no gates      83   -19.92% $    -40,107   32 $     -9,702   51 confidence 26, event_blackout 7, ungated 67, weekend_gap 28
+    confidence      50   -21.74% $    -36,745   16 $    -17,608   34 confidence 642, event_blackout 7, ungated 87, weekend_gap 36
+ flip distance      63   -18.87% $    -42,452   24 $     -4,715   39 confidence 26, flip_distance 127, ungated 85, weekend_gap 36
+      ensemble      54   -25.27% $    -46,908   20 $    -16,272   34 confidence 26, ensemble 393, ungated 87, weekend_gap 36
+   persistence      73    -3.64% $     -3,382   28 $     -5,706   45 confidence 26, persistence 14, ungated 81, weekend_gap 36
+  entry window      74   -18.66% $    -38,052   28 $     -8,590   46 confidence 26, ungated 1, weekend_gap 9
+     all gates      33   -17.81% $    -33,378   11 $    -11,143   22 confidence 701, ensemble 254, persistence 75, weekend_gap 9
 ```
 
 (`configs/es_synthetic.yaml`, `--start 2025-01-02`; generated data, so read
@@ -300,13 +304,13 @@ the shipped costs section implies ($1.245 per MES, one way):
 ```
                        straddles    gamma (units/pt)   band (units)    band width
                       short / long    short / long      short / long    in ES points
-0DTE at 09:35 (6.4h)    83 / 173      327 / 681         +/-200 / 326    1.22 / 0.96
-0DTE at 12:00 (4.0h)    76 / 218      378 / 1085        +/-220 / 445    1.16 / 0.82
-1DTE at the roll        103 / 88      208 / 178         +/-148 / 133    1.42 / 1.50
+0DTE at 09:35 (6.4h)     10 / 30        39 / 118         +/-49 / 101     2.48 / 1.72
+0DTE at 12:00 (4.0h)     13 / 30        65 / 149         +/-68 / 119     2.10 / 1.59
+1DTE at the roll          5 / 15        10 / 30          +/-20 / 41      3.89 / 2.70
 ```
 
-Two things to read off that. The band is **twenty-odd MES contracts wide**
-on a book sized to the margin limit, and it is **about one ES point wide**
+Two things to read off that. The band is **five to ten MES contracts wide**
+on a book sized by the risk budget, and it is **two-odd ES points wide**
 whichever side of the book is on and whenever in the day you look —
 which is the `G^(2/3)` scaling doing its job: a bigger, hotter book is
 allowed more delta but not more underlying. And it is comfortably wider
@@ -344,11 +348,11 @@ pays away more theta on the short side:
 ```
 gamma_ra median band    return         P&L   long gamma  short gamma  hedges       fees  mean err
 --------------------------------------------------------------------------------------------------
-   0.001       393.1  -25.63% $   -64,083 $   -129,852 $     66,014     604 $   79,476    106.69
-   0.003       265.8  -25.20% $   -63,012 $   -131,792 $     68,780     694 $   80,312     65.37
-    0.01       177.5  -24.94% $   -62,339 $   -130,595 $     68,501     783 $   81,491     44.73
-    0.03       123.2  -25.13% $   -62,816 $   -129,991 $     67,420     838 $   82,290     34.89
-     0.1        82.3  -25.38% $   -63,438 $   -130,283 $     67,090     872 $   82,016     30.36
+   0.001        58.7  -20.84% $   -52,090 $    -37,699 $    -14,391     742 $   11,553     31.58
+   0.003        40.4  -22.36% $   -55,900 $    -40,975 $    -14,925     997 $   12,413     18.92
+    0.01        27.0  -22.74% $   -56,840 $    -40,096 $    -16,744    1257 $   13,283     10.76
+    0.03        18.7  -22.73% $   -56,833 $    -40,090 $    -16,743    1439 $   13,671      6.94
+     0.1        12.5  -22.95% $   -57,380 $    -39,577 $    -17,803    1597 $   13,896      4.45
 ```
 
 The hedge count and the mean delta error move exactly as the formula says
@@ -367,12 +371,12 @@ sweep --bands` uses it:
 ```
     band median band    return         P&L   long gamma  short gamma  hedges       fees  mean err
 --------------------------------------------------------------------------------------------------
-       5         5.0  -25.75% $   -64,363 $   -131,099 $     66,736     982 $   82,539     25.29
-      10        10.0  -25.83% $   -64,582 $   -131,096 $     66,514     964 $   82,529     25.99
-      20        20.0  -25.63% $   -64,071 $   -130,694 $     66,623     945 $   82,514     26.38
-      40        40.0  -25.71% $   -64,271 $   -130,660 $     66,389     881 $   82,173     29.96
-      80        80.0  -25.73% $   -64,323 $   -131,180 $     66,857     831 $   82,030     34.75
-     160       160.0  -24.86% $   -62,157 $   -130,563 $     68,651     730 $   81,881     47.93
+       5         5.0  -23.41% $   -58,516 $    -40,196 $    -18,320    1875 $   14,202      2.40
+      10        10.0  -23.19% $   -57,982 $    -39,785 $    -18,197    1660 $   14,087      3.29
+      20        20.0  -22.77% $   -56,928 $    -39,032 $    -17,896    1389 $   13,962      5.40
+      40        40.0  -23.65% $   -59,129 $    -41,269 $    -17,860    1028 $   13,372     10.63
+      80        80.0  -22.82% $   -57,054 $    -41,422 $    -15,632     685 $   12,638     23.82
+     160       160.0  -17.71% $   -44,272 $    -35,318 $     -8,954     361 $   11,013     54.94
 ```
 
 A ±10 band on a book carrying 300 units of gamma per point is a third of an
@@ -498,12 +502,12 @@ flip that has not yet held or that the ensemble disputes defers the exit
 (`exit_deferred`) rather than closing on a read that might be noise.
 
 **Both — the daily loss limit** (`daily_loss_limit_pct`, 5% of the
-session's opening equity) closes the position and halts the session. Note
-what it is guarding at the default sizing: the long branch spends more than
-half of equity on a same-day straddle's debit, and that debit can decay a
-long way in an hour of a quiet morning. On generated data the limit is what
-ends a fair share of long sessions; on real data it is the rule that keeps a
-0DTE book at the margin limit from having a very bad day.
+session's opening equity) closes the position and halts the session. It is
+the backstop behind the branch rules above, and the sizing is what keeps it
+in that role: `sizing.risk_budget_pct` sizes the book so a full stop-out
+costs about one daily limit, which is what makes the stops reachable
+(see "Capital"). Sized to the capital cap instead, the branch stops were
+5–8× the daily limit and this rule was the only exit that ever fired.
 
 The old multi-session tenor is still reachable — widen the four
 `*_days_to_expiry` numbers and set `close_at_days_to_expiry` (the DTE
@@ -531,10 +535,10 @@ A single 0DTE straddle picks up over 4 delta units per ES point in the
 morning and 14 per point half an hour before the bell — which is the
 mechanical reason the position comes off fifteen minutes early, and why the
 band is quoted in points per branch in every backtest summary. A book of
-80–200 of them at the margin limit carries several hundred units of gamma
-per point, so a 5-point move is thirty-odd MES of hedge; at the buffer a
-fully in-the-money book is closed with a flatten that can run to over a
-thousand MES, sent in orders no larger than `hedge.max_hedge_contracts`.
+10–30 of them under the risk budget carries 40–150 units of gamma per
+point, so a 5-point move is a handful of MES of hedge; at the buffer a
+fully in-the-money book is closed with a flatten of a few hundred MES, sent
+in orders no larger than `hedge.max_hedge_contracts`.
 
 ## Reading a result honestly
 
@@ -562,7 +566,7 @@ the new tenor as it did at the old one. With the fix in, the zero-edge panel
 reads:
 
 ```
-16 seeds, 10 days, rolled:   mean +6.23%, 0.4 standard errors from zero, RMS 57.9%
+16 seeds, 10 days, rolled:   mean +2.72%, 1.5 standard errors from zero, RMS 7.4%
 ```
 
 `tests/test_backtest.py::TestCorrectness::test_zero_edge_produces_no_pnl_on_average`.
@@ -570,22 +574,21 @@ reads:
 Unbiased — and with a dispersion an order of magnitude larger than the
 old tenor's, which is the first thing to understand about a backtest of
 this configuration and is explained under "A single run does not measure
-the hedge" below. The short version: a book sized to the margin limit and
-rolled into a 1DTE series spends every night with several hundred delta
-units per point of gamma that the backtest has no bars to hedge against,
+the hedge" below. The short version: a book rolled into a 1DTE series
+spends every night with gamma the backtest has no bars to hedge against,
 and a one-sigma overnight move in ES is thirty-odd points.
 
 ### The generated market is not neutral for a straddle
 
 The synthetic generator draws returns at the volatility it reports as
 implied, so it has no *gamma* edge. But it also lets implied vol wander
-after entry, and a straddle is a large vega position — larger now, at the
-margin limit, than it was at 15% of equity:
+after entry, and a straddle is a large vega position even at the risk
+budget's size:
 
 ```
 40 days, $250k, costs off   long gamma   short gamma        total
-generated (default)          $-104,661     $+112,896      $+8,235
-generated (vol pinned)       $-138,376      $+51,401     $-86,974
+generated (default)           $-27,126      $+11,767     $-15,358
+generated (vol pinned)        $-52,799      $+23,070     $-29,729
 ```
 
 Neither column is evidence about the strategy; the gap between them is the
@@ -607,9 +610,9 @@ that open and close same-day (the roll switched off, so no session boundary
 is ever crossed), shrinks with rebalance frequency:
 
 ```
- 15 mins bars -> RMS residual 17.90%
-  5 mins bars -> RMS residual 11.93%
-  1 min  bars -> RMS residual  7.62%
+ 15 mins bars -> RMS residual 5.10%
+  5 mins bars -> RMS residual 1.56%
+  1 min  bars -> RMS residual 1.13%
 ```
 
 `tests/test_backtest.py::TestCorrectness::test_the_hedging_residual_shrinks_with_rebalance_frequency`
@@ -624,19 +627,21 @@ at any bar size. A 15-day, 20-seed zero-edge panel *including* the roll
 reads:
 
 ```
-20 seeds, 15 days, rolled:   mean -13.39%, 0.8 standard errors from zero, RMS 76.0%
+20 seeds, 15 days, rolled:   mean +0.30%, 0.2 standard errors from zero, RMS 6.8%
 ```
 
 — still unbiased, with a dispersion that is real, unhedgeable-in-this-
 backtest gap risk rather than an artifact of the sampling grid, and now
 the dominant term by far: on the same 16 seeds over the same 10 days, the
-same-day-only book reads an RMS of 12.9% and the rolled book 57.9%. The
-arithmetic: the rolled book carries roughly
-200 delta units per point of gamma, which is $100 of dollar-gamma per
-point²; a one-sigma overnight move at 16 vol over the 17½ hours between
-the bell and the next first bar is about 36 points; and half of gamma
-times the move squared is $65,000 — a quarter of the account, per night,
-that the backtest books whole on the next morning's first bar. The live
+same-day-only book reads an RMS of 1.5% and the rolled book 7.4%. The
+arithmetic: the rolled book carries 10–30 delta units per point of gamma,
+which is $5–15 of dollar-gamma per point²; a one-sigma overnight move at 16
+vol over the 17½ hours between the bell and the next first bar is about 36
+points; and half of gamma times the move squared is $3,000–10,000 — one to
+four percent of the account, per night, that the backtest books whole on
+the next morning's first bar. (Under the old capital-based sizing this term
+was $65,000 a night, a quarter of the account, and it is most of why the
+panel dispersion above fell from an RMS of 58% to 7%.) The live
 runner does not share this limitation — ES trades nearly around the clock
 and the runner keeps polling and hedging (against the wider overnight
 band) for as long as anything is open, so the only unhedgeable gap it
@@ -645,16 +650,14 @@ a small fraction of this component. Which is the argument for reading a
 backtest of this system for its *intraday* behaviour, and the forward
 walk for the rest.
 
-Two further things a margin-limit book adds to the residual, both visible
-in a backtest summary's "Hedge quality" lines and neither a fault:
-`hedge.max_hedge_contracts` (500) is a per-*order* cap, and a book of a
-couple of hundred straddles can need more than that in one 5-minute bar
-after a 5-point move — the rest goes on the next bar, or the next 5-second
-poll live, so the backtest's "max |delta − target|" can read in the
-thousands for a bar or two a day; and the daily loss limit ends more long
-sessions than the stops do. Neither is where the dispersion comes from:
-lifting the cap entirely moves the 16-seed RMS from 57.9% to 55.3%. Widen
-the cap in a backtest if you want the band's own bound measured
+One further thing to know about the residual, visible in a backtest
+summary's "Hedge quality" lines and not a fault:
+`hedge.max_hedge_contracts` (500) is a per-*order* cap, and a book near
+expiry can still need more than that in one 5-minute bar after a large
+move — the rest goes on the next bar, or the next 5-second poll live, so
+the backtest's "max |delta − target|" can spike for a bar. Under the risk
+budget it binds far less often than it did at the margin limit. Widen the
+cap in a backtest if you want the band's own bound measured
 (`tests/test_backtest.py` does).
 
 **Average across seeds before concluding anything from a backtest of this
@@ -683,6 +686,13 @@ The suite has 530 tests. The load-bearing ones:
   that bar was held to or half a contract, whichever is wider;
 - **the zero-edge panel**, **the overnight-inclusive panel**, and **the
   frequency scaling**, described above;
+- **the sizing constraints** — that the risk budget binds at the shipped
+  defaults on both branches, that a full stop-out costs about the risk
+  budget, that a wider stop earns a smaller position, that the gamma
+  ceiling holds the bet steady between a morning and an afternoon entry
+  (and that without it the same budget lets gamma run more than threefold),
+  and that each entry records which constraint set its size
+  (`tests/test_sizing.py::TestTheThreeConstraints`);
 - **the end of the day** — the 15:45 exit, that nothing is opened inside
   the buffer and the read there excludes the expiring series, the roll into
   tomorrow's series at the 16:00 bar, that the roll is exempt from the
@@ -744,7 +754,7 @@ validated historically, not a second implementation of it.
 | `session.py` | CME/NYSE holiday calendar, `trading_days_between`, gap detection, buffered expiry selection |
 | `chain.py` | Chain construction, ATM straddle selection, `TenorPolicy` |
 | `events.py` | The event calendar and its blackout windows |
-| `sizing.py` | SPAN margin (short) / debit (long), buying-power sizing |
+| `sizing.py` | SPAN margin (short) / debit (long); risk-budget, gamma-ceiling and capital-cap sizing |
 | `portfolio.py` | Straddle book, delta and gamma aggregation, P&L by leg |
 | `hedger.py` | The Whalley-Wilmott band (and the fixed control), session-aware — pure, no market or broker dependency |
 | `strategy.py` | GEX read, gates, the end-of-day rules, entry / exit / hedge orchestration |
@@ -753,16 +763,70 @@ validated historically, not a second implementation of it.
 | `live/` | Poll loop (continues overnight while a position is open), position reconciliation |
 | `data/` | Bar sources (overnight-stepped synthetic) and open-interest providers |
 
-## Capital: the margin limit, less a fifth
+## Capital: three constraints, and the smallest wins
 
-`sizing.buying_power_pct: 0.80` — the book is sized to the margin limit
-with a 20% buffer left untouched. Within the 80%, `hedge_margin_reserve_pct`
-(0.30) is held back for the MES hedge and its variation margin, and the
-straddle count is what the rest buys at the per-straddle requirement: 56%
-of equity to the straddles, 24% to the hedge, 20% never committed.
-`max_straddles` (500) is a backstop against a sizing bug, matching the
-per-order hard ceiling in `broker/ibkr.py`; the budget is what decides the
-count, and at any ordinary account size the cap does not bind.
+The straddle count is the smallest number any of three constraints allows.
+Each guards a different failure, and each one alone fails:
+
+```
+contracts = min(risk budget    / what one straddle loses at its branch stop,
+                gamma ceiling  / gamma per straddle,
+                capital cap    / margin or debit per straddle,
+                max_straddles)
+```
+
+**`sizing.risk_budget_pct` (0.05) is what normally binds.** Size to the
+capital cap instead — 80% of equity, which is what this did until now — and
+the exit ladder becomes decoration. At $250k, spot 5000, 15 vol:
+
+| branch | its stop needs | the daily limit is |
+|---|---|---|
+| long 0DTE, 50% of the debit | **5.6×** the daily limit | 1.3 vol points of IV |
+| short 0DTE, 2.5× the credit | **8.1×** the daily limit | 2.8 vol points of IV |
+| short 1DTE at the roll | **19.4×** the daily limit | 1.2 vol points of IV |
+
+So the daily loss limit fired first every time and halted the session — on
+generated data, 27 of 56 positions ended that way against 7 on a branch
+rule. A book carrying $9,300 of vega per point against a $12,500 daily
+limit is sized so that ordinary intraday noise ends the day. The risk
+budget inverts the question: not "how much capital may we commit" but "how
+much may a stop-out cost", divided by what one straddle loses at its stop.
+
+**`sizing.gamma_ceiling_units_per_100k` (60) stops the bet growing into the
+afternoon.** The risk budget holds premium flat and lets gamma run: the
+same budget buys 30 straddles carrying 118 delta units of gamma at 09:35
+and 63 carrying 512 at 14:30, because a cheap late straddle risks less per
+contract and carries more gamma. Gamma is what the strategy is a bet on, so
+the ceiling is what keeps the size of the bet steady across the day.
+Targeting gamma *alone* fails the other way — at the 1DTE roll, where gamma
+per straddle is small, a flat gamma target buys 46% of equity in premium.
+
+**`sizing.buying_power_pct` (0.80) is the capital cap, and now only a cap**
+— the other fifth of equity is the buffer that is never touched. There is
+no hedge reserve any more: with the risk budget binding, the straddle takes
+about a tenth of equity, so what the cap leaves unused covers the MES margin
+even for a fully in-the-money book at the pre-settlement buffer (some 29% of
+equity). `max_straddles` (500) is a backstop against a sizing bug, matching
+the per-order hard ceiling in `broker/ibkr.py`.
+
+Every entry records which constraint set its size, and the backtest summary
+and journal report the split. `deltahedger sweep --sizing` prices the three
+one at a time, and `--risk-budgets` / `--gamma-ceilings` sweep the levels:
+
+```
+        sizing entries straddles    return   long gamma  (n)  short gamma  (n)  stops  daily               bound by
+--------------------------------------------------------------------------------------------------------------------
+  capital only      34       106  -54.99% $    -97,689   10 $    -39,776   24      4     21 capital 33, max_straddles 1
+   risk budget      40         6  -40.07% $    -47,376   12 $    -52,797   28      8      2                risk 40
+ gamma ceiling      37        32  -39.26% $    -86,785   11 $    -11,355   26      9     13    capital 7, gamma 30
+     all three      42         7  -22.74% $    -40,096   13 $    -16,744   29     10      0      gamma 11, risk 31
+```
+
+(`configs/es_synthetic.yaml`; generated data, so read the shape, not the
+P&L.) The columns that matter are **stops** and **daily** — exits taken on a
+branch rule versus on the daily loss limit. Sized to capital alone the daily
+limit takes 21 of 25; under all three it takes none, and the rules written
+for each branch are the ones that fire.
 
 The requirement means different things in the two regimes, and conflating
 them would misstate the risk in both directions:
@@ -792,26 +856,29 @@ roughly doubles between the two. Measured at spot 5000, 15 vol, on a $250k
 account at the default sizing:
 
 ```
-moment                premium   SPAN margin   debit    straddles short / long
-0DTE at 09:35 (6.4h)    16.17        $1,679    $809                83 / 173
-0DTE at 12:00 (4.0h)    12.79        $1,822    $639                76 / 218
-1DTE at the roll        31.48        $1,350  $1,574               103 /  88
-2DTE                    47.15        $1,325  $2,357               105 /  59
+moment                premium   SPAN    debit   short n       long n
+0DTE at 09:35 (6.4h)    16.17  $1,679    $809   10  risk    30  risk
+0DTE at 12:00 (4.0h)    12.79  $1,822    $639   13  risk    30  gamma
+0DTE at 14:30 (1.5h)     7.83  $2,063    $392   18  gamma   18  gamma
+1DTE at the roll        31.32  $1,352  $1,566    5  risk    15  risk
 ```
 
-So the same allocation buys a short book of roughly the same size all day
-and a long book that is twice as big in the morning as at the roll, and the
-two branches carry different gamma — which is why "Band" in every backtest
-summary reports the half-width and its width in points per branch (see "The
-delta band" above). A one-day scan is a conservative charge against a 0DTE
-position that will be flat by the bell, and exactly the horizon the rolled
-1DTE position is carried over.
+Neither the margin nor the debit is usually what decides the count. The risk
+budget binds in the morning and the gamma ceiling takes over by the
+afternoon, which is what each is for. A one-day scan is still a conservative
+charge against a 0DTE position that will be flat by the bell, and exactly
+the horizon the rolled 1DTE position is carried over.
 
-The long branch at this allocation spends more than half of equity on a
-same-day straddle's debit — the maximum loss on the option leg, reachable in
-a single session. The daily loss limit is the rule standing in front of
-that; if the number is uncomfortable, `buying_power_pct` is the lever and
-the sizing tests pin that a fifth is never committed at any setting.
+The short branch comes out smaller than the long one at the same risk
+budget, and that is the rule working rather than a bias: its stop sits 2.5×
+the credit away, so a stop-out costs 1.5× the premium against the long
+side's 0.5×, and a wider stop earns fewer contracts. If that reads as too
+small, the lever is `short_stop_loss_premium_multiple` — now that it is
+reachable it is a real parameter rather than decoration — not the budget.
+The long branch now spends about a tenth of equity on a same-day straddle's
+debit rather than more than half of it; that debit is still the maximum loss
+on the option leg, and the daily loss limit is still the backstop behind
+it — but a backstop rather than the only exit that ever fires.
 
 For live trading, `use_whatif_margin: true` asks IBKR to price the actual
 order. The straddle is probed as a **combo**, not as two separate orders,

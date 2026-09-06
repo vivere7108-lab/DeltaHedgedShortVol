@@ -185,6 +185,76 @@ def cmd_sweep_gates(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The sizing sweep's runs: a label and the ``sizing`` overrides that make
+#: it. "capital only" is what the system did before the risk budget existed;
+#: the middle rows turn exactly one constraint on so its cost is readable.
+SIZING_RUNS: tuple[tuple[str, dict], ...] = (
+    ("capital only", {"risk_budget_pct": None, "gamma_ceiling_units_per_100k": None}),
+    ("risk budget", {"gamma_ceiling_units_per_100k": None}),
+    ("gamma ceiling", {"risk_budget_pct": None}),
+    ("all three", {}),
+)
+
+
+def cmd_sweep_sizing(args: argparse.Namespace) -> int:
+    """Price each sizing constraint on its own, then all of them together.
+
+    The column to read is "bound by", next to the exits. Sized to the
+    capital cap alone the branch stops are 5-8x the daily loss limit, so
+    the daily limit fires first and the exit ladder never runs; the whole
+    point of the risk budget is to move those exits back onto the rules
+    that were written for each branch. "stops" counts exits taken on a
+    branch stop or target, "daily" the ones taken on the daily loss limit.
+    """
+    from .backtest import run_backtest
+
+    cfg = _load(args)
+    defaults = {
+        "risk_budget_pct": cfg.sizing.risk_budget_pct,
+        "gamma_ceiling_units_per_100k": cfg.sizing.gamma_ceiling_units_per_100k,
+    }
+    print(
+        f"{'sizing':>14} {'entries':>7} {'straddles':>9} {'return':>9} "
+        f"{'long gamma':>12} {'(n)':>4} {'short gamma':>12} {'(n)':>4} "
+        f"{'stops':>6} {'daily':>6} {'bound by':>22}"
+    )
+    print("-" * 116)
+    for label, overrides in SIZING_RUNS:
+        for name, value in defaults.items():
+            setattr(cfg.sizing, name, overrides.get(name, value))
+        result = run_backtest(cfg)
+        m = result.metrics
+        events = result.events
+        exits = (
+            events[events["kind"] == "exit"] if not events.empty else events
+        )
+        detail = exits["detail"] if not exits.empty else None
+        stops = (
+            int(detail.str.contains("stop:|target:", regex=True).sum())
+            if detail is not None else 0
+        )
+        daily = (
+            int(detail.str.contains("daily loss limit").sum())
+            if detail is not None else 0
+        )
+        bound = ", ".join(
+            f"{name} {count}" for name, count in sorted(m.sizing_binds.items())
+        ) or "-"
+        print(
+            f"{label:>14} {m.entries:>7} {m.median_straddles:>9,.0f} "
+            f"{m.total_return:>8.2%} ${m.long_gamma_pnl:>11,.0f} "
+            f"{m.long_gamma_trades:>4} ${m.short_gamma_pnl:>11,.0f} "
+            f"{m.short_gamma_trades:>4} {stops:>6} {daily:>6} {bound:>22}"
+        )
+    print(
+        "\nEvery row is the same data; only the sizing constraints differ.\n"
+        "'stops' and 'daily' are exits taken on a branch rule versus on the "
+        "daily loss\nlimit -- a row where 'daily' dominates is one whose stop "
+        "ladder cannot fire."
+    )
+    return 0
+
+
 def cmd_sweep(args: argparse.Namespace) -> int:
     """Run the backtest across risk aversions (or fixed band widths) and compare.
 
@@ -203,8 +273,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if args.gates:
         return cmd_sweep_gates(args)
+    if args.sizing:
+        return cmd_sweep_sizing(args)
 
     cfg = _load(args)
+    if args.risk_budgets or args.gamma_ceilings:
+        return _sweep_sizing_values(cfg, args)
     if args.bands:
         label, values = "band", [float(w) for w in args.bands.split(",")]
         cfg.hedge.band_model = "fixed"
@@ -239,6 +313,67 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             "\nWhalley-Wilmott absolute risk aversion, per dollar of wealth. The "
             "band scales\nas its inverse cube root, so a decade of risk aversion "
             "is about 2.2x of band."
+        )
+    return 0
+
+
+def _sweep_sizing_values(cfg, args: argparse.Namespace) -> int:
+    """Sweep the risk budget or the gamma ceiling, one value per row.
+
+    The band sweep's counterpart for the sizing rule: what each level costs
+    in trades taken, in which branch took them, and in whether the exits
+    landed on the branch stops or on the daily loss limit.
+    """
+    from .backtest import run_backtest
+
+    if args.risk_budgets:
+        attr, label = "risk_budget_pct", "risk %eq"
+        values = [float(v) for v in args.risk_budgets.split(",")]
+    else:
+        attr, label = "gamma_ceiling_units_per_100k", "gamma/100k"
+        values = [float(v) for v in args.gamma_ceilings.split(",")]
+
+    print(
+        f"{label:>11} {'entries':>7} {'straddles':>9} {'return':>9} {'P&L':>11} "
+        f"{'long gamma':>12} {'short gamma':>12} {'stops':>6} {'daily':>6} "
+        f"{'bound by':>22}"
+    )
+    print("-" * 112)
+    for value in values:
+        setattr(cfg.sizing, attr, value)
+        result = run_backtest(cfg)
+        m = result.metrics
+        events = result.events
+        exits = events[events["kind"] == "exit"] if not events.empty else events
+        detail = exits["detail"] if not exits.empty else None
+        stops = (
+            int(detail.str.contains("stop:|target:", regex=True).sum())
+            if detail is not None else 0
+        )
+        daily = (
+            int(detail.str.contains("daily loss limit").sum())
+            if detail is not None else 0
+        )
+        bound = ", ".join(
+            f"{name} {count}" for name, count in sorted(m.sizing_binds.items())
+        ) or "-"
+        print(
+            f"{value:>11g} {m.entries:>7} {m.median_straddles:>9,.0f} "
+            f"{m.total_return:>8.2%} ${m.final_equity - m.starting_equity:>10,.0f} "
+            f"${m.long_gamma_pnl:>11,.0f} ${m.short_gamma_pnl:>11,.0f} "
+            f"{stops:>6} {daily:>6} {bound:>22}"
+        )
+    if attr == "risk_budget_pct":
+        print(
+            "\nFraction of equity a full stop-out may cost. Compare it with "
+            "strategy.daily_loss_limit_pct:\na risk budget above the daily "
+            "limit puts the daily limit back in front of the branch stops."
+        )
+    else:
+        print(
+            "\nGamma ceiling in delta units per point per $100k of equity. It "
+            "binds where the risk\nbudget is loosest -- the cheap, "
+            "high-gamma end of the session."
         )
     return 0
 
@@ -789,7 +924,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sweep = sub.add_parser(
         "sweep", parents=[common],
-        help="compare backtests across risk aversions, band widths or gates"
+        help="compare backtests across risk aversions, band widths, gates or sizing"
     )
     sweep.add_argument("--source", choices=["ibkr", "csv", "synthetic"])
     sweep.add_argument("--open-interest", choices=["synthetic", "csv"])
@@ -806,6 +941,21 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--gates", action="store_true",
         help="sweep the stand-aside gates one at a time instead of the band",
+    )
+    sweep.add_argument(
+        "--sizing", action="store_true",
+        help="sweep the sizing constraints (risk budget, gamma ceiling, "
+             "capital cap) one at a time instead of the band",
+    )
+    sweep.add_argument(
+        "--risk-budgets", dest="risk_budgets", default=None,
+        help="comma-separated sizing.risk_budget_pct values to sweep, e.g. "
+             "0.01,0.02,0.05,0.10",
+    )
+    sweep.add_argument(
+        "--gamma-ceilings", dest="gamma_ceilings", default=None,
+        help="comma-separated sizing.gamma_ceiling_units_per_100k values to "
+             "sweep, e.g. 30,60,120,240",
     )
     sweep.set_defaults(func=cmd_sweep)
 
