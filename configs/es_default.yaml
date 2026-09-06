@@ -40,7 +40,7 @@ hedge:
   # band of a few tens of delta units for a handful of straddles and a
   # couple of hundred for a book sized to the margin limit. Raise it to
   # hedge less often; `deltahedger sweep --risk-aversions` prices the choice.
-  risk_aversion: 0.01
+  risk_aversion: 1
   # Dollar cost of one hedge contract, one way, for the band. null derives
   # it from `costs` (hedge slippage ticks x tick value + fees) whether or
   # not costs.enabled is on.
