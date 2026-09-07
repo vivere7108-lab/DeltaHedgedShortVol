@@ -1,8 +1,8 @@
 """Backtest driver.
 
 Walks the bar stream, hands each bar to ``GexStraddleStrategy`` with a
-simulated execution handler and an open-interest provider, and turns what
-comes out into a
+simulated execution handler, an open-interest provider and an option trade
+feed, and turns what comes out into a
 ``BacktestResult``.  All the decision logic lives in the strategy; this file
 is a loop and a reporting step, which is deliberate -- it is what makes the
 live runner a drop-in replacement rather than a parallel implementation.
@@ -16,8 +16,9 @@ from zoneinfo import ZoneInfo
 
 from ..broker.paper import SimulatedExecution
 from ..config import Config
-from ..data import build_open_interest_provider, build_source
+from ..data import build_open_interest_provider, build_source, build_trade_feed
 from ..data.base import DataSource, ensure_sorted
+from ..flow import OptionTradeFeed
 from ..gex import OpenInterestProvider
 from ..strategy import GexStraddleStrategy
 from .results import (
@@ -48,6 +49,7 @@ def run_backtest(
     cfg: Config,
     source: DataSource | None = None,
     open_interest: OpenInterestProvider | None = None,
+    trade_feed: OptionTradeFeed | None = None,
 ) -> BacktestResult:
     risk_source = cfg.source
     data = source if source is not None else build_source(cfg, risk_source)
@@ -56,7 +58,18 @@ def run_backtest(
         if open_interest is not None
         else build_open_interest_provider(cfg, risk_source)
     )
-    strategy = GexStraddleStrategy(cfg, risk_source, open_interest=oi)
+    # The tape is built from the open-interest provider so a synthetic run's
+    # generated flow agrees with its generated book rather than contradicting
+    # it -- see ``SyntheticTradeFeed``. With ``flow.source: none`` (the
+    # default) this is a null feed and every sign keeps its prior.
+    tape = (
+        trade_feed
+        if trade_feed is not None
+        else build_trade_feed(cfg, risk_source, oi)
+    )
+    strategy = GexStraddleStrategy(
+        cfg, risk_source, open_interest=oi, trade_feed=tape
+    )
     execution = SimulatedExecution(cfg.costs, risk_source)
     tz = strategy.clock.tz
 

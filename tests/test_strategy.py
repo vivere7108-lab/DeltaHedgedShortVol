@@ -36,6 +36,7 @@ from deltahedger.gex import (
     EnsembleResult,
     StrikeOpenInterest,
 )
+from deltahedger.flow import CALL, PUT, SELL, OptionTrade
 from deltahedger.pricing import black76
 from deltahedger.strategy import (
     BLOCK_EVENT_BLACKOUT,
@@ -140,9 +141,11 @@ FIFTEEN_DTE = {
 }
 
 
-def drive(cfg: Config, bars, regime: str = POSITIVE, provider=None):
+def drive(cfg: Config, bars, regime: str = POSITIVE, provider=None, trade_feed=None):
     provider = provider if provider is not None else FixedRegime(regime)
-    strategy = GexStraddleStrategy(cfg, open_interest=provider)
+    strategy = GexStraddleStrategy(
+        cfg, open_interest=provider, trade_feed=trade_feed
+    )
     execution = SimulatedExecution(cfg.costs, cfg.source)
     for market_bar in bars:
         strategy.on_bar(market_bar, execution)
@@ -1069,3 +1072,145 @@ class TestEventBlackout:
     def test_the_bar_state_names_the_event(self):
         strategy = drive(self.make(), [bar(45)])
         assert "test event" in strategy.bar_states[-1].event_blackout
+
+
+class RecordingFeed:
+    """A tape that hands back one trade per pull and records its windows.
+
+    The windows are the point: the strategy has to ask for ``(last, now]``
+    every bar, and a feed that was asked for an overlapping window would
+    fold the same execution into the dealer position twice with nothing
+    downstream able to see it happen.
+    """
+
+    def __init__(
+        self, side: str = SELL, size: float = 5_000.0, right: str = CALL,
+        strikes: tuple = (5000.0,),
+    ):
+        self.windows: list[tuple] = []
+        self.side = side
+        self.size = size
+        self.right = right
+        self.strikes = strikes
+
+    def trades(self, start, end, expiry):
+        self.windows.append((start, end, expiry))
+        return [
+            OptionTrade(
+                timestamp=end, expiry=expiry, strike=strike, right=self.right,
+                price=10.0, size=self.size, aggressor=self.side,
+            )
+            for strike in self.strikes
+        ]
+
+
+class TestTradeFeed:
+    """The tape reaches the profile, exactly once per bar."""
+
+    def test_no_feed_leaves_every_sign_on_the_prior(self):
+        strategy = drive(make_cfg(), [bar(0)], NEGATIVE)
+        assert strategy.bar_states[-1].gex_flow_coverage == 0.0
+        assert strategy.flow.classified_volume() == 0.0
+
+    def test_a_feed_is_drained_every_bar_and_reaches_the_profile(self):
+        feed = RecordingFeed()
+        strategy = drive(
+            make_cfg(), [bar(0), bar(5), bar(10)], NEGATIVE, trade_feed=feed
+        )
+        assert len(feed.windows) == 3
+        assert strategy.flow.classified_volume() == 3 * 5_000.0
+        assert strategy.bar_states[-1].gex_flow_coverage > 0.0
+
+    def test_the_windows_are_contiguous_and_never_overlap(self):
+        feed = RecordingFeed()
+        drive(make_cfg(), [bar(0), bar(5), bar(10)], NEGATIVE, trade_feed=feed)
+        starts = [w[0] for w in feed.windows]
+        ends = [w[1] for w in feed.windows]
+        # Each window picks up exactly where the last one ended.
+        assert starts[1:] == ends[:-1]
+
+    def test_the_first_window_is_one_bar_wide_not_unbounded(self):
+        feed = RecordingFeed()
+        drive(make_cfg(), [bar(0), bar(5)], NEGATIVE, trade_feed=feed)
+        first_start, first_end, _ = feed.windows[0]
+        # No previous bar to measure against, so it falls back to the OI
+        # refresh interval rather than reaching back to the epoch.
+        assert (first_end - first_start).total_seconds() == pytest.approx(900.0)
+
+    def test_measured_flow_can_reverse_the_regime_the_chain_implies(self):
+        # FixedRegime(NEGATIVE) is a put-heavy chain, which the static
+        # convention calls short gamma. A tape saying customers were selling
+        # those puts to dealers says the opposite -- and the strategy must
+        # act on what was measured, not on what was assumed.
+        cfg = make_cfg()
+        cfg.gex.flow_confidence_contracts = 10.0  # a thin book measures fast
+        feed = RecordingFeed(
+            side=SELL, size=50_000.0, right=PUT,
+            # Across the whole strike window: measuring one strike's sign
+            # cannot outweigh forty strikes still carrying the prior, and
+            # should not be able to.
+            strikes=tuple(5000.0 + 5.0 * i for i in range(-20, 21)),
+        )
+        strategy = drive(cfg, [bar(0), bar(5)], NEGATIVE, trade_feed=feed)
+        assert strategy.bar_states[-1].gex_regime == POSITIVE
+
+    def test_measuring_one_strike_cannot_outweigh_a_chain_of_priors(self):
+        cfg = make_cfg()
+        cfg.gex.flow_confidence_contracts = 10.0
+        feed = RecordingFeed(side=SELL, size=50_000.0, right=PUT)  # one strike
+        strategy = drive(cfg, [bar(0), bar(5)], NEGATIVE, trade_feed=feed)
+        assert strategy.bar_states[-1].gex_regime == NEGATIVE
+
+    def test_a_feed_that_raises_does_not_halt_the_run(self):
+        class Broken:
+            def trades(self, start, end, expiry):
+                raise RuntimeError("the tick stream dropped")
+
+        strategy = drive(make_cfg(), [bar(0), bar(5)], NEGATIVE, trade_feed=Broken())
+        # The read falls back to the prior for that expiry rather than
+        # standing aside for the rest of the session.
+        assert strategy.bar_states[-1].gex_regime == NEGATIVE
+        assert strategy.bar_states[-1].gex_flow_coverage == 0.0
+
+    def test_a_failed_pull_is_retried_rather_than_skipping_its_window(self):
+        class FlakyOnce:
+            def __init__(self):
+                self.calls = 0
+                self.windows = []
+
+            def trades(self, start, end, expiry):
+                self.calls += 1
+                self.windows.append((start, end))
+                if self.calls == 1:
+                    raise RuntimeError("transient")
+                return []
+
+        feed = FlakyOnce()
+        drive(make_cfg(), [bar(0), bar(5)], NEGATIVE, trade_feed=feed)
+        # The high-water mark is only advanced on a successful pull, so the
+        # second window still covers the trades the first one dropped.
+        assert feed.windows[1][0] == feed.windows[0][0]
+        assert feed.windows[1][1] > feed.windows[0][1]
+
+    def test_the_recovery_window_is_bounded_by_backfill_seconds(self):
+        class AlwaysBroken:
+            def __init__(self):
+                self.windows = []
+
+            def trades(self, start, end, expiry):
+                self.windows.append((start, end))
+                raise RuntimeError("still down")
+
+        cfg = make_cfg()
+        cfg.flow.backfill_seconds = 600.0
+        feed = AlwaysBroken()
+        drive(
+            cfg,
+            [bar(0), bar(5), bar(10), bar(20), bar(40)],
+            NEGATIVE,
+            trade_feed=feed,
+        )
+        # An outage does not turn into an ever-widening re-read the moment
+        # the feed comes back.
+        widest = max((end - start).total_seconds() for start, end in feed.windows)
+        assert widest <= 600.0

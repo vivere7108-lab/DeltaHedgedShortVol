@@ -63,6 +63,17 @@ data:
   open_interest: ibkr              # the exchange's OI, not a generated surface
   bar_size: 5 mins
 
+flow:
+  # The live option tape. Every execution near the money is classified by
+  # aggressor side, so the dealer sign at each strike is measured rather
+  # than assumed. IBKR relays no MDP 3.0 aggressor flag, so the Lee-Ready
+  # quote and tick rules do the work here -- run `deltahedger doctor`
+  # during the session to confirm trades are actually arriving before a
+  # walk depends on them. Without them every strike keeps the prior and the
+  # runner behaves as it did before, silently, which is exactly the failure
+  # doctor exists to catch.
+  source: ibkr
+
 ibkr:
   host: 127.0.0.1
   port: 4002                       # IB Gateway paper. TWS paper is 7497.
