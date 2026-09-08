@@ -316,3 +316,9 @@ class TestProviderFactory:
         cfg.data.open_interest = "vibes"
         with pytest.raises(ValueError, match="unknown open-interest source"):
             build_open_interest_provider(cfg, cfg.source)
+
+    @pytest.mark.parametrize("kind", ["databento", "databento_flow"])
+    def test_databento_is_refused_in_a_backtest(self, cfg, kind):
+        cfg.data.open_interest = kind
+        with pytest.raises(ValueError, match="live Databento session"):
+            build_open_interest_provider(cfg, cfg.source)
