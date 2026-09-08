@@ -599,10 +599,16 @@ class DataConfig:
     default_atm_iv: float = 0.15
 
     # -- open interest, which is what GEX is computed from ---------------
-    #: "synthetic" | "csv" | "ibkr". The bar source and the open-interest
-    #: source are separate on purpose: real ES bars with modelled OI is a
-    #: legitimate study, and pretending otherwise would hide which half of
-    #: the result is assumed.
+    #: "synthetic" | "csv" | "ibkr" | "databento" | "databento_flow". The
+    #: bar source and the open-interest source are separate on purpose: real
+    #: ES bars with modelled OI is a legitimate study, and pretending
+    #: otherwise would hide which half of the result is assumed.
+    #:
+    #: "databento" reads exchange open interest directly off CME's MDP 3.0
+    #: feed rather than through IBKR's relay -- see DatabentoConfig. It is
+    #: still the exchange's once-a-session figure; "databento_flow" adds
+    #: cumulative signed trade volume since that print as a same-day proxy.
+    #: Both are live-only, like "ibkr".
     open_interest: str = "synthetic"
     #: CSV open interest: a file with date,strike,call_oi,put_oi.
     oi_csv_path: str | None = None
@@ -653,6 +659,31 @@ class IBKRConfig:
     hedge_order_type: str = "MKT"
     #: For LMT hedges, cross the spread by this many ticks.
     limit_cross_ticks: float = 1.0
+
+
+@dataclass
+class DatabentoConfig:
+    """Live market data from CME's MDP 3.0 feed, via Databento.
+
+    Read when ``data.open_interest`` is ``databento`` or ``databento_flow``.
+    The API key is never written to a config file -- like the IBKR
+    credentials, which live in the Gateway's own config rather than here,
+    it is read from the environment at connect time.
+    """
+
+    #: Environment variable holding the Databento API key.
+    api_key_env: str = "DATABENTO_API_KEY"
+    dataset: str = "GLBX.MDP3"
+    #: Override the CME root used for every expiry, e.g. "ES" (subscribed
+    #: as "ES.OPT"). Leave unset for ES: its 0DTE weeklies are listed under
+    #: a different Globex root per weekday (confirmed live: "ES.OPT" itself
+    #: resolves to zero instruments), so the default instead asks IBKR to
+    #: qualify each expiry and reads its root back -- see
+    #: DatabentoSession.ensure_subscribed. Set this only for a risk source
+    #: without that per-weekday split.
+    parent_symbol: str | None = None
+    #: Reconnect automatically if the live session drops.
+    reconnect: bool = True
 
 
 @dataclass
@@ -711,6 +742,7 @@ class Config:
     costs: CostsConfig = field(default_factory=CostsConfig)
     data: DataConfig = field(default_factory=DataConfig)
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
+    databento: DatabentoConfig = field(default_factory=DatabentoConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
     #: Backtest window, ISO dates. ``None`` means "whatever the source has".
     start_date: str | None = None

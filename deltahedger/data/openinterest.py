@@ -229,9 +229,10 @@ class CsvOpenInterest:
 def build_open_interest_provider(cfg, source: RiskSource):
     """Construct the provider named by ``cfg.data.open_interest``.
 
-    ``ibkr`` is not constructible here -- it needs a live connection -- so
-    the live runner builds it and the backtest refuses it loudly rather than
-    substituting generated data for the real thing.
+    ``ibkr``, ``databento`` and ``databento_flow`` are not constructible
+    here -- they need a live connection -- so the live runner builds them
+    and the backtest refuses them loudly rather than substituting generated
+    data for the real thing.
     """
     kind = cfg.data.open_interest.lower()
     if kind == "synthetic":
@@ -244,7 +245,13 @@ def build_open_interest_provider(cfg, source: RiskSource):
             "available in `deltahedger live`, not in a backtest. Use 'csv' to "
             "replay real open interest historically."
         )
+    if kind in ("databento", "databento_flow"):
+        raise ValueError(
+            f"data.open_interest == {kind!r} needs a live Databento session; "
+            "it is available in `deltahedger live`, not in a backtest. Use "
+            "'csv' to replay real open interest historically."
+        )
     raise ValueError(
         f"unknown open-interest source {cfg.data.open_interest!r}; use "
-        "'synthetic', 'csv' or 'ibkr'"
+        "'synthetic', 'csv', 'ibkr', 'databento' or 'databento_flow'"
     )

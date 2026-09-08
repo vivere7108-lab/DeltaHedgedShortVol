@@ -93,6 +93,7 @@ class FakeOpenInterest:
 def build_runner(tmp_path, drop_after=None, **live):
     cfg = Config()
     cfg.starting_equity = 250_000.0
+    cfg.data.open_interest = "ibkr"
     cfg.live.journal_dir = str(tmp_path)
     cfg.live.reconnect_backoff_seconds = 0.01
     cfg.live.max_reconnect_backoff_seconds = 0.02
