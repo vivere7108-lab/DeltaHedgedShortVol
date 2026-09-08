@@ -29,6 +29,25 @@ exactly rather than approximated, so the model captures the thing that
 matters most for a short option -- margin exploding as the strike comes
 into range of the scan.
 
+Where the scan range comes from, and why it matters more than anything
+----------------------------------------------------------------------
+CME sets the outright futures margin *to* the price scan range, so
+``RiskSource.future_initial_margin / future.multiplier`` recovers the move
+being scanned -- 352 ES points, about 7% of spot, at a 17,600 outright
+margin.  That one number decides the whole short branch: it is what the
+straddle is repriced across, so halving it roughly halves the charge per
+straddle and doubles the count the budget buys.
+
+It has to be the **full-size** contract's performance bond.  An earlier
+revision carried MES's (~2,455) here, which scanned about 49 points, ~1%
+of spot -- the short branch was then charged around a tenth of what CME
+would actually hold against it, and ``buying_power_pct`` bought a book the
+account could not margin.  Nothing downstream could detect that: the
+sizing arithmetic, the entry log and the equity curve were all internally
+consistent and all wrong.  ``_check_scan_is_plausible`` now says so out
+loud, and the live path should prefer ``broker.ibkr.WhatIfMarginModel``,
+which asks IBKR rather than deriving anything.
+
 What the tenor does to the requirement
 --------------------------------------
 The traded series is today's, rolled into tomorrow's at the end of the
@@ -37,29 +56,28 @@ The two branches respond to tenor in opposite directions, and the reason
 is worth stating because it is not what most people expect.
 
 The **scan range does not lengthen with the option**.  SPAN scans a
-one-day move -- about 49 ES points at a 2455 outright margin -- whatever
-the tenor of what you are holding.  What changes is how much the straddle
-is worth *after* that move relative to what it is worth now, and a
-longer-dated straddle has already collected most of the value that move
-would create.  So the short branch's margin per straddle is close to flat
-across the range (measured at 5000, 15 vol, a 250k account)::
+one-day move whatever the tenor of what you are holding.  What changes is
+how much the straddle is worth *after* that move relative to what it is
+worth now, and a longer-dated straddle has already collected most of the
+value that move would create.  So the short branch's margin per straddle
+is close to flat across the range (measured at 5000, 15 vol, a 250k
+account at the default sizing)::
 
-    tenor   premium   SPAN margin   debit    straddles short / long
-    0DTE      15.66        $1,699    $783                 15 / 25*
-    2DTE      46.97        $1,324   $2,349                 19 / 11
-    3DTE      56.45        $1,373   $2,822                 19 /  9
-    5DTE      71.73        $1,502   $3,586                 17 /  7
-
-    (* capped by max_straddles rather than by the budget)
+    moment                premium   SPAN margin   debit   straddles short / long
+    0DTE at 09:35 (6.4h)    16.17       $16,791    $809                8 / 173
+    0DTE at 12:00 (4.0h)    12.79       $16,961    $639                8 / 218
+    1DTE at the roll        31.49       $16,026  $1,574                8 /  88
+    2DTE                    44.41       $15,379  $2,221                9 /  63
 
 The **long branch is a different story**, because its requirement is the
 debit and the debit roughly doubles between the morning's 0DTE entry and
-the afternoon's 1DTE roll.  So the same ``buying_power_pct`` buys a short
-book of roughly the same size at either moment and a long book about half
-as big at the roll, and the two branches do not carry comparable gamma.
-That is a real asymmetry, it is a property of the requirement rather than
-of the signal, and the backtest's band section reports median gamma and
-band per branch so a regime comparison cannot mistake it for one.
+the afternoon's 1DTE roll.  The two branches are therefore not remotely
+comparable in size: a short straddle is charged a scan move worth several
+hundred points, a long one only the premium, so the same budget buys an
+order of magnitude more long straddles than short ones.  That is a
+property of the requirement rather than of the signal, and the backtest's
+band section reports median gamma and band per branch so a regime
+comparison cannot mistake it for one.
 
 A one-day scan is a conservative charge against a 0DTE position that will
 be flat by the bell, and exactly the horizon a rolled 1DTE position is
@@ -69,10 +87,15 @@ At the default 80% allocation the long branch spends more than half of
 equity on a same-day straddle's debit.  That is the maximum loss on the
 option leg, and it can be reached in a single session; the daily loss
 limit in ``StrategyConfig`` is the rule that stops it getting there.
+``buying_power_pct`` is the lever if that is not enough.
 
 ``RegTMarginModel`` is the 15%-of-notional equity-option rule.  It is
-included because it is what most people reach for, and it overstates ES
-option margin by roughly an order of magnitude; use it only to compare.
+included because it is what most people reach for, and it charges the
+losing leg against notional rather than against a scanned move, so it
+lands a factor of two or so above SPAN; use it only to compare.  (An
+earlier revision recorded that gap as an order of magnitude.  That was
+the SPAN branch being run off a scan range ten times too narrow, not a
+property of this model.)
 
 None of these are IBKR's number.  For live trading use
 ``broker.ibkr.WhatIfMarginModel``, which asks IBKR to price the margin
@@ -81,13 +104,26 @@ impact of the actual order before it is sent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .chain import OptionQuote, StraddleQuote
 from .config import SizingConfig
 from .instruments import RiskSource
 from .pricing import black76
+
+log = logging.getLogger(__name__)
+
+#: Below this fraction of spot, a derived price scan range is not a
+#: plausible one-day SPAN move for an equity-index future -- CME scans
+#: something in the 4-8% region -- and the most likely cause is a
+#: ``RiskSource.future_initial_margin`` carrying the *micro* contract's
+#: performance bond instead of the full-size one. That mistake is silent
+#: and expensive: it undercharges every short straddle and the
+#: buying-power budget then buys a book the account cannot margin, so it
+#: is worth one loud line rather than none.
+MIN_PLAUSIBLE_SCAN_PCT = 0.02
 
 #: SPAN's 16-scenario risk array: (fraction of the price scan range,
 #: fraction of the volatility scan range, weight applied to the loss).
@@ -154,8 +190,8 @@ class SpanScanMarginModel:
     The price scan range is inferred from the risk source's outright future
     margin -- CME sets that margin *to* the scan range, so
     ``future_initial_margin / multiplier`` recovers the point move being
-    scanned (about 49 ES points, ~1%, at a 2455 margin).  Volatility is
-    scanned as a relative bump.
+    scanned (352 ES points, ~7% of spot, at a 17,600 margin).  Volatility
+    is scanned as a relative bump.
 
     The scan is a *one-day* move and does not stretch with the option's
     tenor, which is SPAN's design and not an approximation here.  See the
@@ -166,12 +202,40 @@ class SpanScanMarginModel:
     vol_scan_pct: float = 0.30
     short_option_minimum: float = 250.0
     risk_free_rate: float = 0.0
+    #: One-shot latch so the implausible-scan warning is logged once per
+    #: model rather than on every bar of a backtest.
+    _warned: list[bool] = field(default_factory=list, repr=False, compare=False)
 
     def price_scan_range(self, source: RiskSource) -> float:
         """The price move SPAN scans, in underlying points."""
         return (
             source.future_initial_margin / source.future.multiplier
         ) * self.scan_multiplier
+
+    def _check_scan_is_plausible(self, scan: float, future_price: float) -> None:
+        """Say so when the scan range is too narrow to be a real one.
+
+        The scan is derived from the risk source's outright futures margin,
+        and there is no way for the model to tell a genuinely low margin
+        from a mis-entered one.  What it can tell is that a one-day scan
+        worth well under 2% of spot is not what CME scans an equity-index
+        future for, and that a book sized against it will be several times
+        larger than the account can carry.
+        """
+        if self._warned or future_price <= 0.0:
+            return
+        if scan >= MIN_PLAUSIBLE_SCAN_PCT * future_price:
+            return
+        self._warned.append(True)
+        log.warning(
+            "the SPAN price scan range is %.1f points, %.2f%% of a spot of "
+            "%.2f -- too narrow for a one-day equity-index scan. Check "
+            "RiskSource.future_initial_margin: it must be the FULL-SIZE "
+            "contract's performance bond, not the micro's. Too small a "
+            "figure undercharges every short straddle and oversizes the "
+            "book against the margin actually required.",
+            scan, 100.0 * scan / future_price, future_price,
+        )
 
     def straddle_requirement(
         self, quote: StraddleQuote, future_price: float, source: RiskSource,
@@ -181,6 +245,7 @@ class SpanScanMarginModel:
             return straddle_debit(quote, source)
 
         scan = self.price_scan_range(source)
+        self._check_scan_is_plausible(scan, future_price)
         mult = source.option.multiplier
         # We are short, so a scenario that raises the pair's value is a loss.
         # Both legs are repriced in the same scenario and netted before the

@@ -76,7 +76,7 @@ where those come from.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 
 from .broker.base import ExecutionHandler, Fill
@@ -644,6 +644,11 @@ class GexStraddleStrategy:
         if fills is None:
             return
         call_fill, put_fill = fills
+        # The book records what the exchange filled, never what was asked
+        # for. ``_open_legs`` has already squared the two legs, so they
+        # agree; taking the requested size instead would leave the strategy
+        # hedging and marking contracts it does not own.
+        filled = call_fill.quantity
 
         self._hedge_realised_at_entry = self.portfolio.hedge_realised
         self._fees_at_entry = self.portfolio.fees_paid - call_fill.fees - put_fill.fees
@@ -651,7 +656,7 @@ class GexStraddleStrategy:
             StraddlePosition(
                 strike=quote.strike,
                 expiry=expiry,
-                quantity=quantity,
+                quantity=filled,
                 call_entry=call_fill.price,
                 put_entry=put_fill.price,
                 entry_time=moment,
@@ -665,16 +670,19 @@ class GexStraddleStrategy:
         self.regime_trades[profile.regime] = self.regime_trades.get(profile.regime, 0) + 1
 
         side = "bought" if direction > 0 else "sold"
-        cash = abs(quantity) * (call_fill.price + put_fill.price) * self.source.option.multiplier
+        cash = abs(filled) * (call_fill.price + put_fill.price) * self.source.option.multiplier
         intent = "scalp gamma" if direction > 0 else "collect theta"
         self._record(
             moment, "entry",
-            f"{side} {sizing.contracts} {expiry} ({days_left}DTE) "
+            f"{side} {abs(filled)}"
+            + ("" if abs(filled) == sizing.contracts else f" of {sizing.contracts}")
+            + f" {expiry} ({days_left}DTE) "
             f"{quote.strike:g} straddle "
             f"@ {call_fill.price + put_fill.price:.2f} "
             f"(C {call_fill.price:.2f} / P {put_fill.price:.2f}, IV {quote.iv:.3f}) "
             f"for ${cash:,.0f} {'debit' if direction > 0 else 'credit'}; "
-            f"{sizing.requirement_kind} ${sizing.total_margin:,.0f} of "
+            f"{sizing.requirement_kind} "
+            f"${abs(filled) * sizing.margin_per_contract:,.0f} of "
             f"${sizing.budget:,.0f} budget -- {profile.reason}, so {intent}",
             regime=profile.regime,
         )
@@ -714,47 +722,129 @@ class GexStraddleStrategy:
         self, quote: StraddleQuote, quantity: int, moment: datetime,
         execution: ExecutionHandler,
     ) -> tuple[Fill, Fill] | None:
-        """Fill both legs, or leave the book flat.
+        """Fill both legs to the *same* size, or leave the book flat.
 
         A straddle with one leg on is a naked option, not a straddle -- it
         carries the wrong sign of delta and none of the gamma exposure the
-        regime called for.  If the second leg does not fill, the first is
-        unwound immediately rather than held.  In the backtest this cannot
-        happen; in live it can, which is the case worth writing for.
+        regime called for.  So there are two ways this can fail and both are
+        squared here rather than passed upstairs:
+
+        * the second leg does not fill at all -- the first is unwound;
+        * the two legs fill *different* sizes.  A partial fill is ordinary
+          on a 0DTE chain and the excess on the longer leg is exactly the
+          naked option the paragraph above is about, so it is trimmed back
+          to the smaller leg before anything is booked.
+
+        What comes back is therefore a matched pair, and the caller may
+        take either leg's quantity as the position's.  The returned sizes
+        are what the exchange filled -- never what was asked for -- because
+        a book that records the request is a book that hedges and marks
+        contracts the account does not hold.  In the backtest neither case
+        can happen; in live both can, which is the case worth writing for.
         """
         call_fill = execution.execute_option(quote.call, quantity, moment)
-        if call_fill is None:
+        if call_fill is None or call_fill.quantity == 0:
             self._record(moment, "entry_failed", "the call leg did not fill")
             return None
         self.fills.append(call_fill)
         self.portfolio.charge_fees(call_fill.fees)
 
         put_fill = execution.execute_option(quote.put, quantity, moment)
-        if put_fill is not None:
+        if put_fill is not None and put_fill.quantity != 0:
             self.fills.append(put_fill)
             self.portfolio.charge_fees(put_fill.fees)
-            return call_fill, put_fill
+            return self._square_legs(
+                quote, call_fill, put_fill, moment, execution, "entry"
+            )
 
-        unwind = execution.execute_option(quote.call, -call_fill.quantity, moment)
-        if unwind is None:
+        if self._unwind_leg(
+            quote.call, call_fill.quantity, call_fill.price, moment, execution
+        ):
+            self._record(
+                moment, "entry_failed",
+                "the put leg did not fill; the call leg was unwound and the book "
+                "is flat",
+            )
+        else:
             self._record(
                 moment, "entry_failed",
                 f"the put leg did not fill and the {call_fill.quantity:+d} call leg "
                 "could not be unwound -- the book is holding a naked option and "
                 "needs manual attention",
             )
+        return None
+
+    def _square_legs(
+        self, quote: StraddleQuote, call_fill: Fill, put_fill: Fill,
+        moment: datetime, execution: ExecutionHandler, context: str = "entry",
+    ) -> tuple[Fill, Fill] | None:
+        """Trim a mismatched pair of leg fills down to the smaller of the two.
+
+        Both fills carry the same sign (the sign of the order), so the
+        excess is whatever the longer leg filled beyond the shorter one, and
+        unwinding it leaves a matched straddle at the smaller size.  If the
+        trim itself does not fill, nothing is booked: the strategy cannot
+        represent a lopsided pair, and pretending it is a straddle is how a
+        book ends up hedging a delta it does not have.
+        """
+        matched = min(abs(call_fill.quantity), abs(put_fill.quantity))
+        if matched == abs(call_fill.quantity) == abs(put_fill.quantity):
+            return call_fill, put_fill
+
+        sign = 1 if call_fill.quantity > 0 else -1
+        long_leg, long_quote = (
+            (call_fill, quote.call)
+            if abs(call_fill.quantity) > abs(put_fill.quantity)
+            else (put_fill, quote.put)
+        )
+        excess = long_leg.quantity - sign * matched
+        if not self._unwind_leg(
+            long_quote, excess, long_leg.price, moment, execution
+        ):
+            self._record(
+                moment, f"{context}_failed",
+                f"the legs filled {call_fill.quantity:+d} call / "
+                f"{put_fill.quantity:+d} put and the {excess:+d} "
+                f"{long_quote.right} excess could not be reversed -- the book is "
+                "holding a naked option and needs manual attention",
+            )
             return None
+        self._record(
+            moment, f"{context}_partial",
+            f"the legs filled {call_fill.quantity:+d} call / "
+            f"{put_fill.quantity:+d} put; the {excess:+d} {long_quote.right} "
+            f"excess was reversed and {matched} straddles were "
+            f"{'opened' if context == 'entry' else 'closed'}",
+        )
+        trimmed = sign * matched
+        return (
+            replace(call_fill, quantity=trimmed),
+            replace(put_fill, quantity=trimmed),
+        )
+
+    def _unwind_leg(
+        self, quote, quantity: int, entry_price: float, moment: datetime,
+        execution: ExecutionHandler,
+    ) -> bool:
+        """Close ``quantity`` of one option leg opened at ``entry_price``.
+
+        Books whatever came back -- the fees and the realised P&L on the
+        part that closed -- and reports True only when the whole of
+        ``quantity`` is gone.  A partial unwind leaves a naked residual the
+        caller has to be loud about, so it must not read as success.
+        """
+        if quantity == 0:
+            return True
+        unwind = execution.execute_option(quote, -quantity, moment)
+        if unwind is None or unwind.quantity == 0:
+            return False
         self.fills.append(unwind)
         self.portfolio.charge_fees(unwind.fees)
         self.portfolio.option_realised += (
-            call_fill.quantity * (unwind.price - call_fill.price)
+            -unwind.quantity * (unwind.price - entry_price)
             * self.source.option.multiplier
         )
-        self._record(
-            moment, "entry_failed",
-            "the put leg did not fill; the call leg was unwound and the book is flat",
-        )
-        return None
+        return abs(unwind.quantity) == abs(quantity)
 
     # -- exits -------------------------------------------------------------
 
@@ -963,28 +1053,75 @@ class GexStraddleStrategy:
         regime = position.regime
         quantity = position.quantity
 
+        # The legs go out one at a time, and a leg that fills is *always*
+        # booked. Sending both and then discarding the pair when one of
+        # them failed -- which is what this did -- leaves the exchange
+        # holding a trade the book has no record of, and the exit fires
+        # again on the next bar and sends that leg a second time. Repeat
+        # once a poll and the account accumulates a position nobody asked
+        # for while the strategy still believes it holds a flat straddle.
         call_fill = execution.execute_option(quote.call, -quantity, moment)
-        put_fill = execution.execute_option(quote.put, -quantity, moment)
-        if call_fill is None or put_fill is None:
-            filled = "call" if call_fill is not None else "put" if put_fill is not None else "neither"
+        if call_fill is None or call_fill.quantity == 0:
             self._record(
                 moment, "exit_failed",
-                f"could not close ({reason}); {filled} leg filled",
+                f"could not close ({reason}); the call leg did not fill",
                 regime=regime,
             )
             return
-        for fill in (call_fill, put_fill):
-            self.fills.append(fill)
-            self.portfolio.charge_fees(fill.fees)
+        self.fills.append(call_fill)
+        self.portfolio.charge_fees(call_fill.fees)
+
+        put_fill = execution.execute_option(quote.put, -quantity, moment)
+        if put_fill is None or put_fill.quantity == 0:
+            # Put the call leg back, so the book and the account agree again
+            # and the next bar retries the close from a known state.
+            restored = self._unwind_leg(
+                quote.call, call_fill.quantity, call_fill.price, moment, execution
+            )
+            self._record(
+                moment, "exit_failed",
+                f"could not close ({reason}); the put leg did not fill and the "
+                + (
+                    f"{call_fill.quantity:+d} call leg was put back"
+                    if restored else
+                    f"{call_fill.quantity:+d} call leg could not be put back -- "
+                    "the book is holding a naked option and needs manual attention"
+                ),
+                regime=regime,
+            )
+            return
+        self.fills.append(put_fill)
+        self.portfolio.charge_fees(put_fill.fees)
+
+        squared = self._square_legs(
+            quote, call_fill, put_fill, moment, execution, "exit"
+        )
+        if squared is None:
+            return
+        call_fill, put_fill = squared
+        closed = abs(call_fill.quantity)
 
         # Attribute the whole position -- straddle and hedge -- before the
         # book is torn down, so the regime that opened it is charged with
-        # what it actually made.
+        # what it actually made. A partial close leaves the rest on the
+        # book; the exit reason still holds, so the next bar closes it and
+        # the attribution lands then.
         position_pnl = self._position_pnl(quote, bar.close)
-        option_pnl = self.portfolio.close_straddle(call_fill.price, put_fill.price)
+        option_pnl = self.portfolio.reduce_straddle(
+            closed, call_fill.price, put_fill.price
+        )
+        if self.portfolio.straddle is not None:
+            self._record(
+                moment, "exit_partial",
+                f"closed {closed} of {abs(quantity)} {position.strike:g} straddles "
+                f"@ {call_fill.price + put_fill.price:.2f} ({reason}); straddle "
+                f"P&L ${option_pnl:,.0f}, {abs(position.quantity)} still open",
+                regime=regime,
+            )
+            return
         self._record(
             moment, "exit",
-            f"closed {abs(quantity)} {position.strike:g} straddle @ "
+            f"closed {closed} {position.strike:g} straddle @ "
             f"{call_fill.price + put_fill.price:.2f} ({reason}); "
             f"straddle P&L ${option_pnl:,.0f}, position P&L ${position_pnl:,.0f}",
             regime=regime,

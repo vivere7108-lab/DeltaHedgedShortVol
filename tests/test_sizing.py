@@ -1,3 +1,5 @@
+import logging
+from dataclasses import replace
 from datetime import date
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from deltahedger.chain import select_atm_straddle
 from deltahedger.config import SizingConfig, VolConfig
 from deltahedger.sizing import (
+    MIN_PLAUSIBLE_SCAN_PCT,
     FixedMarginModel, RegTMarginModel, SpanScanMarginModel,
     build_margin_model, size_straddles, straddle_debit,
 )
@@ -54,7 +57,34 @@ class TestDirectionDecidesTheRequirement:
 
 class TestSpanScan:
     def test_scan_range_comes_from_the_future_margin(self, span, es):
-        assert span.price_scan_range(es) == pytest.approx(2455.0 / 50.0)
+        assert span.price_scan_range(es) == pytest.approx(
+            es.future_initial_margin / es.future.multiplier
+        )
+
+    def test_the_scan_range_is_a_plausible_one_day_move(self, span, es):
+        """The check the shipped ES numbers once failed.
+
+        ``future_initial_margin`` has to be the FULL-SIZE contract's
+        performance bond. An earlier revision carried MES's (~$2,455),
+        which scanned about 49 points -- 1% of spot -- so every short
+        straddle was charged roughly a tenth of what CME would hold and
+        the buying-power budget bought a book the account could not
+        margin. Nothing else in the system could notice: the arithmetic,
+        the entry log and the equity curve were all internally consistent.
+        A one-day equity-index scan is a few per cent of spot, so pin
+        that rather than the number.
+        """
+        scan = span.price_scan_range(es)
+        assert MIN_PLAUSIBLE_SCAN_PCT * F < scan < 0.15 * F
+
+    def test_an_implausibly_narrow_scan_is_reported(self, es, caplog):
+        """And it says so out loud rather than silently undercharging."""
+        micro = replace(es, future_initial_margin=2455.0)
+        model = SpanScanMarginModel()
+        with caplog.at_level(logging.WARNING, logger="deltahedger.sizing"):
+            model.straddle_requirement(straddle(micro), F, micro, SHORT)
+        assert "price scan range" in caplog.text
+        assert "full-size" in caplog.text.lower()
 
     def test_margin_is_the_right_order_of_magnitude(self, span, es):
         """A short 0DTE ATM straddle is riskier than one leg but should still
@@ -88,11 +118,19 @@ class TestSpanScan:
         assert rich < cheap
 
     def test_scanning_volatility_harder_costs_more_margin(self, es):
-        """The vol scan itself still binds; it is the entry premium, not the
-        scan, that moves the wrong way above."""
+        """The vol scan binds while the price scan leaves it room to.
+
+        It only has room when the scanned move does not take the straddle
+        so far in the money that its value is intrinsic and vol stops
+        mattering -- which at a full ES scan range is exactly what happens
+        to a 0DTE straddle, so the comparison is made on a narrower scan.
+        That is a property of a same-day option under a several-hundred
+        point scan, not a defect in the model, and the price-scan test
+        below is what pins the dominant term.
+        """
         quote = straddle(es)
-        gentle = SpanScanMarginModel(vol_scan_pct=0.05)
-        harsh = SpanScanMarginModel(vol_scan_pct=0.90)
+        gentle = SpanScanMarginModel(vol_scan_pct=0.05, scan_multiplier=0.05)
+        harsh = SpanScanMarginModel(vol_scan_pct=0.90, scan_multiplier=0.05)
         assert harsh.straddle_requirement(
             quote, F, es, SHORT
         ) > gentle.straddle_requirement(quote, F, es, SHORT)
@@ -111,12 +149,20 @@ class TestSpanScan:
         quote = straddle(es, iv=0.02, t=1.0 / 24 / 365)
         assert model.straddle_requirement(quote, F, es, SHORT) >= 1500.0
 
-    def test_regt_wildly_overstates_futures_margin(self, span, es):
-        """Documents why reg_t is not the default."""
+    def test_regt_overstates_futures_margin(self, span, es):
+        """Documents why reg_t is not the default.
+
+        It charges the losing leg in full against notional rather than
+        against a scanned move, so it lands well above SPAN -- but only by
+        a factor of two or so, not the order of magnitude an earlier
+        revision recorded here. That figure was an artefact of the SPAN
+        branch being run off a scan range ten times too narrow; it is the
+        SPAN number that was wrong, not this one.
+        """
         quote = straddle(es)
-        assert RegTMarginModel().straddle_requirement(quote, F, es, SHORT) > 5 * (
-            span.straddle_requirement(quote, F, es, SHORT)
-        )
+        regt = RegTMarginModel().straddle_requirement(quote, F, es, SHORT)
+        scan = span.straddle_requirement(quote, F, es, SHORT)
+        assert 1.5 * scan < regt < 5.0 * scan
 
     def test_regt_still_charges_only_the_debit_for_a_long(self, es):
         quote = straddle(es)

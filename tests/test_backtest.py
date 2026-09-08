@@ -418,26 +418,41 @@ class TestHedgeBehaviour:
         )))
         assert result.metrics.max_abs_delta_error <= es.hedge_quantum / 2 + 1e-6
 
-    def test_neither_regime_is_hedged_more_tightly_than_the_other(self):
+    def test_neither_regime_is_hedged_more_tightly_than_the_other(self, es):
         """Under the fixed model, one band applied symmetrically: if the
         long side were held tighter than the short side the regime
         comparison would be measuring the hedger rather than the signal.
         (Under Whalley-Wilmott the band is even in gamma -- pinned in
         ``test_hedger`` -- but the two branches carry different gamma, so
-        their bands differ in delta units by construction.)"""
+        their bands differ in delta units by construction.)
+
+        Both branches are pinned to one straddle rather than sized, so what
+        is left is the hedger and nothing else. The two requirements are
+        not comparable -- a short straddle is charged a scanned move, a
+        long one only its debit -- so any allocation leaves the branches
+        different sizes, and a bigger book drifts further inside the same
+        band. That is size, not asymmetry in the hedger.
+
+        What is asserted is the band, not the mean residual. The two
+        regimes last different numbers of bars over different paths, so
+        their mean residuals differ by however much the paths did; an
+        earlier revision compared them directly and passed on the strength
+        of that coincidence rather than on any property of the hedger.
+        """
         result = run_backtest(uncapped(synthetic(days=20, **{
             "hedge.band_model": "fixed", "hedge.band": 10.0,
-            # At the old allocation: at the margin limit a 5-minute bar
-            # moves a bigger book further outside a +/-10 band on the
-            # heavier branch, which is size, not asymmetry in the hedger.
-            "sizing.buying_power_pct": 0.15,
+            "sizing.min_straddles": 1, "sizing.max_straddles": 1,
         })))
         held = result.bars[result.bars["straddle_contracts"] != 0]
-        errors = held.groupby(held["direction"])["delta_error"].apply(
-            lambda column: column.abs().mean()
-        )
-        assert len(errors) == 2
-        assert errors.max() - errors.min() < 1.0
+        branches = held.groupby(held["direction"])
+        assert len(branches) == 2
+        # One band, applied to both sides ...
+        assert branches["band_half_width"].nunique().eq(1).all()
+        assert held["band_half_width"].nunique() == 1
+        # ... and both sides held to it, to the bound it promises.
+        bound = max(10.0, es.hedge_quantum / 2)
+        assert (branches["delta_error"].apply(lambda c: c.abs().max()) <= bound).all()
+        assert branches["in_band"].all().all()
 
     def test_the_band_widens_with_the_gamma_of_the_book(self):
         """The Whalley-Wilmott property, end to end: a book with more gamma

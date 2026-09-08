@@ -634,6 +634,136 @@ class TestLegFills:
         quantities = [f.quantity for f in strategy.fills if f.instrument == "option"]
         assert sum(quantities) == 0, "the call leg was left on"
 
+    class FillsPart(SimulatedExecution):
+        """Fills ``share`` of any opening order on one right, all of the other.
+
+        The ordinary case on a 0DTE chain, and the one the book has to
+        record honestly: what the exchange filled, not what was asked for.
+        """
+
+        def __init__(self, costs, source, right="P", share=0.5):
+            super().__init__(costs, source)
+            self.right, self.share = right, share
+
+        def execute_option(self, quote, quantity, moment):
+            if quote.right == self.right and quantity != 0:
+                short = int(quantity * self.share) or (1 if quantity > 0 else -1)
+                quantity = short
+            return super().execute_option(quote, quantity, moment)
+
+    def test_the_book_records_what_filled_not_what_was_asked_for(self):
+        """The straddle carries the *filled* size.
+
+        Recording the requested size instead leaves the strategy marking,
+        hedging and margining contracts the account does not hold -- and
+        the error is invisible, because every number downstream is derived
+        from the same wrong quantity.
+        """
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.FillsPart(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+
+        position = strategy.portfolio.straddle
+        assert position is not None
+        net = sum(f.quantity for f in strategy.fills if f.instrument == "option")
+        # Both legs end at the same size, and it is the smaller of the two.
+        assert abs(position.quantity) < cfg.sizing.max_straddles
+        assert net == 2 * position.quantity, (
+            "the legs are not matched, or the book took the requested size"
+        )
+        assert "entry_partial" in kinds(strategy)
+
+    def test_a_mismatched_pair_is_trimmed_to_the_smaller_leg(self):
+        """The excess on the longer leg is a naked option and is unwound."""
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        strategy.on_bar(bar(0), self.FillsPart(cfg.costs, cfg.source, share=0.5))
+        position = strategy.portfolio.straddle
+        assert position is not None
+        # Two matched legs, so the net option exposure across both rights
+        # is twice the position -- no naked excess left on either.
+        net = sum(f.quantity for f in strategy.fills if f.instrument == "option")
+        assert net == 2 * position.quantity
+
+
+class TestExitLegFills:
+    """A close that half-happens must be recorded, not thrown away.
+
+    Discarding a leg that filled leaves the exchange holding a trade the
+    book has no record of; the exit then fires again on the next bar and
+    sends that leg a second time, once a bar, for as long as the exit
+    reason holds.
+    """
+
+    class DropsThePutOnClose(SimulatedExecution):
+        """Opens normally, refuses the put leg of any closing order.
+
+        Keeps its own tally of what it actually filled -- the broker's
+        truth. That is the number the book has to agree with, and it is
+        the only one that can catch a fill the strategy dropped: a
+        discarded fill is by definition absent from the strategy's own
+        record, so summing that record can never reveal it.
+        """
+
+        def __init__(self, costs, source):
+            super().__init__(costs, source)
+            self.open_seen = False
+            self.put_close_orders = 0
+            self.traded = 0  # net option contracts actually filled
+
+        def execute_option(self, quote, quantity, moment):
+            closing = self.open_seen and quantity > 0  # short book: a buy closes
+            if quote.right == "P" and closing:
+                self.put_close_orders += 1
+                return None
+            if quote.right == "P" and quantity < 0:
+                self.open_seen = True
+            fill = super().execute_option(quote, quantity, moment)
+            if fill is not None:
+                self.traded += fill.quantity
+            return fill
+
+    def _drive_to_a_failed_close(self, bars):
+        cfg = make_cfg(**{"strategy.exit_on_regime_flip": False})
+        cfg.strategy.short_take_profit_pct = None
+        cfg.strategy.short_stop_loss_premium_multiple = 1.0  # exit on the next bar
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.DropsThePutOnClose(cfg.costs, cfg.source)
+        for market_bar in bars:
+            strategy.on_bar(market_bar, execution)
+        return strategy, execution
+
+    def test_a_leg_that_filled_is_never_silently_discarded(self):
+        strategy, execution = self._drive_to_a_failed_close(
+            [bar(0), bar(5, 5040.0), bar(10, 5045.0), bar(15, 5050.0)]
+        )
+        assert execution.put_close_orders >= 1, "the exit never ran"
+        assert "exit_failed" in kinds(strategy)
+        # The call leg was closed and put back, so what the broker holds
+        # still matches the straddle the strategy believes it holds.
+        position = strategy.portfolio.straddle
+        book = position.quantity if position is not None else 0
+        assert execution.traded == 2 * book
+        # And the strategy's own record agrees with the broker's.
+        recorded = sum(
+            f.quantity for f in strategy.fills if f.instrument == "option"
+        )
+        assert recorded == execution.traded
+
+    def test_the_book_and_the_account_stay_in_step_across_retries(self):
+        """Every failed close leaves net option exposure equal to the book."""
+        strategy, execution = self._drive_to_a_failed_close(
+            [bar(0)] + [bar(5 * i, 5040.0 + i) for i in range(1, 8)]
+        )
+        assert execution.put_close_orders >= 2, "the exit did not retry"
+        position = strategy.portfolio.straddle
+        book = position.quantity if position is not None else 0
+        assert execution.traded == 2 * book, (
+            "the account is holding option contracts the book does not know "
+            "about -- each retry sent the call leg again"
+        )
+
 
 class TestCosts:
     def test_slippage_lowers_a_sale_and_raises_a_purchase(self, es):

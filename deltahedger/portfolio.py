@@ -197,11 +197,39 @@ class Portfolio:
         """Close both legs and realise the straddle's P&L."""
         if self.straddle is None:
             return 0.0
-        pnl = self.straddle.unrealised(
-            call_price, put_price, self.source.option.multiplier
+        return self.reduce_straddle(
+            abs(self.straddle.quantity), call_price, put_price
+        )
+
+    def reduce_straddle(
+        self, contracts: int, call_price: float, put_price: float
+    ) -> float:
+        """Close ``contracts`` of the open straddle and realise their P&L.
+
+        ``contracts`` is unsigned and is clamped to what is open.  Closing
+        the whole of it clears the position; closing part of it leaves the
+        rest on the book at the same entry premium, which is what a partial
+        exit fill actually leaves behind.  Without this a broker that fills
+        half a closing order forces the caller to choose between recording a
+        close that did not happen and recording nothing at all -- and
+        recording nothing is how a leg gets sent twice.
+        """
+        position = self.straddle
+        if position is None or contracts <= 0:
+            return 0.0
+        contracts = min(int(contracts), abs(position.quantity))
+        direction = position.direction
+        pnl = (
+            direction * contracts
+            * ((call_price + put_price) - position.entry_premium)
+            * self.source.option.multiplier
         )
         self.option_realised += pnl
-        self.straddle = None
+        remaining = position.quantity - direction * contracts
+        if remaining == 0:
+            self.straddle = None
+        else:
+            position.quantity = remaining
         return pnl
 
     def apply_hedge_fill(self, filled_qty: int, fill_price: float) -> float:

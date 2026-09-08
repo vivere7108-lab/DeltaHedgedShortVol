@@ -748,29 +748,41 @@ them would misstate the risk in both directions:
 One property of SPAN worth pinning down because it is counter-intuitive:
 **a richer premium lowers the scan margin.** SPAN charges the worst loss
 *relative to the entry value*, and a straddle sold at 40 vol has already
-collected most of what a 49-point scan move is worth. It is asserted in
+collected most of what the scan move is worth. It is asserted in
 `tests/test_sizing.py`.
 
 ### What the day does to the two branches
 
-SPAN scans a *one-day* move (about 49 ES points, from a 2455 outright
-margin) whatever the tenor of what is held, so the short branch's margin per
-straddle is close to flat between the morning's 0DTE entry and the
-afternoon's 1DTE roll. The long branch's requirement is the debit, which
-roughly doubles between the two. Measured at spot 5000, 15 vol, on a $250k
-account at the default sizing:
+The scan range is the outright futures margin: CME sets one *to* the other,
+so `future_initial_margin / multiplier` recovers the scanned move — 352 ES
+points at a $17,600 outright margin. **That number has to be the full-size
+contract's performance bond.** An earlier revision carried MES's (~$2,455)
+in `RiskSource.future_initial_margin`, which scanned about 49 points, ~1% of
+spot; the short branch was then charged roughly a tenth of what CME actually
+holds against it, and `buying_power_pct` bought a book several times larger
+than the account could margin. Nothing downstream could catch it — the
+sizing, the entry log and the equity curve were all internally consistent —
+so `SpanScanMarginModel` now warns when the derived scan is implausibly
+narrow, and live runs should prefer `use_whatif_margin`.
+
+SPAN scans a *one-day* move whatever the tenor of what is held, so the short
+branch's margin per straddle is close to flat between the morning's 0DTE
+entry and the afternoon's 1DTE roll. The long branch's requirement is the
+debit, which roughly doubles between the two. Measured at spot 5000, 15 vol,
+on a $250k account at the default sizing:
 
 ```
 moment                premium   SPAN margin   debit    straddles short / long
-0DTE at 09:35 (6.4h)    16.17        $1,679    $809                83 / 173
-0DTE at 12:00 (4.0h)    12.79        $1,822    $639                76 / 218
-1DTE at the roll        31.48        $1,350  $1,574               103 /  88
-2DTE                    47.15        $1,325  $2,357               105 /  59
+0DTE at 09:35 (6.4h)    16.17       $16,791    $809                 8 / 173
+0DTE at 12:00 (4.0h)    12.79       $16,961    $639                 8 / 218
+1DTE at the roll        31.49       $16,026  $1,574                 8 /  88
+2DTE                    44.41       $15,379  $2,221                 9 /  63
 ```
 
 So the same allocation buys a short book of roughly the same size all day
-and a long book that is twice as big in the morning as at the roll, and the
-two branches carry different gamma — which is why "Band" in every backtest
+and a long book an order of magnitude larger, because a short straddle is
+charged a several-hundred-point scan move and a long one only its premium.
+The two branches carry very different gamma — which is why "Band" in every backtest
 summary reports the half-width and its width in points per branch (see "The
 delta band" above). A one-day scan is a conservative charge against a 0DTE
 position that will be flat by the bell, and exactly the horizon the rolled

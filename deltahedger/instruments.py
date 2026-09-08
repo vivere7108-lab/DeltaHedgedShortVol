@@ -72,10 +72,23 @@ class RiskSource:
     option_expiry_time: str = "16:00"
     #: Typical strike spacing of the daily series, in underlying points.
     strike_increment: float = 5.0
-    #: Approximate initial margin per short future contract, USD. Used by the
-    #: heuristic margin model; the live path can query IBKR instead.
-    future_initial_margin: float = 2455.0
-    hedge_initial_margin: float = 245.5
+    #: Approximate initial margin (CME performance bond) for ONE contract of
+    #: ``future`` -- the full-size contract, not the micro. This is the
+    #: single most load-bearing number in the sizing path: SPAN sets the
+    #: outright futures margin *to* the price scan range, so
+    #: ``SpanScanMarginModel`` recovers the scanned move from it as
+    #: ``future_initial_margin / future.multiplier``. Understate it and the
+    #: scan is too narrow, every short straddle looks cheap to carry, and
+    #: the buying-power budget buys a book several times larger than the
+    #: account can actually margin. Verify it against the current CME
+    #: performance-bond table before a walk; the live path can query IBKR
+    #: instead (``ibkr.use_whatif_margin``).
+    future_initial_margin: float = 17_600.0
+    #: The same figure for ONE contract of ``hedge``. For a micro against
+    #: its full-size parent it tracks the multiplier ratio -- MES is a tenth
+    #: of ES -- and it is what the hedge-margin reserve is meant to be
+    #: measured against.
+    hedge_initial_margin: float = 1_760.0
     aliases: tuple[str, ...] = field(default_factory=tuple)
 
     def delta_units_per_contract(self, spec: ContractSpec) -> float:
@@ -127,8 +140,12 @@ ES = RiskSource(
     ),
     reference_multiplier=50.0,
     strike_increment=5.0,
-    future_initial_margin=2455.0,
-    hedge_initial_margin=245.5,
+    # CME performance bond for one ES contract (not one MES: an earlier
+    # revision carried the micro's ~$2,455 here, which narrowed the SPAN
+    # price scan to ~1% of spot and undercharged every short straddle by
+    # roughly an order of magnitude). Check the current CME table.
+    future_initial_margin=17_600.0,
+    hedge_initial_margin=1_760.0,
     aliases=("ES", "SPX-ES", "EMINI"),
 )
 

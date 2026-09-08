@@ -10,8 +10,15 @@ Differences from the backtest that are worth being explicit about:
 
   * bars are *polls*, not completed bars, so the strategy sees the market as
     of each poll rather than a settled OHLC;
-  * fills come from the exchange and can be partial or missing entirely, so
-    the position is reconciled against IBKR on every cycle;
+  * fills come from the exchange and can be partial or missing entirely.
+    The strategy books what came back rather than what was asked for, and
+    squares a half-filled straddle before it records anything -- but the
+    book is reconciled against IBKR's positions only **once, at connect**
+    (``_reconcile``), not on every cycle.  Between two connects the book
+    is this process's own record of its fills, so an order that IBKR fills
+    after ``IbkrExecution._send`` has given up on it and cancelled it is
+    invisible until the next reconnect.  Per-cycle reconciliation is the
+    missing safety net here;
   * the ATM implied vol comes from the live chain rather than a historical
     series;
   * open interest is the exchange's, read through
