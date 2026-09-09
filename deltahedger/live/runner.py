@@ -54,6 +54,11 @@ from ..broker.ibkr import (
 )
 from ..config import Config
 from ..data.base import MarketBar
+from ..data.databento_source import (
+    DatabentoFlowAdjustedOpenInterestProvider,
+    DatabentoOpenInterestProvider,
+    DatabentoSession,
+)
 from ..sizing import build_margin_model
 from ..strategy import GexStraddleStrategy
 from .journal import JournallingStrategy, SessionJournal
@@ -77,6 +82,10 @@ class LiveRunner:
         self._driver = None
         self._cycles = 0
         self._stop = False
+        # Independent of the IBKR connection's reconnect cycle -- Databento
+        # manages its own session, so it is started once and outlives any
+        # number of IBKR gateway restarts.
+        self._databento: DatabentoSession | None = None
 
     def request_stop(self, *_: object) -> None:
         log.info("stop requested; finishing the current cycle")
@@ -103,47 +112,53 @@ class LiveRunner:
         backoff = self.cfg.live.reconnect_backoff_seconds
         attempts = 0
 
-        while not self._stop:
-            cycles_before = self._cycles
-            try:
-                self._run_connected(max_cycles)
-                backoff = self.cfg.live.reconnect_backoff_seconds
-                attempts = 0
-            except Exception as exc:  # noqa: BLE001 - the point is to survive it
-                if self._stop:
-                    break
-                if not self.cfg.live.reconnect:
-                    raise
-                # A session that actually polled before dropping was a
-                # healthy one, so the failure budget starts over. Without
-                # this, a walk that reconnects cleanly every night still
-                # exhausts max_reconnect_attempts after that many days and
-                # dies for having worked.
-                if self._cycles > cycles_before:
-                    attempts = 0
+        try:
+            while not self._stop:
+                cycles_before = self._cycles
+                try:
+                    self._run_connected(max_cycles)
                     backoff = self.cfg.live.reconnect_backoff_seconds
-                attempts += 1
-                limit = self.cfg.live.max_reconnect_attempts
-                if limit is not None and attempts >= limit:
-                    log.error(
-                        "giving up after %d consecutive connection failures: %s",
-                        attempts, exc,
+                    attempts = 0
+                except Exception as exc:  # noqa: BLE001 - the point is to survive it
+                    if self._stop:
+                        break
+                    if not self.cfg.live.reconnect:
+                        raise
+                    # A session that actually polled before dropping was a
+                    # healthy one, so the failure budget starts over. Without
+                    # this, a walk that reconnects cleanly every night still
+                    # exhausts max_reconnect_attempts after that many days and
+                    # dies for having worked.
+                    if self._cycles > cycles_before:
+                        attempts = 0
+                        backoff = self.cfg.live.reconnect_backoff_seconds
+                    attempts += 1
+                    limit = self.cfg.live.max_reconnect_attempts
+                    if limit is not None and attempts >= limit:
+                        log.error(
+                            "giving up after %d consecutive connection failures: %s",
+                            attempts, exc,
+                        )
+                        raise
+                    log.warning(
+                        "connection lost (%s); reconnecting in %.0fs (attempt %d%s)",
+                        exc, backoff, attempts,
+                        f" of {limit}" if limit else "",
                     )
-                    raise
-                log.warning(
-                    "connection lost (%s); reconnecting in %.0fs (attempt %d%s)",
-                    exc, backoff, attempts,
-                    f" of {limit}" if limit else "",
-                )
-                self._sleep(backoff)
-                backoff = min(
-                    backoff * 2.0, self.cfg.live.max_reconnect_backoff_seconds
-                )
-                continue
+                    self._sleep(backoff)
+                    backoff = min(
+                        backoff * 2.0, self.cfg.live.max_reconnect_backoff_seconds
+                    )
+                    continue
 
-            # A clean return means the cycle budget ran out or we were asked
-            # to stop -- neither is a reason to reconnect.
-            break
+                # A clean return means the cycle budget ran out or we were
+                # asked to stop -- neither is a reason to reconnect.
+                break
+        finally:
+            # Independent of the IBKR connection, so it needs its own
+            # shutdown regardless of which path out of the loop was taken.
+            if self._databento is not None:
+                self._databento.close()
 
         if self.strategy is None:
             raise RuntimeError("the runner never established a session")
@@ -175,7 +190,7 @@ class LiveRunner:
                 self.cfg,
                 self.source,
                 margin_model,
-                open_interest=IbkrOpenInterestProvider(conn, self.cfg),
+                open_interest=self._open_interest_provider(conn),
                 trade_feed=self.trade_feed,
             )
             self.strategy = strategy
@@ -222,6 +237,29 @@ class LiveRunner:
                 # on an account that still counts them against its limit.
                 self.trade_feed.close()
             log.info("live runner stopped after %d cycles", self._cycles)
+
+    def _open_interest_provider(self, conn):
+        """Build the OI provider named by ``cfg.data.open_interest``.
+
+        ``databento``/``databento_flow`` share one ``DatabentoSession``,
+        started once and cached on ``self`` so it survives IBKR reconnects
+        rather than tearing down and rebuilding a separate live connection
+        every time the gateway does its daily restart.
+        """
+        kind = self.cfg.data.open_interest.lower()
+        if kind == "ibkr":
+            return IbkrOpenInterestProvider(conn, self.cfg)
+        if kind in ("databento", "databento_flow"):
+            if self._databento is None:
+                self._databento = DatabentoSession(self.cfg, self.source)
+                self._databento.start()
+            if kind == "databento":
+                return DatabentoOpenInterestProvider(self._databento, conn)
+            return DatabentoFlowAdjustedOpenInterestProvider(self._databento, conn)
+        raise ValueError(
+            f"data.open_interest == {self.cfg.data.open_interest!r} is not a "
+            "live source; use 'ibkr', 'databento' or 'databento_flow'"
+        )
 
     def _holding(self) -> bool:
         """Whether there is anything to hedge right now.

@@ -326,6 +326,12 @@ class TestProviderFactory:
         with pytest.raises(ValueError, match="unknown open-interest source"):
             build_open_interest_provider(cfg, cfg.source)
 
+    @pytest.mark.parametrize("kind", ["databento", "databento_flow"])
+    def test_databento_is_refused_in_a_backtest(self, cfg, kind):
+        cfg.data.open_interest = kind
+        with pytest.raises(ValueError, match="live Databento session"):
+            build_open_interest_provider(cfg, cfg.source)
+
 
 def dealer_flow(sign: float, volume: float, center: float = F, span: int = 10):
     """Measured flow leaning the same way in both rights at every strike.

@@ -60,7 +60,12 @@ strategy:
 
 data:
   source: ibkr
-  open_interest: ibkr              # the exchange's OI, not a generated surface
+  open_interest: databento_flow    # MDP 3.0 direct, plus signed flow since
+                                   # the print as a same-day proxy -- see
+                                   # DatabentoFlowAdjustedOpenInterestProvider.
+                                   # Root is resolved per expiry through
+                                   # IBKR's own contract qualification, not
+                                   # hardcoded; needs DATABENTO_API_KEY set.
   bar_size: 5 mins
 
 flow:
