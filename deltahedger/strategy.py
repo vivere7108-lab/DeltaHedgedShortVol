@@ -216,6 +216,10 @@ class BarState:
 
 
 class GexStraddleStrategy:
+    #: How soon an open-interest read that came back with no strikes at all
+    #: is tried again, seconds -- see ``_read_gex``.
+    EMPTY_OI_RETRY_SECONDS = 30.0
+
     def __init__(
         self,
         cfg: Config,
@@ -488,12 +492,25 @@ class GexStraddleStrategy:
         if not expiries:
             return None
 
+        # An empty read is "no data yet", not a reading of the market, and
+        # it is retried on a shorter clock than a real one: a Databento
+        # session opened after the morning's print receives it a few
+        # seconds later by replay, and holding an empty read for the full
+        # refresh interval would keep GEX at zero -- and the strategy
+        # standing aside -- for a quarter of an hour after the data was in.
+        since_read = (
+            (moment - self._oi_read_at).total_seconds()
+            if self._oi_read_at is not None else None
+        )
+        empty = bool(self._oi) and not any(self._oi.values())
         stale = (
             not self._oi
             or self._oi_expiries != tuple(expiries)
-            or self._oi_read_at is None
-            or (moment - self._oi_read_at).total_seconds()
-            >= self.cfg.gex.refresh_seconds
+            or since_read is None
+            or since_read >= self.cfg.gex.refresh_seconds
+            or (empty and since_read >= min(
+                self.EMPTY_OI_RETRY_SECONDS, self.cfg.gex.refresh_seconds
+            ))
         )
         if stale:
             fresh: dict[date, list[StrikeOpenInterest]] = {}

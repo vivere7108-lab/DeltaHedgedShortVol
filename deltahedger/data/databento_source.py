@@ -92,8 +92,9 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from ..config import Config
+from ..config import Config, _parse_time
 from ..flow import BUY, CALL, PUT, SELL, UNKNOWN, OptionTrade
 from ..gex import StrikeOpenInterest
 from ..instruments import RiskSource
@@ -116,8 +117,20 @@ class DatabentoSession:
         self.source = source
         self._lock = threading.Lock()
         self._definitions: dict[int, _Definition] = {}
-        self._oi: dict[int, tuple[float, int]] = {}  # instrument_id -> (qty, ts_ref)
-        self._flow: dict[int, float] = {}  # instrument_id -> signed qty since ts_ref
+        #: instrument_id -> (open interest, ns timestamp the print covers
+        #: trades up to: the close of its trade date, not its ts_ref).
+        self._oi: dict[int, tuple[float, int]] = {}
+        #: instrument_id -> signed aggressor volume since that moment.
+        self._flow: dict[int, float] = {}
+        #: instrument_id -> [(ts_event, signed size)] for trades seen before
+        #: any print for that instrument. A replay delivers the day's tape
+        #: before its statistics, and a live session can see a trade before
+        #: the morning's print lands; either way the trade is not yet
+        #: attributable to "since the print" until the print says what it
+        #: covers. Folded into ``_flow`` when it arrives, bounded meanwhile.
+        self._pending: dict[int, list[tuple[int, float]]] = {}
+        self._close_time = _parse_time(cfg.databento.trade_date_close)
+        self._tz = ZoneInfo(source.timezone)
         self._root_by_expiry: dict[date, str] = {}
         self._subscribed_roots: set[str] = set()
         self._live = None
@@ -272,6 +285,7 @@ class DatabentoSession:
         with self._lock:
             roots = sorted(self._subscribed_roots)
             self._flow.clear()
+            self._pending.clear()
             self._trades.clear()
             self._dropped_trades = 0
         live = self._new_client()
@@ -324,11 +338,39 @@ class DatabentoSession:
             return
         if record.quantity == dbn.UNDEF_STAT_QUANTITY:
             return
+        covers = self._print_covers_until(record.ts_ref)
         with self._lock:
-            self._oi[record.instrument_id] = (float(record.quantity), record.ts_ref)
-            # A fresh print already embeds every trade up to ts_ref; flow
-            # accumulated against the old print no longer applies.
-            self._flow[record.instrument_id] = 0.0
+            held = self._oi.get(record.instrument_id)
+            self._oi[record.instrument_id] = (float(record.quantity), covers)
+            if held is not None and held[1] == covers:
+                # The same print again -- a correction, or a replay of one
+                # already held. The flow counted since it still stands.
+                return
+            # A new print embeds every trade up to the close of its trade
+            # date; flow accumulated against the old one no longer applies.
+            # Trades seen before any print for this instrument are folded in
+            # now that what the print covers is known.
+            self._flow[record.instrument_id] = sum(
+                signed
+                for ts_event, signed in self._pending.pop(record.instrument_id, ())
+                if ts_event > covers
+            )
+
+    def _print_covers_until(self, ts_ref: int) -> int:
+        """The last nanosecond of trading an open-interest print embeds.
+
+        ``ts_ref`` names the trade date the print describes, as midnight UTC
+        of that date.  The print is struck after that date's close, so it
+        contains the whole of that date's session -- and comparing trades
+        against midnight, as an earlier revision did, counted the entire
+        session before the print a second time.
+        """
+        trade_date = datetime.fromtimestamp(ts_ref / 1e9, tz=timezone.utc).date()
+        close = datetime.combine(trade_date, self._close_time, tzinfo=self._tz)
+        return int(close.timestamp() * 1e9)
+
+    #: Per-instrument cap on trades held before a print arrives for it.
+    MAX_PENDING_TRADES = 20_000
 
     #: Per-expiry cap on kept executions. A drain that stops happening --
     #: the poll loop wedged, the strategy standing aside all day -- must
@@ -357,10 +399,16 @@ class DatabentoSession:
         with self._lock:
             base = self._oi.get(record.instrument_id)
             if base is None:
-                return  # no OI print yet for this instrument
-            _, ts_ref = base
-            if record.ts_event <= ts_ref:
-                return  # this trade predates the current print
+                # No print yet for this instrument, so nothing says what
+                # "since the print" means. Hold it until one does.
+                kept = self._pending.setdefault(record.instrument_id, [])
+                kept.append((record.ts_event, signed))
+                if len(kept) > self.MAX_PENDING_TRADES:
+                    del kept[: len(kept) - self.MAX_PENDING_TRADES]
+                return
+            _, covers = base
+            if record.ts_event <= covers:
+                return  # inside the print's own trade date: already counted
             self._flow[record.instrument_id] = (
                 self._flow.get(record.instrument_id, 0.0) + signed
             )

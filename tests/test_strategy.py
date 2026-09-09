@@ -330,6 +330,35 @@ class TestEntry:
         drive(cfg, [bar(m) for m in range(0, 60, 5)], provider=provider)
         assert provider.calls > 1
 
+    def test_an_empty_read_is_retried_long_before_the_refresh_timer(self):
+        """No strikes at all is "no data yet", not a reading. A Databento
+        session opened after the morning's print receives it seconds later
+        by replay, and a runner that held the empty read for the full
+        interval would read zero GEX for a quarter of an hour after the
+        data was in."""
+
+        class LateProvider(FixedRegime):
+            def __init__(self):
+                super().__init__(POSITIVE)
+                self.empty_reads = 2
+
+            def open_interest(self, moment, future_price, expiry):
+                if self.empty_reads:
+                    self.empty_reads -= 1
+                    self.calls += 1
+                    return []
+                return super().open_interest(moment, future_price, expiry)
+
+        provider = LateProvider()
+        cfg = make_cfg(**{"gex.refresh_seconds": 3600.0})
+        strategy = drive(cfg, [bar(m) for m in range(0, 10)], provider=provider)
+
+        # Two empty reads a minute apart, then the real one; after that the
+        # hour-long timer holds and nothing is re-read for the remaining bars.
+        assert provider.calls == 3
+        assert strategy.bar_states[0].gex_total in (None, 0.0)
+        assert strategy.bar_states[-1].gex_total not in (None, 0.0)
+
 
 def _entry_quote(strategy):
     position = strategy.portfolio.straddle

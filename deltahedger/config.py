@@ -897,6 +897,18 @@ class DatabentoConfig:
     parent_symbol: str | None = None
     #: Reconnect automatically if the live session drops.
     reconnect: bool = True
+    #: When a CME trade date ends, exchange-local time. An open-interest
+    #: print carries ``ts_ref`` = the trade date it describes, at midnight
+    #: UTC, and embeds every trade of that date -- which for equity-index
+    #: products runs to 16:00 Chicago, 17:00 New York. The flow-adjusted
+    #: provider counts a trade towards the change *since* the print only
+    #: when it printed after this moment on the print's trade date; the
+    #: earlier revision compared against midnight and so counted the whole
+    #: of the previous session twice.
+    trade_date_close: str = "17:00"
+
+    def validate(self) -> None:
+        _parse_time(self.trade_date_close)
 
 
 @dataclass
@@ -987,7 +999,7 @@ class Config:
         get_risk_source(self.risk_source)  # raises on an unknown symbol
         for section in (
             self.hedge, self.sizing, self.gex, self.gates, self.strategy,
-            self.flow, self.ibkr, self.live,
+            self.flow, self.ibkr, self.databento, self.live,
         ):
             section.validate()
 
@@ -1023,6 +1035,7 @@ class Config:
                 "data": DataConfig,
                 "flow": FlowConfig,
                 "ibkr": IBKRConfig,
+                "databento": DatabentoConfig,
                 "live": LiveConfig,
             }.get(key)
             kwargs[key] = build(target, value) if target else value

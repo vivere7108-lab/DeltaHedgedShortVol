@@ -2,19 +2,25 @@
 a live connection.
 
 The record-parsing handlers (``_on_definition``/``_on_stat``/``_on_trade``)
-are thin, mechanical translations off real ``databento_dbn`` record types
-and are exercised against the live feed directly rather than against faked
-Rust objects here -- see the module docstring in ``databento_source.py`` for
-what is and is not verified that way. What *is* worth pinning down without a
-live connection is: the aggregation ``rows()`` does over whatever state the
-handlers would have produced (grouping by strike, the flow adjustment, the
-floor at zero, which strikes get reported at all); and ``ensure_subscribed``'s
-root resolution and caching, which is the part that replaced a hardcoded
-parent symbol after "ES.OPT" turned out to resolve to nothing live -- see
-the module docstring for what CME actually lists ES's weeklies under.
+are thin translations off real ``databento_dbn`` record types and are
+exercised against the live feed directly for their field access; what they
+*decide* -- which trades count towards the change since a print, what a
+print covers, what happens when the same print is delivered twice -- is
+pinned here against a stub of the ``databento_dbn`` enums (``TestSincePrint``).
+Also worth pinning without a live connection: the aggregation ``rows()``
+does over whatever state the handlers would have produced (grouping by
+strike, the flow adjustment, the floor at zero, which strikes get reported
+at all); and ``ensure_subscribed``'s root resolution and caching, which is
+the part that replaced a hardcoded parent symbol after "ES.OPT" turned out
+to resolve to nothing live -- see the module docstring for what CME
+actually lists ES's weeklies under.
 """
 
+import sys
+import types
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
+from types import SimpleNamespace
 
 import pytest
 
@@ -494,3 +500,140 @@ class TestTradeFeedWiring:
         # provider; keeping them costs memory a walk that is not measuring
         # the dealer sign has no use for.
         assert session._capture_trades is False
+
+
+# -- the handlers' decisions, against a stub of the databento_dbn enums -----
+
+def _ns(moment: datetime) -> int:
+    return int(moment.timestamp() * 1e9)
+
+
+@pytest.fixture
+def dbn_stub(monkeypatch):
+    """The three enums the handlers read, without the Rust extension."""
+    real = sys.modules.get("databento_dbn")
+    if real is not None:
+        return real
+
+    class StatType(Enum):
+        OPEN_INTEREST = 9
+        SETTLEMENT_PRICE = 3
+
+    class Side(Enum):
+        ASK = "A"
+        BID = "B"
+        NONE = "N"
+
+    class InstrumentClass(Enum):
+        CALL = "C"
+        PUT = "P"
+
+    stub = types.ModuleType("databento_dbn")
+    stub.StatType = StatType
+    stub.Side = Side
+    stub.InstrumentClass = InstrumentClass
+    stub.UNDEF_STAT_QUANTITY = 2**63 - 1
+    monkeypatch.setitem(sys.modules, "databento_dbn", stub)
+    return stub
+
+
+#: The print for the 8 September trade date: ts_ref is that date at midnight
+#: UTC, and it embeds every trade through the 17:00 New York close.
+TRADE_DATE = datetime(2026, 9, 8, tzinfo=timezone.utc)
+CLOSE = datetime(2026, 9, 8, 21, 0, tzinfo=timezone.utc)
+
+
+def _print(dbn, instrument_id=1, quantity=877.0, ts_ref=TRADE_DATE):
+    return SimpleNamespace(
+        stat_type=dbn.StatType.OPEN_INTEREST, quantity=quantity,
+        instrument_id=instrument_id, ts_ref=_ns(ts_ref),
+    )
+
+
+def _execution(dbn, at: datetime, size=10.0, side=None, instrument_id=1):
+    return SimpleNamespace(
+        instrument_id=instrument_id, size=size, ts_event=_ns(at),
+        side=side if side is not None else dbn.Side.BID,
+        pretty_price=1.0,
+    )
+
+
+class TestSincePrint:
+    def test_a_print_covers_its_trade_date_through_the_close_not_midnight(self, session):
+        assert session._print_covers_until(_ns(TRADE_DATE)) == _ns(CLOSE)
+
+    def test_a_trade_inside_the_prints_own_session_is_not_counted_again(self, session, dbn_stub):
+        session._on_stat(_print(dbn_stub))
+        session._on_trade(_execution(dbn_stub, CLOSE - timedelta(hours=2)))
+        session._on_trade(_execution(dbn_stub, CLOSE))
+
+        assert session._flow.get(1, 0.0) == 0.0
+
+    def test_a_trade_after_the_close_counts_towards_the_change_since_the_print(
+        self, session, dbn_stub
+    ):
+        session._on_stat(_print(dbn_stub))
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=14), size=7.0))
+        session._on_trade(
+            _execution(dbn_stub, CLOSE + timedelta(hours=15), size=2.0, side=dbn_stub.Side.ASK)
+        )
+
+        assert session._flow[1] == 5.0  # +7 buyer-initiated, -2 seller-initiated
+
+    def test_trades_seen_before_the_print_are_held_and_folded_in_when_it_lands(
+        self, session, dbn_stub
+    ):
+        """A replay delivers the day's tape before its statistics, and a
+        live session can see the morning's first prints before the
+        overnight print lands. Neither is attributable until the print
+        says what it covers."""
+        session._on_trade(_execution(dbn_stub, CLOSE - timedelta(hours=1), size=100.0))
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=13), size=30.0))
+        session._on_trade(
+            _execution(dbn_stub, CLOSE + timedelta(hours=16), size=5.0, side=dbn_stub.Side.ASK)
+        )
+        assert session._flow == {}
+        assert len(session._pending[1]) == 3
+
+        session._on_stat(_print(dbn_stub))
+
+        assert session._flow[1] == 25.0  # the 100 inside the trade date is in the print
+        assert 1 not in session._pending
+
+    def test_the_same_print_again_keeps_the_flow_counted_since_it(self, session, dbn_stub):
+        """Replay re-delivers the print already held, and CME re-publishes a
+        corrected figure under the same trade date. Neither is a new print."""
+        session._on_stat(_print(dbn_stub, quantity=877.0))
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=14), size=40.0))
+
+        session._on_stat(_print(dbn_stub, quantity=880.0))
+
+        assert session._oi[1] == (880.0, _ns(CLOSE))
+        assert session._flow[1] == 40.0
+
+    def test_a_new_trade_dates_print_resets_the_flow(self, session, dbn_stub):
+        session._on_stat(_print(dbn_stub))
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=14), size=40.0))
+
+        session._on_stat(_print(dbn_stub, ts_ref=TRADE_DATE + timedelta(days=1)))
+
+        assert session._flow[1] == 0.0
+
+    def test_an_unnamed_aggressor_is_neither_counted_nor_held(self, session, dbn_stub):
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=14), side=dbn_stub.Side.NONE))
+
+        assert session._pending == {}
+        assert session._flow == {}
+
+    def test_a_restart_drops_what_was_held_as_well(self, session, dbn_stub):
+        session._live = FakeLive()
+        session._new_client = FakeLive
+        session.ensure_subscribed(EXPIRY, FakeConnection(session.source, trading_class="E2B"))
+        session._on_trade(_execution(dbn_stub, CLOSE + timedelta(hours=14)))
+        assert session._pending
+
+        session.ensure_subscribed(
+            OTHER_EXPIRY, FakeConnection(session.source, trading_class="E2C")
+        )
+
+        assert session._pending == {}
