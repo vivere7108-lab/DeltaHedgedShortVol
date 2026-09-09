@@ -27,6 +27,14 @@ Differences from the backtest that are worth being explicit about:
     ``IbkrOpenInterestProvider``, rather than generated.  A forward test
     with a generated OI surface would be measuring the generator, so the
     live path refuses to fall back to one;
+  * the dealer sign at each strike is measured from the live option tape
+    (``IbkrTradeFeed``) rather than assumed, when ``flow.source`` is set to
+    ``ibkr``.  The subscription is opened here rather than inside the
+    strategy because it has to be re-centred as spot moves and torn down
+    when the connection drops, both of which are the runner's business and
+    neither of which a backtest has any equivalent of.  With no feed the
+    strategy falls back to ``gex.call_sign``/``gex.put_sign``, exactly as a
+    backtest without one does;
   * **the loop does not stop at the bell.**  The 0DTE position is rolled
     into tomorrow's series a quarter of an hour before settlement and that
     position is carried overnight, so the runner keeps polling while
@@ -51,6 +59,7 @@ from ..broker.ibkr import (
     IbkrConnection,
     IbkrExecution,
     IbkrOpenInterestProvider,
+    IbkrTradeFeed,
     WhatIfMarginModel,
 )
 from ..config import Config
@@ -59,6 +68,7 @@ from ..data.databento_source import (
     DatabentoFlowAdjustedOpenInterestProvider,
     DatabentoOpenInterestProvider,
     DatabentoSession,
+    DatabentoTradeFeed,
 )
 from ..instruments import RiskSource
 from ..portfolio import StraddlePosition
@@ -177,6 +187,9 @@ class LiveRunner:
         self.source = cfg.source
         self.connection = IbkrConnection(cfg, self.source)
         self.strategy: GexStraddleStrategy | None = None
+        #: The live option tape, when ``flow.source == "ibkr"``. Rebuilt on
+        #: every reconnection along with the strategy.
+        self.trade_feed: IbkrTradeFeed | None = None
         self.journal = (
             SessionJournal(cfg.live.journal_dir) if cfg.live.journal else None
         )
@@ -299,11 +312,17 @@ class LiveRunner:
                 if self.cfg.ibkr.use_whatif_margin
                 else fallback
             )
+            # Open interest first: the Databento trade feed rides the
+            # session those providers own, so it has to exist before the
+            # feed asks it to start capturing.
+            open_interest = self._open_interest_provider(conn)
+            self.trade_feed = self._trade_feed(conn)
             strategy = GexStraddleStrategy(
                 self.cfg,
                 self.source,
                 margin_model,
-                open_interest=self._open_interest_provider(conn),
+                open_interest=open_interest,
+                trade_feed=self.trade_feed,
             )
             self.strategy = strategy
             driver = strategy
@@ -350,7 +369,50 @@ class LiveRunner:
                     last_heartbeat = now
                 conn.ib.sleep(self.cfg.ibkr.poll_seconds)
 
+            if self.trade_feed is not None and hasattr(self.trade_feed, "close"):
+                # IBKR only: the subscriptions die with the socket either
+                # way, but cancelling them explicitly keeps a reconnect from
+                # landing on an account that still counts them against its
+                # limit. The Databento feed holds no subscriptions of its
+                # own -- the session it rides is closed with the runner.
+                self.trade_feed.close()
             log.info("live runner stopped after %d cycles", self._cycles)
+
+    def _trade_feed(self, conn):
+        """The option tape, from whichever live feed is configured.
+
+        Built per connection rather than carried across one: an IBKR
+        tick-by-tick subscription does not survive the gateway's nightly
+        restart, so a feed held over a reconnect would be a live-looking
+        object delivering nothing.  The Databento session *does* survive
+        (it has its own connection and reconnect cycle), but the feed
+        wrapping it is cheap and rebuilding it keeps the two paths the
+        same shape.
+
+        ``databento`` is the feed that reads MDP 3.0's aggressor flag, and
+        it rides the session the Databento open-interest providers own --
+        so it needs one of those running. Asking for it without one is
+        refused here rather than silently delivering an empty tape, which
+        would look exactly like a quiet market and leave every dealer sign
+        on the prior.
+        """
+        kind = self.cfg.flow.source.lower()
+        if kind == "ibkr":
+            return IbkrTradeFeed(conn, self.cfg)
+        if kind == "databento":
+            if self._databento is None:
+                raise ValueError(
+                    "flow.source == 'databento' reads the option tape off the "
+                    "Databento session the open-interest providers own, so "
+                    "data.open_interest must be 'databento' or "
+                    f"'databento_flow' too (it is "
+                    f"{self.cfg.data.open_interest!r}). Use flow.source "
+                    "'ibkr' to measure the dealer sign off IBKR's tape "
+                    "instead -- it carries no MDP 3.0 aggressor flag, so it "
+                    "classifies with the Lee-Ready rules."
+                )
+            return DatabentoTradeFeed(self._databento, conn)
+        return None
 
     def _open_interest_provider(self, conn):
         """Build the OI provider named by ``cfg.data.open_interest``.
@@ -431,6 +493,7 @@ class LiveRunner:
 
     def _poll(self, conn, chain_provider, execution, now: datetime) -> None:
         future_price = conn.future_price()
+        self._subscribe_tape(now, future_price)
         atm_iv = self._atm_iv(conn, chain_provider, future_price, now)
         bar = MarketBar(
             timestamp=now,
@@ -458,6 +521,38 @@ class LiveRunner:
             state.hedge_contracts, state.net_delta_units, self.cfg.hedge.target,
             state.band_half_width, f"${state.equity:,.0f}",
         )
+        if self.trade_feed is not None and state.gex_flow_coverage is not None:
+            log.info(
+                "  dealer signs %.0f%% measured, %s",
+                state.gex_flow_coverage * 100.0,
+                self.strategy.flow.describe(),
+            )
+
+    def _subscribe_tape(self, now: datetime, future_price: float) -> None:
+        """Keep the tick-by-tick trade subscription centred on the money.
+
+        Done here rather than in ``GexStraddleStrategy._read_flow`` because
+        it is a property of the connection, not of the decision: the
+        strategy pulls a window of trades from whatever feed it was handed
+        and has no business knowing that this one is a set of live
+        subscriptions that have to be re-centred as spot moves.
+        """
+        if self.trade_feed is None or self.strategy is None:
+            return
+        if not hasattr(self.trade_feed, "subscribe"):
+            # Databento: the roots are already subscribed by the
+            # open-interest provider sharing its session, and the feed
+            # resolves a newly listed expiry itself on the first pull.
+            return
+        try:
+            self.trade_feed.subscribe(
+                future_price, self.strategy._classification_expiries(now)
+            )
+        except Exception as exc:  # noqa: BLE001 - no tape is a fallback, not a stop
+            log.warning(
+                "could not subscribe to the option tape (%s); dealer signs fall "
+                "back to the configured prior", exc,
+            )
 
     def _atm_iv(self, conn, chain_provider, future_price: float, now: datetime) -> float:
         """Read ATM implied vol off the live chain, on the traded series.

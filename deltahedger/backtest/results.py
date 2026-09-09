@@ -339,6 +339,8 @@ def bars_to_frame(states: list[BarState], target: float) -> pd.DataFrame:
                 "distance_to_flip": s.distance_to_flip,
                 "gex_confidence": s.gex_confidence,
                 "gex_gate": s.gex_gate,
+                "gex_flow_coverage": s.gex_flow_coverage,
+                "gex_flow_volume": s.gex_flow_volume,
                 "confirmed_regime": s.confirmed_regime,
                 "days_to_expiry": s.days_to_expiry,
                 "in_session": s.in_session,

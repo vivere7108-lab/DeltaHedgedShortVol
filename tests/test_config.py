@@ -5,6 +5,7 @@ import yaml
 
 from deltahedger.config import (
     Config,
+    FlowConfig,
     GatesConfig,
     GexConfig,
     HedgeConfig,
@@ -249,3 +250,82 @@ class TestValidation:
         path.write_text(yaml.safe_dump({"gex": {"call_signn": 1.0}}))
         with pytest.raises(ValueError, match="call_signn"):
             Config.from_yaml(path)
+
+
+class TestFlowConfig:
+    """The tape section, and the two knobs that decide how far it is trusted."""
+
+    def test_the_default_attaches_no_feed(self):
+        # A deployment either has an aggressor-carrying feed or it does
+        # not, and the wrong response to not having one is to invent it. The
+        # default is the old behaviour, stated out loud.
+        cfg = Config()
+        assert cfg.flow.source == "none"
+        assert cfg.gex.use_flow_signs is True  # ready, with nothing to use
+
+    def test_every_rule_in_the_chain_is_on_by_default(self):
+        flow = FlowConfig()
+        assert (
+            flow.use_aggressor_flag
+            and flow.use_book_delta
+            and flow.use_quote_rule
+            and flow.use_tick_rule
+        )
+
+    def test_an_unknown_source_is_rejected(self):
+        with pytest.raises(ValueError, match="unknown flow.source"):
+            FlowConfig(source="nasdaq").validate()
+
+    def test_csv_without_a_path_is_rejected(self):
+        with pytest.raises(ValueError, match="flow.csv_path"):
+            FlowConfig(source="csv").validate()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"quote_tolerance_ticks": -1.0},
+            {"half_life_minutes": -1.0},
+            {"strike_width_pct": 0.0},
+            {"backfill_seconds": -1.0},
+            {"synthetic_flagged_share": 1.5},
+        ],
+    )
+    def test_nonsense_values_are_rejected(self, kwargs):
+        with pytest.raises(ValueError):
+            FlowConfig(**kwargs).validate()
+
+    def test_the_strike_window_follows_gex_unless_set(self):
+        gex = GexConfig(strike_width_pct=0.02)
+        assert FlowConfig().window_pct(gex) == 0.02
+        assert FlowConfig(strike_width_pct=0.05).window_pct(gex) == 0.05
+
+    def test_the_flow_confidence_constant_must_be_positive(self):
+        with pytest.raises(ValueError, match="flow_confidence_contracts"):
+            GexConfig(flow_confidence_contracts=0.0).validate()
+
+    def test_the_ensemble_must_include_the_traded_flow_trust(self):
+        # Same rule the skew axis has: the configuration actually traded has
+        # to be one of the members, or the gate is checking a model the
+        # system does not run.
+        with pytest.raises(ValueError, match="must include 1.0"):
+            GatesConfig(ensemble_flow_confidence_scales=[0.5, 2.0]).validate()
+
+    def test_the_ensemble_flow_scales_must_be_positive_and_present(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            GatesConfig(ensemble_flow_confidence_scales=[]).validate()
+        with pytest.raises(ValueError, match="must all be > 0"):
+            GatesConfig(ensemble_flow_confidence_scales=[0.0, 1.0]).validate()
+
+    def test_the_flow_section_round_trips_through_yaml(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            yaml.safe_dump({"flow": {"source": "synthetic", "half_life_minutes": 45.0}})
+        )
+        cfg = Config.from_yaml(path)
+        assert cfg.flow.source == "synthetic"
+        assert cfg.flow.half_life_minutes == 45.0
+        assert Config.from_dict(cfg.to_dict()).flow == cfg.flow
+
+    def test_a_typo_in_the_flow_section_is_refused(self):
+        with pytest.raises(ValueError, match="use_agressor_flag"):
+            Config.from_dict({"flow": {"use_agressor_flag": True}})

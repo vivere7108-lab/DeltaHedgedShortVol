@@ -252,10 +252,11 @@ def cmd_gex(args: argparse.Namespace) -> int:
     number is being made by the series you are about to trade or by the one
     expiring this afternoon.
     """
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from .chain import select_expiry
-    from .data import build_open_interest_provider
+    from .data import build_open_interest_provider, build_trade_feed
+    from .flow import build_flow_book
     from .gex import ExpiryBook, GexCalculator
     from .session import SessionClock
     from .volsurface import VolSurface
@@ -287,16 +288,33 @@ def cmd_gex(args: argparse.Namespace) -> int:
     calculator = GexCalculator(
         cfg.gex, source, VolSurface(cfg.vol), cfg.risk_free_rate, cfg.gates
     )
+    # The tape, if one is configured: a single pull covering the session so
+    # far, so a one-shot read measures the signs off the same window a
+    # running strategy would have accumulated by now rather than off nothing.
+    flow = build_flow_book(cfg, source)
+    feed = build_trade_feed(cfg, source, provider, tz=clock.tz)
+    session_start = now - timedelta(hours=args.flow_hours)
     price = args.price
-    books = [
-        ExpiryBook.of(
-            expiry,
-            clock.time_to_expiry(now, expiry),
-            provider.open_interest(now, price, expiry),
-            clock.days_to_expiry(now, expiry),
+    books = []
+    for expiry in expiries:
+        # Open interest first, then the tape: a generated surface freezes
+        # the strike anchor on its first read and the generated tape is
+        # centred on it, so the order is what keeps the two consistent.
+        rows = provider.open_interest(now, price, expiry)
+        try:
+            for trade in feed.trades(session_start, now, expiry):
+                flow.observe(trade)
+        except Exception as exc:  # noqa: BLE001 - a missing tape is not fatal here
+            print(f"  (no tape for {expiry}: {exc})")
+        books.append(
+            ExpiryBook.of(
+                expiry,
+                clock.time_to_expiry(now, expiry),
+                rows,
+                clock.days_to_expiry(now, expiry),
+                flow.rows(expiry, now),
+            )
         )
-        for expiry in expiries
-    ]
     profile = calculator.blended_profile(price, books, args.iv)
     ensemble = calculator.ensemble(price, books, args.iv)
 
@@ -327,6 +345,19 @@ def cmd_gex(args: argparse.Namespace) -> int:
     )
     peak = profile.peak_strike
     print(f"  peak gamma     {peak:,.0f}" if peak is not None else "  peak gamma     -")
+    print(
+        f"  dealer signs   {profile.flow_coverage:.0%} measured"
+        + (
+            f" ({profile.flow_volume:,.0f} classified contracts); "
+            f"{flow.describe()}"
+            if profile.flow_volume > 0.0
+            else f", {profile.flow_coverage:.0%}: "
+            f"prior {cfg.gex.call_sign:+g}/{cfg.gex.put_sign:+g} everywhere"
+            if not cfg.gex.use_flow_signs
+            else f", prior {cfg.gex.call_sign:+g}/{cfg.gex.put_sign:+g} everywhere "
+            f"(flow.source is {cfg.flow.source!r})"
+        )
+    )
     print(f"  regime         {profile.regime}"
           + (f" (blocked by the {profile.gate} gate)" if profile.gate else ""))
     print(f"  because        {profile.reason}")
@@ -462,6 +493,45 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"expiries x {len(rows)} strikes x 2 rights), requested in batches "
             f"of {IbkrOpenInterestProvider.MAX_CONCURRENT}",
         )
+
+        # The tape, which is what turns the sign convention from an
+        # assumption into a measurement. A walk configured for it and not
+        # receiving it reads exactly like a walk that never asked, so the
+        # check is whether trades actually arrive -- not whether the
+        # subscription was accepted.
+        if cfg.flow.source.lower() == "ibkr":
+            from datetime import timedelta
+
+            from .broker.ibkr import IbkrTradeFeed
+
+            feed = IbkrTradeFeed(connection, cfg)
+            try:
+                feed.subscribe(price, [expiry])
+                connection.ib.sleep(5.0)
+                seen = feed.trades(now - timedelta(minutes=5), now, expiry)
+                quoted = sum(
+                    1 for t in seen if t.bid is not None and t.ask is not None
+                )
+                check(
+                    "option tape (tick-by-tick AllLast)", bool(seen),
+                    f"{len(seen)} trades in 5s, {quoted} with a usable quote"
+                    if seen else
+                    "no trades arrived in 5 seconds. That is normal in a quiet "
+                    "series and a missing permission in a busy one -- re-run "
+                    "during the session before concluding. Without it every "
+                    "strike falls back to the gex.call_sign/put_sign prior.",
+                )
+            except Exception as exc:  # noqa: BLE001 - this is the report
+                check("option tape (tick-by-tick AllLast)", False, str(exc))
+            finally:
+                feed.close()
+        else:
+            check(
+                "option tape", True,
+                f"flow.source is {cfg.flow.source!r}: dealer signs come from "
+                f"the prior {cfg.gex.call_sign:+g}/{cfg.gex.put_sign:+g}, not "
+                "from classified trades",
+            )
 
         if rows and total > 0:
             atm_iv = straddle.iv if straddle else cfg.data.default_atm_iv
@@ -758,6 +828,11 @@ def build_parser() -> argparse.ArgumentParser:
     gex.add_argument("--iv", type=float, default=0.15, help="ATM implied vol")
     gex.add_argument("--at", help="timestamp to profile at, ISO-8601 (default: now)")
     gex.add_argument("--open-interest", choices=["synthetic", "csv"])
+    gex.add_argument(
+        "--flow-hours", type=float, default=6.5,
+        help="hours of option tape to classify the dealer signs from "
+             "(default: one session)",
+    )
     gex.set_defaults(func=cmd_gex, source=None, bar_size=None)
 
     doctor = sub.add_parser(

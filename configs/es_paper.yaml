@@ -37,7 +37,21 @@ gex:
 
 sizing:
   buying_power_pct: 0.80           # the margin limit less a 20% buffer
-  max_straddles: 500
+  max_straddles: 50                # well above what a $250k account buys
+                                   # (about ten, hedge margin included), and
+                                   # below broker.base.MAX_ORDER_CONTRACTS so
+                                   # the per-order backstop can actually bind
+
+gates:
+  # The entry window (strategy.entry_time / entry_cutoff_time) is lifted
+  # for the forward walk. It existed to keep entries near the open, when
+  # a once-a-day open-interest print was freshest; with open interest and
+  # the option tape read live off MDP 3.0 the read is as good at 14:45 as
+  # at 09:45, and every session the window stood the book aside was a
+  # session of forward-test data lost. The other three gates -- confidence,
+  # ensemble, persistence -- stay on, and the pre-settlement buffer still
+  # decides which series may be entered.
+  entry_window: false
 
 strategy:
   min_days_to_expiry: 0            # today's series ...
@@ -45,8 +59,8 @@ strategy:
   prefer_min_days_to_expiry: 0
   prefer_max_days_to_expiry: 0
   close_at_days_to_expiry: null
-  entry_time: '09:35'
-  entry_cutoff_time: '14:30'
+  entry_time: '09:35'              # reported against, not enforced:
+  entry_cutoff_time: '14:30'       # gates.entry_window is off above
   close_before_expiry_minutes: 15  # out before the expiry gamma spike ...
   roll_at_expiry: true             # ... and into tomorrow's series
   hold_over_weekends: false        # flat from Friday 15:45 to Monday 09:35
@@ -66,6 +80,24 @@ data:
                                    # IBKR's own contract qualification, not
                                    # hardcoded; needs DATABENTO_API_KEY set.
   bar_size: 5 mins
+
+flow:
+  # The live option tape. Every execution near the money is classified by
+  # aggressor side, so the dealer sign at each strike is measured rather
+  # than assumed.
+  #
+  # `databento` reads MDP 3.0's own aggressor flag (tag 5797), so rule 1 of
+  # the classification chain resolves the tape outright and the Lee-Ready
+  # rules never have to run. It rides the same session data.open_interest
+  # already opens above, so it costs no extra connection.
+  #
+  # `ibkr` is the fallback where there is no Databento subscription: IBKR
+  # relays no aggressor flag, so Lee-Ready does the work against the
+  # prevailing quote. Either way, run `deltahedger doctor` during the
+  # session to confirm trades are actually arriving -- without them every
+  # strike keeps the prior and the runner behaves as it did before,
+  # silently, which is exactly the failure doctor exists to catch.
+  source: databento
 
 ibkr:
   host: 127.0.0.1

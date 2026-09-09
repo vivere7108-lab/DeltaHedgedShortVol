@@ -62,11 +62,23 @@ hedge:
 
 gex:
   enabled: true
-  # Dealers long the calls, short the puts. This is the standard assumption
-  # and it is the load-bearing one -- open interest does not say who is on
-  # which side. Flip these to test how much of the result depends on it.
+  # Dealers long the calls, short the puts. This is the standard assumption,
+  # and open interest does not say who is on which side -- so it is now the
+  # *prior*, not the answer. With a trade feed attached (`flow:` below) the
+  # sign at a strike is measured from the aggressor side of the executions
+  # that printed there, and these two numbers apply only where the tape has
+  # said nothing. Flip them to test how much of the result still depends on
+  # the assumption.
   call_sign: 1.0
   put_sign: -1.0
+  # Use the measured sign where there is flow to measure it from. Off
+  # restores the static convention exactly, which is the control a measured
+  # run should be compared against.
+  use_flow_signs: true
+  # Classified contracts at which a strike's measured sign carries half the
+  # weight and the prior the other half. How much tape it takes to overrule
+  # the assumption.
+  flow_confidence_contracts: 250.0
   strike_width_pct: 0.02      # strikes within 2% carry essentially all the
                               # front expiries' gamma
   flip_search_pct: 0.03       # hypothetical-spot grid for the flip search
@@ -88,9 +100,14 @@ gates:
   confidence: true            # |total|/gross GEX below this reads as noise
   min_confidence_ratio: 0.15
   flip_distance: true         # spot within flip_proximity_pct of the flip
-  ensemble: true               # unanimous across a skew/sign-convention grid
+  ensemble: true               # unanimous across a skew/sign/flow-trust grid
   ensemble_skew_slope_deltas: [-0.5, 0.0, 0.5]
   ensemble_sign_conventions: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
+  # Multipliers on gex.flow_confidence_contracts: how readily a measured
+  # sign overrules the prior. Where a strike is heavily traded every scale
+  # agrees and this axis is free; where the read rests on a few prints they
+  # diverge and the gate blocks. Collapses to [1.0] when there is no tape.
+  ensemble_flow_confidence_scales: [0.5, 1.0, 2.0]
   persistence: true            # a regime must hold this many bars in a row
   persistence_bars: 3
   entry_window: true           # entries only inside strategy.entry_time/
@@ -185,6 +202,40 @@ data:
   # to exercise the machinery.
   open_interest: synthetic
   oi_csv_path: null
+
+# The option tape, which is what turns the call/put sign convention from an
+# assumption into a measurement. Each execution is classified as buyer- or
+# seller-initiated -- from CME MDP 3.0's own aggressor flag (tag 5797) where
+# the feed carries it, from the market-by-order book change where it carries
+# that, and from the Lee-Ready quote and tick rules otherwise -- and the
+# dealer is the resting side of whatever it decides.
+#
+# `none` is the honest default: a deployment either has an
+# aggressor-carrying feed or it does not, and without one every strike falls
+# back to gex.call_sign/put_sign and the system behaves as it always did.
+#
+# `databento` is the only feed that actually carries the aggressor flag --
+# it reads MDP 3.0 directly, so rule 1 resolves the tape and Lee-Ready never
+# runs. It rides the session the Databento open-interest providers own, so
+# it needs data.open_interest on `databento` or `databento_flow` too.
+# `ibkr` relays no flag and falls back to Lee-Ready. Both are live-only; a
+# backtest needs `csv` to replay a real tape, or `synthetic` to exercise the
+# classification path.
+flow:
+  source: none               # none | csv | synthetic | ibkr | databento
+  csv_path: null             # timestamp,expiry,strike,right,price,size
+                             # [,bid,ask,aggressor,bid_size_delta,ask_size_delta]
+  # The classification chain, in precedence order. Each rule runs only when
+  # every rule above it declined.
+  use_aggressor_flag: true   # (1) MDP 3.0 tag 5797 -- authoritative
+  use_book_delta: true       # (2) MBO: the side that lost resting size was passive
+  use_quote_rule: true       # (3) Lee-Ready, against the prevailing bid/ask
+  use_tick_rule: true        # (4) Lee-Ready tick test, for midpoint trades
+  quote_tolerance_ticks: 1.0 # how far inside the touch still counts as "at" it
+  half_life_minutes: 0.0     # 0 = no decay; a 0DTE book is written in the
+                             # window being watched, so there is nothing stale
+  strike_width_pct: null     # null follows gex.strike_width_pct
+  backfill_seconds: 3600.0
 
 ibkr:
   host: 127.0.0.1

@@ -3,8 +3,9 @@
 This is the forward-testing path.  It implements the same
 ``ExecutionHandler`` interface the backtest uses, so ``GexStraddleStrategy``
 runs unchanged -- what differs is that fills come back from the exchange
-rather than from a slippage model, and that open interest is the exchange's
-rather than a generated surface.
+rather than from a slippage model, that open interest is the exchange's
+rather than a generated surface, and that the option tape the dealer sign is
+measured from is the real one.
 
 Safety
 ------
@@ -31,6 +32,7 @@ from typing import Any
 
 from ..chain import OptionQuote, StraddleQuote, atm_strike
 from ..config import Config
+from ..flow import CALL, PUT, UNKNOWN, OptionTrade, aggressor_from_mdp
 from ..gex import StrikeOpenInterest
 from ..instruments import ContractSpec, RiskSource
 from ..pricing import black76, implied_vol
@@ -447,6 +449,214 @@ def _open_interest(ticker: Any, right: str) -> float:
         if value is not None and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
             return float(value)
     return 0.0
+
+
+class IbkrTradeFeed:
+    """The live option tape, for measuring the dealer sign at each strike.
+
+    Subscribes to tick-by-tick "AllLast" on the strikes near the money in
+    each expiry the GEX blend covers, buffers what arrives, and hands the
+    strategy the executions in each poll's window.  ``deltahedger.flow``
+    does the classifying; this class only has to deliver trades with as much
+    context attached as the connection can supply.
+
+    What IBKR gives, and what it does not
+    ------------------------------------
+    IBKR relays CME's data but does **not** pass through MDP 3.0's
+    ``AggressorSide`` (tag 5797) or the market-by-order book deltas.  What a
+    tick-by-tick "AllLast" record carries is the print -- price, size, time
+    -- and what ``reqMktData`` carries alongside it is the top of book.  So
+    on this path the first two rules in the classification chain never fire
+    and the Lee-Ready quote and tick rules do all the work, which is exactly
+    what those rules are for and is why they are in the chain rather than
+    being a historical footnote.
+
+    The quote attached to each trade is the **prevailing** one -- the last
+    bid/ask seen strictly before the print -- and not the quote at the time
+    the buffer is drained.  Attaching the current quote would classify a
+    trade against a book that moved *because of* it, which biases every
+    aggressive print towards looking passive.  Lee and Ready's original
+    correction was a five-second lag for exactly this reason; a per-trade
+    prevailing quote off a tick stream is the same idea done properly, so no
+    lag is applied on top of it.
+
+    A feed that is not entitled to the data does not fail loudly here.  It
+    delivers nothing, every strike keeps its configured sign prior, and the
+    system behaves as it did before the tape was wired in -- so the check
+    that matters is ``deltahedger doctor``, which says whether trades are
+    actually arriving before a walk depends on them.
+
+    Line budget
+    -----------
+    Tick-by-tick subscriptions are a scarcer resource than market-data lines
+    on an ordinary IBKR account, so this deliberately watches *fewer*
+    strikes than the GEX profile spans: ``MAX_CONTRACTS`` caps the total,
+    allocated from the money outwards, on the basis that a strike far enough
+    from spot to be dropped is one whose gamma contribution is small enough
+    that its sign hardly moves the total. Subscriptions are held open
+    between polls rather than cycled -- a tape sampled in bursts is a tape
+    with most of itself missing -- and re-centred only when spot has moved
+    far enough to change which strikes are near the money.
+    """
+
+    #: Tick-by-tick subscriptions held open at once, across every expiry.
+    MAX_CONTRACTS = 24
+    #: Re-centre the subscribed strikes once spot has moved this fraction.
+    RECENTRE_PCT = 0.004
+
+    def __init__(self, connection: "IbkrConnection", cfg: Config):
+        self.conn = connection
+        self.cfg = cfg
+        self._subscriptions: dict[tuple[date, float, str], Any] = {}
+        self._quotes: dict[tuple[date, float, str], Any] = {}
+        self._buffer: dict[date, list[OptionTrade]] = {}
+        self._seen: dict[tuple[date, float, str], int] = {}
+        self._centre: dict[date, float] = {}
+
+    # -- subscription ----------------------------------------------------
+
+    def subscribe(self, future_price: float, expiries: list[date]) -> None:
+        """Hold tick-by-tick trades open on the near-the-money strikes.
+
+        Called by the runner each poll.  It is a no-op once the strikes are
+        already subscribed and spot has not moved far enough to change
+        which ones they should be, so the cost is one dictionary comparison
+        per poll rather than a resubscribe.
+        """
+        from ..chain import strike_grid
+
+        if not expiries:
+            return
+        if all(
+            expiry in self._centre
+            and abs(future_price - self._centre[expiry])
+            <= future_price * self.RECENTRE_PCT
+            for expiry in expiries
+        ):
+            return
+
+        width = self.cfg.flow.window_pct(self.cfg.gex)
+        per_expiry = max(self.MAX_CONTRACTS // (2 * len(expiries)), 1)
+        wanted: set[tuple[date, float, str]] = set()
+        for expiry in expiries:
+            strikes = strike_grid(future_price, self.conn.source, width)
+            # From the money outwards: the strikes whose sign moves the
+            # total most are the ones carrying the most gamma.
+            nearest = sorted(strikes, key=lambda k: abs(k - future_price))[:per_expiry]
+            for strike in nearest:
+                for right in (CALL, PUT):
+                    wanted.add((expiry, round(float(strike), 4), right))
+            self._centre[expiry] = future_price
+
+        for key in list(self._subscriptions):
+            if key not in wanted:
+                self._cancel(key)
+        for key in sorted(wanted - set(self._subscriptions)):
+            self._open(key)
+
+    def _open(self, key: tuple[date, float, str]) -> None:
+        expiry, strike, right = key
+        try:
+            contract = self.conn.option_contract(expiry, strike, right)
+        except ExecutionError:
+            return  # not listed; a missing strike is not an error
+        try:
+            self._subscriptions[key] = self.conn.ib.reqTickByTickData(
+                contract, "AllLast", 0, False
+            )
+            self._quotes[key] = self.conn.ib.reqMktData(contract, "", False, False)
+        except Exception as exc:  # noqa: BLE001 - a refused line is not fatal
+            log.debug("no tick-by-tick on %s %s%s: %s", expiry, strike, right, exc)
+            self._cancel(key)
+
+    def _cancel(self, key: tuple[date, float, str]) -> None:
+        ticker = self._subscriptions.pop(key, None)
+        quote = self._quotes.pop(key, None)
+        self._seen.pop(key, None)
+        for handle, cancel in (
+            (ticker, "cancelTickByTickData"), (quote, "cancelMktData")
+        ):
+            if handle is None:
+                continue
+            try:
+                getattr(self.conn.ib, cancel)(handle.contract)
+            except Exception:  # noqa: BLE001 - cancelling a dead line is fine
+                pass
+
+    def close(self) -> None:
+        for key in list(self._subscriptions):
+            self._cancel(key)
+        self._centre.clear()
+
+    # -- draining --------------------------------------------------------
+
+    def trades(
+        self, start: datetime, end: datetime, expiry: date
+    ) -> list[OptionTrade]:
+        """Executions in ``(start, end]``, newest prints folded in first.
+
+        The tickers accumulate ``tickByTicks`` between polls, so the drain
+        reads each one past the index it last consumed rather than clearing
+        it -- ib_async's own buffer is shared with anything else reading the
+        ticker, and clearing it would take the trades out from under them.
+        """
+        self._collect()
+        rows = self._buffer.get(expiry)
+        if not rows:
+            return []
+        kept = [t for t in rows if start < t.timestamp <= end]
+        # Anything older than the window has been consumed by a previous
+        # drain and will never be asked for again.
+        self._buffer[expiry] = [t for t in rows if t.timestamp > end]
+        return kept
+
+    def _collect(self) -> None:
+        """Move whatever the tickers have accumulated into the buffer."""
+        for key, ticker in list(self._subscriptions.items()):
+            expiry, strike, right = key
+            ticks = list(getattr(ticker, "tickByTicks", []) or [])
+            consumed = self._seen.get(key, 0)
+            if len(ticks) <= consumed:
+                # ib_async trims its own buffer; a shorter list means it was
+                # cleared under us, so start again from the beginning rather
+                # than silently skipping everything that arrived since.
+                if len(ticks) < consumed:
+                    consumed = 0
+                else:
+                    continue
+            quote = self._quotes.get(key)
+            for tick in ticks[consumed:]:
+                trade = self._to_trade(expiry, strike, right, tick, quote)
+                if trade is not None:
+                    self._buffer.setdefault(expiry, []).append(trade)
+            self._seen[key] = len(ticks)
+        for expiry in self._buffer:
+            self._buffer[expiry].sort(key=lambda t: t.timestamp)
+
+    def _to_trade(
+        self, expiry: date, strike: float, right: str, tick: Any, quote: Any
+    ) -> OptionTrade | None:
+        price = getattr(tick, "price", None)
+        size = getattr(tick, "size", None)
+        stamp = getattr(tick, "time", None)
+        if not _valid(price) or size is None or float(size) <= 0 or stamp is None:
+            return None
+        bid = getattr(quote, "bid", None) if quote is not None else None
+        ask = getattr(quote, "ask", None) if quote is not None else None
+        return OptionTrade(
+            timestamp=stamp,
+            expiry=expiry,
+            strike=float(strike),
+            right=right,
+            price=float(price),
+            size=float(size),
+            bid=float(bid) if _valid(bid) else None,
+            ask=float(ask) if _valid(ask) else None,
+            # IBKR relays no MDP 3.0 aggressor flag, so the Lee-Ready rules
+            # do the work. ``pastLimit``-style attributes are not an
+            # aggressor indicator and are deliberately not read as one.
+            aggressor=aggressor_from_mdp(getattr(tick, "aggressor", None)) or UNKNOWN,
+        )
 
 
 @dataclass

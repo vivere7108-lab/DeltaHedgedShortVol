@@ -8,6 +8,12 @@ from .openinterest import (
     build_open_interest_provider,
 )
 from .synthetic import SyntheticSource, bar_seconds
+from .tradeflow import (
+    CsvTradeFeed,
+    NullTradeFeed,
+    SyntheticTradeFeed,
+    build_trade_feed,
+)
 
 __all__ = [
     "DataSource",
@@ -18,6 +24,10 @@ __all__ = [
     "SyntheticOpenInterest",
     "SyntheticSource",
     "build_open_interest_provider",
+    "CsvTradeFeed",
+    "NullTradeFeed",
+    "SyntheticTradeFeed",
+    "build_trade_feed",
     "bar_seconds",
     "build_source",
 ]

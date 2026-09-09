@@ -654,3 +654,44 @@ class TestFailureBudget:
         with pytest.raises(Exception):
             runner.run(max_cycles=100)
         assert connects["n"] <= 5
+
+
+class TestTradeFeedSelection:
+    """Which live tape the runner builds, and when it refuses to."""
+
+    def runner(self, tmp_path, flow_source: str, oi_source: str = "ibkr"):
+        cfg = Config()
+        cfg.live.journal = False
+        cfg.live.journal_dir = str(tmp_path)
+        cfg.flow.source = flow_source
+        cfg.data.open_interest = oi_source
+        return LiveRunner(cfg)
+
+    def test_no_feed_is_configured_by_default(self, tmp_path):
+        assert self.runner(tmp_path, "none")._trade_feed(None) is None
+
+    def test_databento_without_its_session_is_refused_not_left_empty(self, tmp_path):
+        # The Databento tape rides the session the open-interest providers
+        # own. Without one it would deliver nothing -- which looks exactly
+        # like a quiet market and leaves every dealer sign on the prior, so
+        # it is refused loudly instead.
+        runner = self.runner(tmp_path, "databento", oi_source="ibkr")
+        with pytest.raises(ValueError, match="data.open_interest must be"):
+            runner._trade_feed(None)
+
+    def test_the_error_names_the_ibkr_fallback_and_what_it_costs(self, tmp_path):
+        runner = self.runner(tmp_path, "databento", oi_source="ibkr")
+        with pytest.raises(ValueError, match="Lee-Ready"):
+            runner._trade_feed(None)
+
+    def test_databento_rides_the_session_when_one_is_running(self, tmp_path):
+        from deltahedger.data.databento_source import (
+            DatabentoSession,
+            DatabentoTradeFeed,
+        )
+
+        runner = self.runner(tmp_path, "databento", oi_source="databento_flow")
+        runner._databento = DatabentoSession(runner.cfg, runner.source)
+        feed = runner._trade_feed(None)
+        assert isinstance(feed, DatabentoTradeFeed)
+        assert runner._databento._capture_trades is True

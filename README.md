@@ -85,9 +85,16 @@ gex(K) = multiplier * S^2 * 0.01 * gamma(K) * (call_sign*OI_call + put_sign*OI_p
 ```
 
 `S^2 * 0.01` converts per-point gamma into **dollars of delta a dealer must
-trade for a 1% move**, which is the unit GEX is quoted in. The default
-signs — `+1` for calls, `−1` for puts — encode the standard assumption that
-the public buys puts and sells calls, so the dealer holds the other side.
+trade for a 1% move**, which is the unit GEX is quoted in. `call_sign` and
+`put_sign` — `+1` and `−1` — encode the standard assumption that the public
+buys puts and sells calls, so the dealer holds the other side.
+
+That assumption is the load-bearing one in the whole system, and it is not
+in the open-interest print. It *is* in the tape, so with a trade feed
+attached it is measured rather than assumed — see
+[Measuring the dealer sign](#measuring-the-dealer-sign-instead-of-assuming-it)
+below. `call_sign`/`put_sign` are then the **prior**: what a strike falls
+back to when nothing has traded there.
 
 The **gamma flip point** is where total GEX crosses zero, found by repricing
 the chain's gamma across a grid of hypothetical spot levels with open
@@ -104,6 +111,7 @@ would trade 2026-09-08 (0DTE, 5.5h), IV 0.140, spot 5,000.00
   confidence     28.6% (gate at 15%)
   gamma flip     4,972.50 (+27.50 from spot)
   peak gamma     5,010
+  dealer signs   0% measured, prior +1/-1 everywhere (flow.source is 'none')
   regime         positive
   because        GEX +924.2M/1% at 5,000.00, flip 4,972.5 (29% of gross): dealers are long gamma ...
   ensemble       all 9 ensemble members read positive
@@ -136,16 +144,141 @@ when nothing is eligible to trade, and the read is still made — off the
 listed series inside the tenor's range, with nothing traded against it — so
 the journal has it and the persistence streak is live at Monday's open.
 
+### Measuring the dealer sign instead of assuming it
+
+Open interest says how many contracts exist at a strike. It says nothing
+about who is long them — and every published GEX print papers over that with
+one number applied everywhere: dealers are long the calls and short the
+puts, all day, at every strike. Get it backwards and the system is not
+merely wrong, it is confidently reversed: buying straddles precisely when it
+should be selling them.
+
+The tape does say. Every execution has an aggressor and a resting side, and
+the dealer is the resting side by construction:
+
+- **a customer lifts the offer** → they bought the option *from* a dealer,
+  who is now **short** it and short its gamma;
+- **a customer hits the bid** → they sold it *to* a dealer, who is now
+  **long** it.
+
+`deltahedger/flow.py` classifies each execution and accumulates the signed
+dealer position per strike and per right. Classification is a **precedence
+chain**, not a vote — each rule runs only when every rule above it declined,
+and every trade records which rule resolved it:
+
+| # | Rule | What it knows | When it fires |
+|---|------|---------------|---------------|
+| 1 | **MDP 3.0 aggressor flag** | The aggressor side, stated outright by CME in the trade summary message (tag 5797: 1 buy, 2 sell, 0 none) | Whenever the feed carries it. This is not an inference and there is nothing below it worth trying. |
+| 2 | **MBO book-state change** | Which side's *resting* liquidity was removed. MDP 3.0 is market-by-order, so the incremental refresh accompanying an execution shows individual orders leaving the queue — liquidity consumed on the offer means an inbound order swept the ask, so a customer bought and a dealer is short that strike's gamma | When both top-of-book size deltas are known. This is what recovers a trade printed at the midpoint of a stale quote. |
+| 3 | **Lee-Ready quote rule** | The execution price against the prevailing bid/ask: at or near the ask is buyer-initiated, at or near the bid is seller-initiated, and anything off the midpoint takes the side it is nearer | When there is a usable quote. `flow.quote_tolerance_ticks` is the "or near" — an option trading a tick inside a wide quote is still an aggressor paying up. |
+| 4 | **Lee-Ready tick test** | This print against the last one in the *same option*: uptick buyer-initiated, downtick seller-initiated, zero-tick inherits the last non-zero direction | For midpoint trades and missing quotes. |
+
+A trade no rule resolves is `unknown`: counted, never signed. Guessing on it
+would put fabricated positioning into the number that decides which side the
+strategy takes, which is the failure being removed rather than relocated.
+
+**From classified trades to a sign.** Per strike and right, dealer position
+is `seller_initiated − buyer_initiated` contracts, and dividing by the
+classified volume gives a number in `[−1, +1]` on exactly the scale
+`call_sign`/`put_sign` live on. A measured sign is only as good as the tape
+behind it, so `gex` blends rather than substitutes:
+
+```
+w    = n / (n + gex.flow_confidence_contracts)      # n = classified contracts
+s(K) = w * measured(K) + (1 - w) * prior
+```
+
+Three properties make that the right shape rather than a threshold: a strike
+that has not traded returns the prior **exactly**, so attaching a feed can
+never change a read it has no evidence about; a heavily traded strike
+returns the measurement, so the assumption stops mattering where it stopped
+being needed; and nothing between is a cliff, so the profile does not jump
+when one more contract prints. `deltahedger gex` prints where on that scale
+a read sits, and the strike table shows the signs actually used:
+
+```
+  dealer signs   62% measured (18,400 classified contracts); 18,400 of 19,100 contracts classified (96%): aggressor_flag 71%, quote 22%, tick 3%
+
+   strike   call OI    put OI   net GEX ($M/1%)  call sgn   put sgn      flow
+    5,000       877       471            -41.06     -0.62     -0.94      3,180
+    5,005       918       437             12.58      0.31     -0.88      2,940
+    5,010       951       401            139.24      1.00     -1.00          0   <- untraded: the prior
+```
+
+**Where the tape comes from** (`flow.source`):
+
+| Source | What it is |
+|--------|-----------|
+| `none` *(default)* | No feed. Every strike keeps the prior and the system behaves exactly as it did before — a deployment either has an aggressor-carrying feed or it does not, and the wrong response to not having one is to invent it. |
+| `csv` | Replays a real tape: `timestamp,expiry,strike,right,price,size` required, `bid,ask,aggressor,bid_size_delta,ask_size_delta` used when present. `aggressor` takes MDP 3.0 tag 5797 verbatim. |
+| `synthetic` | A **harness**, not a market model. It exercises the classification path end to end in a generated run, and is built to agree with the generated open interest rather than contradict it. It says the machinery works, never that the signal works. |
+| `ibkr` | The live tape, via tick-by-tick `AllLast` plus top-of-book. No aggressor flag, so Lee-Ready does the work. Live runs only. |
+| `databento` | The live tape off **CME MDP 3.0 directly**, carrying the exchange's own aggressor side. Rule 1 resolves essentially the whole tape. Rides the session the Databento open-interest providers own, so it needs `data.open_interest` on `databento` or `databento_flow` too. Live runs only. |
+
+**The two live feeds are not equivalent.** Same precedence chain, materially
+different evidence reaching it — and `DealerFlowBook.rule_counts` is what
+says which one a read got:
+
+| | aggressor flag | book deltas | what actually classifies |
+|---|---|---|---|
+| `databento` | yes (tag 5797) | — | rule 1, essentially all of it |
+| `ibkr` | no | no | rules 3–4, Lee-Ready inference |
+
+Databento's `TradeMsg.side` *is* MDP 3.0's aggressor side (`BID` = buy
+aggressor → dealer short; `ASK` = sell aggressor → dealer long). That
+mapping has one definition in the codebase, shared with the flow-adjusted
+open-interest provider that signs its adjustment off the same field —
+inverting it would not degrade the strategy, it would reverse it.
+
+Note the two uses of those same messages are different quantities:
+`DatabentoFlowAdjustedOpenInterestProvider` uses aggressor side to estimate
+how much open interest has been *added* at a strike since the last print;
+`DatabentoTradeFeed` uses it to say who ended up *holding* what. One adjusts
+a magnitude, the other decides a sign, and neither substitutes for the
+other.
+
+**What IBKR does and does not relay**, for walks on that path. IBKR passes
+CME's data through but
+**not** MDP 3.0's `AggressorSide` or the market-by-order deltas — a
+tick-by-tick record carries the print, and `reqMktData` carries the top of
+book. So on the IBKR path rules 1 and 2 never fire and Lee-Ready does all
+the work, which is what those rules are for and why they are in the chain.
+The quote attached to each trade is the **prevailing** one, the last bid/ask
+seen strictly before the print, never the quote at drain time: attaching the
+current quote would classify a trade against a book that moved *because of*
+it, biasing every aggressive print towards looking passive. Run
+`deltahedger doctor` during the session to confirm trades are actually
+arriving — a walk configured for the tape and not receiving it reads exactly
+like a walk that never asked for it.
+
+**What this does not fix.** Classified flow is a *flow*; open interest is a
+*stock*. Applying a strike's measured sign to all of its open interest
+extrapolates from the contracts that traded while the process was watching
+to the ones that did not. For a 0DTE series, where the book is written the
+same session, that gap is small. For a series listed a week ago it is not,
+and `flow.half_life_minutes` and `gex.flow_confidence_contracts` are the two
+dials deciding how loudly the part that *was* seen speaks for the rest.
+Separately, the resting side is not always a dealer — a customer resting a
+limit order is passive too, and gets booked as one. What is measured is
+aggressor-versus-resting, a good proxy for customer-versus-dealer in listed
+options and not the same thing.
+
+`gex.use_flow_signs: false` restores the static convention exactly, which is
+the control a measured run should be compared against.
+
 **Five things GEX is not**, stated plainly because they bound what any
 result here can mean:
 
-1. **Open interest is not positioning.** Who is long and who is short is not
-   in the OI print. The call/put sign convention is an *assumption*, and it
-   is the load-bearing one — get it backwards and the system is confidently
-   wrong in exactly the wrong direction. It is config (`gex.call_sign`,
-   `gex.put_sign`) rather than a constant so it can be varied instead of
-   believed, and the ensemble gate (below) turns that variation into a
-   trading rule rather than a one-off stress test.
+1. **Open interest is not positioning — the tape is, as far as it goes.**
+   Who is long and who is short is not in the OI print. With a trade feed
+   attached it is *measured* from classified executions at each strike (see
+   above), which turns the assumption into an estimate carrying a known
+   amount of evidence; without one, `gex.call_sign`/`gex.put_sign` are still
+   an assumption and still the load-bearing one. Either way the ensemble
+   gate prices what remains uncertain rather than believing the number.
+   Measuring it moved the assumption rather than removing it: "the flow I
+   classified at this strike represents the book standing at it" is the new
+   load-bearing claim, and the ensemble's third axis is what tests it.
 2. **OI is only as fresh as the feed.** With intraday open interest from the
    MDP 3.0 feed the same-day print describes the book that is there, which
    is what makes trading the 0DTE series on it defensible. On a feed that
@@ -178,16 +311,22 @@ entitled to make:
    call and put gamma nets to nothing, and its sign is then decided by noise
    in the open-interest print.
 2. **Ensemble invariance** (`gates.ensemble`) — recompute the regime over a
-   small grid of `vol.skew_slope` perturbations
-   (`gates.ensemble_skew_slope_deltas`) and dealer sign-convention
-   perturbations (`gates.ensemble_sign_conventions`), and trade only when
-   every member agrees, NEUTRAL included. Both perturbed inputs are the
-   assumptions the GEX section above calls load-bearing; a regime that
-   reverses under a plausible variation of either was never a reading of
-   the market. The sign-convention members are re-weightings of the
-   standard assumption, not inversions of it — an inverted member flips the
-   answer by construction, which would make unanimity unreachable and the
-   gate mean "never trade."
+   small grid of three perturbations and trade only when every member
+   agrees, NEUTRAL included: `vol.skew_slope`
+   (`gates.ensemble_skew_slope_deltas`), the dealer sign prior
+   (`gates.ensemble_sign_conventions`), and how readily a measured sign
+   overrules that prior (`gates.ensemble_flow_confidence_scales`, scaling
+   `gex.flow_confidence_contracts`). All three are the assumptions the GEX
+   section above calls load-bearing; a regime that reverses under a
+   plausible variation of any of them was never a reading of the market.
+   The sign-prior members are re-weightings of the standard assumption, not
+   inversions of it — an inverted member flips the answer by construction,
+   which would make unanimity unreachable and the gate mean "never trade."
+   The flow axis follows the uncertainty where the measurement moved it:
+   where a strike is heavily traded every scale agrees and the axis is
+   free, and where the read rests on a handful of prints they diverge and
+   the gate blocks. With no tape at all it collapses to a single member, so
+   a run without a feed pays nothing for it (9 members, not 27).
 3. **Persistence** (`gates.persistence`, `gates.persistence_bars`, default
    `3`) — a regime must hold this many consecutive bars before it counts as
    an entry or exit trigger. A regime that flickers bar to bar is spot
@@ -868,8 +1007,12 @@ backtest never sees, and produce evidence that outlives it.
   it back.
 - **`deltahedger doctor`** checks the connection, the account type, contract
   qualification, the ATM quote, whether a series is eligible right now,
-  the event calendar, and — the one most likely to waste a week — whether
-  the account actually receives **generic tick 101 (option open interest)**.
+  the event calendar, and the two data entitlements most likely to waste a
+  week: whether the account actually receives **generic tick 101 (option
+  open interest)**, and — when `flow.source: ibkr` — whether **tick-by-tick
+  option trades** actually arrive. Both fail silently in production: no OI
+  means standing aside on every bar, and no tape means every dealer sign
+  quietly falls back to the prior.
 - **A heartbeat every five minutes**, so a quiet log and a stalled process
   can be told apart.
 - **The loop does not stop at the bell.** The rolled position is carried
@@ -949,4 +1092,8 @@ Python 3.10+, `numpy`, `scipy`, `pandas`, `PyYAML`. Live trading, history
 and live open interest also need `ib_async` and a running TWS or IB Gateway
 with CME market data. Reading open interest needs the market-data permission
 that carries generic tick 101; without it the live runner logs that GEX
-cannot be computed and stands aside rather than guessing a side.
+cannot be computed and stands aside rather than guessing a side. Measuring
+the dealer sign (`flow.source: ibkr`) additionally needs tick-by-tick
+`AllLast` on the option chain; without it every strike falls back to the
+`gex.call_sign`/`gex.put_sign` prior, silently — which is what the
+`deltahedger doctor` tape check exists to catch before a walk depends on it.

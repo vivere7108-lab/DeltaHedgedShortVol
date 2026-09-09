@@ -262,13 +262,33 @@ class GexConfig:
 
     The sign convention is a modelling choice, so it is a parameter rather
     than a constant.  ``call_sign``/``put_sign`` of ``+1``/``-1`` is the
-    standard assumption and what every published GEX print uses.
+    standard assumption and what every published GEX print uses -- but it
+    is only a *prior* now.  With a trade feed attached (``flow:``) the sign
+    at each strike is measured from the tape's aggressor side rather than
+    assumed, and these two numbers are what a strike with no measured flow
+    falls back to.  See ``flow.py`` and ``use_flow_signs`` below.
     """
 
     enabled: bool = True
-    #: Dealer inventory signs applied to open interest at each strike.
+    #: Prior dealer inventory signs, applied to open interest at a strike
+    #: where the tape has said nothing. ``+1``/``-1`` is the standard
+    #: assumption -- dealers long the calls, short the puts.
     call_sign: float = 1.0
     put_sign: float = -1.0
+
+    # -- measured signs, from classified trades ---------------------------
+    #: Use the dealer sign measured from classified option trades in place
+    #: of the prior, where there is flow to measure it from. Off restores
+    #: the static convention exactly, which is what the system did before
+    #: the tape was wired in and what a control run should use.
+    use_flow_signs: bool = True
+    #: Classified contracts at which a strike's measured sign carries half
+    #: the weight, the prior the other half. The blend is
+    #: ``w*measured + (1-w)*prior`` with ``w = n / (n + this)``, so it is
+    #: the number that says how much tape it takes to overrule the
+    #: assumption. Too small and three prints redefine a strike; too large
+    #: and a well-traded strike still reports the assumption back at you.
+    flow_confidence_contracts: float = 250.0
     #: Strikes included in the profile, as +/- a fraction of spot. Most of
     #: the gamma in the front expiries sits inside 2%; widening it costs
     #: live market-data lines on every expiry in the blend, which is the
@@ -316,6 +336,8 @@ class GexConfig:
             raise ValueError("gex.min_hours_to_expiry must be >= 0")
         if self.blend_max_expiries < 1:
             raise ValueError("gex.blend_max_expiries must be >= 1")
+        if self.flow_confidence_contracts <= 0.0:
+            raise ValueError("gex.flow_confidence_contracts must be > 0")
 
 
 @dataclass
@@ -341,12 +363,16 @@ class GatesConfig:
        It is kept separate from (1) because they fail differently: a book
        can be strongly directional *and* sitting on its flip, or flat and
        far from one.
-    3. **ensemble** -- recompute the regime over a small grid of skew and
-       sign-convention perturbations and trade only if every member agrees.
-       This is the only gate that tests the *model* rather than the data:
-       both perturbed inputs are assumptions the README flags as
-       load-bearing, and a regime that reverses under a plausible variation
-       of either was never a reading of the market.
+    3. **ensemble** -- recompute the regime over a small grid of skew,
+       sign-prior and flow-trust perturbations and trade only if every
+       member agrees.  This is the only gate that tests the *model* rather
+       than the data: all three perturbed inputs are assumptions the README
+       flags as load-bearing, and a regime that reverses under a plausible
+       variation of any of them was never a reading of the market.  With a
+       trade feed attached the sign axis matters less at a heavily traded
+       strike -- the sign is measured there, not assumed -- and the flow
+       axis matters more, which is the gate correctly following where the
+       uncertainty went.
     4. **persistence** -- a regime must hold ``persistence_bars``
        consecutive bars before it is acted on.  Open interest does not move
        intraday, so a regime that flickers bar to bar is spot crossing a
@@ -379,6 +405,21 @@ class GatesConfig:
     ensemble_sign_conventions: list[list[float]] = field(
         default_factory=lambda: [[1.0, -1.0], [1.0, -0.8], [0.8, -1.0]]
     )
+    #: Multipliers on ``gex.flow_confidence_contracts`` -- how much
+    #: classified tape it takes to overrule the prior. This is the third
+    #: perturbed axis and it exists because measuring the sign did not
+    #: remove the assumption, it replaced it: "the flow I have seen at this
+    #: strike represents the book standing at it" is now the load-bearing
+    #: claim, and a scale of 0.5 trusts the tape twice as readily as 2.0
+    #: does. Where a strike is heavily traded every member agrees and the
+    #: axis costs nothing; where the read rests on a handful of prints they
+    #: diverge and the gate blocks, which is the whole point. Must contain
+    #: 1.0 -- the traded configuration has to be an ensemble member -- and
+    #: it collapses to ``[1.0]`` automatically when there is no flow at all,
+    #: so a run without a trade feed pays nothing for it.
+    ensemble_flow_confidence_scales: list[float] = field(
+        default_factory=lambda: [0.5, 1.0, 2.0]
+    )
     #: (4) consecutive bars a regime must hold before it is acted on.
     persistence: bool = True
     persistence_bars: int = 3
@@ -408,9 +449,21 @@ class GatesConfig:
                     "each gates.ensemble_sign_conventions entry must be "
                     f"[call_sign, put_sign]; got {pair!r}"
                 )
+        if not self.ensemble_flow_confidence_scales:
+            raise ValueError("gates.ensemble_flow_confidence_scales must not be empty")
+        if any(float(s) <= 0.0 for s in self.ensemble_flow_confidence_scales):
+            raise ValueError("gates.ensemble_flow_confidence_scales must all be > 0")
+        if 1.0 not in [float(s) for s in self.ensemble_flow_confidence_scales]:
+            raise ValueError(
+                "gates.ensemble_flow_confidence_scales must include 1.0 -- the "
+                "traded configuration has to be one of the ensemble members"
+            )
 
     def sign_conventions(self) -> list[tuple[float, float]]:
         return [(float(a), float(b)) for a, b in self.ensemble_sign_conventions]
+
+    def flow_confidence_scales(self) -> list[float]:
+        return [float(s) for s in self.ensemble_flow_confidence_scales]
 
 
 @dataclass
@@ -602,6 +655,112 @@ class CostsConfig:
     hedge_fees_per_contract: float = 0.62
     #: Apply costs at all. Turn off to isolate strategy P&L.
     enabled: bool = True
+
+
+@dataclass
+class FlowConfig:
+    """The trade tape, and how executions are turned into a dealer sign.
+
+    This section is what replaces the static call/put sign convention with
+    a measurement.  ``deltahedger.flow`` classifies each option execution as
+    buyer- or seller-initiated -- from MDP 3.0's own aggressor flag where
+    the feed carries it, from the MBO book-state change where it carries
+    that, and from the Lee-Ready quote and tick rules otherwise -- and the
+    dealer is the resting side of whatever it decides.  ``gex`` then blends
+    the measured sign at each strike against ``gex.call_sign`` /
+    ``gex.put_sign`` as the prior.
+
+    ``source`` of ``"none"`` (the default) attaches no feed at all, and the
+    system behaves exactly as it did before: every strike falls back to the
+    prior.  That is deliberate -- the tape is an input a deployment either
+    has or does not, and a missing one must degrade to the old behaviour
+    loudly rather than silently synthesising flow.
+    """
+
+    #: ``"none"`` | ``"csv"`` | ``"synthetic"`` | ``"ibkr"`` |
+    #: ``"databento"``. The last two need a live connection and are built
+    #: by the live runner, not here.
+    #:
+    #: ``databento`` is the one that reads MDP 3.0's aggressor flag
+    #: directly, so rule 1 of the classification chain resolves the tape
+    #: and the Lee-Ready rules never have to run. It shares the session the
+    #: Databento open-interest providers own, so it needs
+    #: ``data.open_interest`` set to ``databento`` or ``databento_flow``
+    #: too; ``ibkr`` relays no flag and falls back to Lee-Ready.
+    source: str = "none"
+    #: CSV replay: a tape with
+    #: ``timestamp,expiry,strike,right,price,size`` and, where the export
+    #: has them, ``bid,ask,aggressor,bid_size_delta,ask_size_delta``.
+    #: ``aggressor`` takes MDP 3.0 tag 5797 verbatim (1 buy, 2 sell, 0 none).
+    csv_path: str | None = None
+
+    # -- the classification chain ----------------------------------------
+    #: (1) MDP 3.0 tag 5797. Authoritative when present; nothing below runs.
+    use_aggressor_flag: bool = True
+    #: (2) MBO: the side whose resting size fell was the passive one.
+    use_book_delta: bool = True
+    #: (3) Lee-Ready quote rule, against the prevailing bid/ask.
+    use_quote_rule: bool = True
+    #: (4) Lee-Ready tick test, for midpoint trades and missing quotes.
+    use_tick_rule: bool = True
+    #: How far inside the touch still counts as trading "at" it, in option
+    #: ticks. Capped at half the spread internally so the bid and the ask
+    #: test can never both fire. Zero demands an exact touch, which throws
+    #: away most of a wide options quote's tape.
+    quote_tolerance_ticks: float = 1.0
+    #: Minutes after which a classified contract counts half as much. 0
+    #: disables the decay: for a 0DTE series the whole book was written in
+    #: the window being watched and there is nothing stale to fade. Set it
+    #: for longer-dated series, where last week's prints should not carry
+    #: the same weight as this morning's.
+    half_life_minutes: float = 0.0
+
+    # -- the live feed ----------------------------------------------------
+    #: Strikes either side of spot to subscribe to trades on, as a fraction
+    #: of spot. Defaults to matching ``gex.strike_width_pct`` when null --
+    #: there is no point classifying flow at a strike the profile excludes.
+    strike_width_pct: float | None = None
+    #: Seconds of tick-by-tick history to pull when a subscription first
+    #: opens, so a restart mid-session does not start from an empty tape.
+    backfill_seconds: float = 3600.0
+
+    # -- synthetic (a harness, not a market model) ------------------------
+    #: Synthetic tape: contracts traded per expiry per bar. The synthetic
+    #: feed exists to exercise the classification path end to end; it says
+    #: the machinery works, never that the signal does.
+    synthetic_contracts_per_bar: float = 400.0
+    #: Share of synthetic trades that carry an explicit aggressor flag; the
+    #: rest are left to the quote and tick rules, so a generated run
+    #: exercises the whole chain rather than only its first link.
+    synthetic_flagged_share: float = 0.6
+    synthetic_seed: int = 23
+
+    def validate(self) -> None:
+        if self.source.lower() not in (
+            "none", "csv", "synthetic", "ibkr", "databento"
+        ):
+            raise ValueError(
+                f"unknown flow.source {self.source!r}; use 'none', 'csv', "
+                "'synthetic', 'ibkr' or 'databento'"
+            )
+        if self.source.lower() == "csv" and not self.csv_path:
+            raise ValueError("flow.csv_path must be set when flow.source == 'csv'")
+        if self.quote_tolerance_ticks < 0.0:
+            raise ValueError("flow.quote_tolerance_ticks must be >= 0")
+        if self.half_life_minutes < 0.0:
+            raise ValueError("flow.half_life_minutes must be >= 0")
+        if self.strike_width_pct is not None and self.strike_width_pct <= 0.0:
+            raise ValueError("flow.strike_width_pct must be > 0 or null")
+        if self.backfill_seconds < 0.0:
+            raise ValueError("flow.backfill_seconds must be >= 0")
+        if not 0.0 <= self.synthetic_flagged_share <= 1.0:
+            raise ValueError("flow.synthetic_flagged_share must be in [0, 1]")
+
+    def window_pct(self, gex: "GexConfig") -> float:
+        """Strike window for the live trade subscription."""
+        if self.strike_width_pct is not None:
+            return float(self.strike_width_pct)
+        return float(gex.strike_width_pct)
 
 
 @dataclass
@@ -805,6 +964,7 @@ class Config:
     vol: VolConfig = field(default_factory=VolConfig)
     costs: CostsConfig = field(default_factory=CostsConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    flow: FlowConfig = field(default_factory=FlowConfig)
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
     databento: DatabentoConfig = field(default_factory=DatabentoConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
@@ -827,7 +987,7 @@ class Config:
         get_risk_source(self.risk_source)  # raises on an unknown symbol
         for section in (
             self.hedge, self.sizing, self.gex, self.gates, self.strategy,
-            self.ibkr, self.live,
+            self.flow, self.ibkr, self.live,
         ):
             section.validate()
 
@@ -861,6 +1021,7 @@ class Config:
                 "vol": VolConfig,
                 "costs": CostsConfig,
                 "data": DataConfig,
+                "flow": FlowConfig,
                 "ibkr": IBKRConfig,
                 "live": LiveConfig,
             }.get(key)

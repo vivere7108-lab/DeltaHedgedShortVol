@@ -3,14 +3,47 @@
 What this computes
 ------------------
 GEX is an estimate of the gamma the option dealer community is carrying,
-inferred from open interest.  The standard assumption -- and the one every
-published GEX print uses -- is that the public buys puts and sells calls, so
-the dealer is *long the calls and short the puts*::
+inferred from open interest and a *sign* at each strike::
 
-    gex(K) = mult * S^2 * 0.01 * gamma(K) * (call_sign*OI_call + put_sign*OI_put)
+    gex(K) = mult * S^2 * 0.01 * gamma(K) * (s_call(K)*OI_call + s_put(K)*OI_put)
 
 The ``S^2 * 0.01`` turns per-point gamma into dollars of delta the dealer
 must trade for a 1% move, which is the unit the number is quoted in.
+
+Where the sign comes from
+-------------------------
+Every published GEX print takes ``s_call = +1`` and ``s_put = -1`` at every
+strike, all day: the public buys puts and sells calls, so the dealer is long
+the calls and short the puts.  That is an assumption, it is the load-bearing
+one in the whole system, and it is not in the open-interest print.  It is,
+however, in the **tape**.  Each execution has an aggressor and a resting
+side, and the dealer is the resting side: a customer lifting the offer
+leaves a dealer short the option and short its gamma; a customer hitting the
+bid leaves one long it.
+
+``flow.py`` classifies executions -- from CME MDP 3.0's own aggressor flag
+(tag 5797) where the feed carries it, from the market-by-order book-state
+change where it carries that, and from the Lee-Ready quote and tick rules
+otherwise -- and accumulates the signed dealer position per strike and
+right.  ``StrikeDealerFlow.sign`` is that position over the classified
+volume: a number in ``[-1, +1]`` on exactly the scale ``call_sign`` and
+``put_sign`` live on.
+
+A measured sign is only as good as the tape behind it, so this module
+blends rather than substitutes::
+
+    w      = n / (n + gex.flow_confidence_contracts)
+    s(K)   = w * measured(K) + (1 - w) * prior
+
+with ``n`` the classified contracts at that strike and right.  A strike that
+has not traded keeps the prior exactly -- which is the behaviour this module
+had before the tape was wired in -- a heavily traded one is essentially all
+measurement, and everything between is a weighted admission of how much is
+actually known.  ``GexProfile.flow_coverage`` reports where on that scale a
+given read sits, so a number driven by the assumption can be told from one
+driven by the evidence.  ``gex.use_flow_signs`` turns the whole thing off
+and restores the static convention, which is the control a measured run
+should be compared against.
 
 Why it matters is entirely mechanical.  A dealer who is **short gamma**
 (negative GEX) has to sell as the market falls and buy as it rises: their
@@ -54,10 +87,10 @@ Standing aside
 here, because they are properties of the profile rather than of the
 strategy: the **confidence ratio** ``|total|/gross`` and the **distance to
 the flip**.  A third, the **ensemble**, is computed here too --
-``GexCalculator.ensemble`` reprices the regime over a grid of skew and
-sign-convention perturbations -- but it is invoked by the strategy only
-when a decision actually turns on it, because it costs a full profile per
-member.  Persistence and the entry window are the strategy's, not the
+``GexCalculator.ensemble`` reprices the regime over a grid of skew,
+sign-prior and flow-trust perturbations -- but it is invoked by the strategy
+only when a decision actually turns on it, because it costs a full profile
+per member.  Persistence and the entry window are the strategy's, not the
 calculator's.
 
 What the strategy does with it
@@ -72,11 +105,21 @@ near zero / flip   about to change     unknown         stand aside
 
 Honest limits
 -------------
-1. **Open interest is not positioning.**  Who is long and who is short is
-   not in the OI print; the call/put sign convention is an assumption, and
-   it is the load-bearing one.  ``call_sign``/``put_sign`` are config so it
-   can be varied rather than believed, and the ensemble gate turns that
-   variation into a trading rule.
+1. **Open interest is not positioning -- the tape is, as far as it goes.**
+   Who is long and who is short is not in the OI print.  With a trade feed
+   attached it is measured from classified executions at each strike, which
+   turns the old assumption into an estimate with a known amount of
+   evidence behind it; without one, ``call_sign``/``put_sign`` are still an
+   assumption and still the load-bearing one.  Either way the ensemble gate
+   prices the remaining uncertainty rather than believing the number.
+   Note what the measurement does *not* fix: classified flow is a flow and
+   open interest is a stock, so applying a strike's measured sign to all of
+   its open interest extrapolates from the contracts that traded while the
+   process was watching to the ones that did not.  For a 0DTE series, where
+   the book is written the same session, that gap is small.  For a series
+   listed a week ago it is not, and ``flow.half_life_minutes`` and
+   ``gex.flow_confidence_contracts`` are the two dials that decide how
+   loudly the part that *was* seen speaks for the rest.
 2. **OI is only as fresh as the feed.**  With intraday open interest
    from the exchange's MDP 3.0 feed the same-day series' print describes
    the book that is actually there, which is what makes a 0DTE read
@@ -105,6 +148,7 @@ from typing import NamedTuple, Protocol, Sequence
 import numpy as np
 
 from .config import GatesConfig, GexConfig
+from .flow import CALL, PUT, StrikeDealerFlow
 from .instruments import RiskSource
 from .pricing import black76_gamma
 from .volsurface import VolSurface
@@ -152,18 +196,27 @@ class StrikeOpenInterest:
 
 @dataclass(frozen=True)
 class ExpiryBook:
-    """One expiry's open interest, with the tenor to price it at.
+    """One expiry's open interest and measured flow, with its tenor.
 
     The unit the blend is built from.  ``time_to_expiry`` is the real
     wall-clock tenor of that series; the ``min_hours_to_expiry`` floor is
     applied by the calculator rather than baked in here, so a caller cannot
     accidentally hand the hedger a floored tenor.
+
+    ``flow`` is what ``DealerFlowBook`` measured at each strike, and it is
+    carried *raw* -- signed dealer contracts and the classified volume
+    behind them, not a finished sign.  The blend against the prior happens
+    in the calculator, because the ensemble gate re-derives it under
+    perturbed priors and perturbed trust in the tape and would have nothing
+    to perturb if the answer arrived already computed.  Empty means no feed,
+    and every strike falls back to the prior.
     """
 
     expiry: date
     time_to_expiry: float
     rows: tuple[StrikeOpenInterest, ...]
     days_to_expiry: int = 0
+    flow: tuple[StrikeDealerFlow, ...] = ()
 
     @classmethod
     def of(
@@ -172,8 +225,13 @@ class ExpiryBook:
         time_to_expiry: float,
         rows: Sequence[StrikeOpenInterest],
         days_to_expiry: int = 0,
+        flow: Sequence[StrikeDealerFlow] = (),
     ) -> "ExpiryBook":
-        return cls(expiry, time_to_expiry, tuple(rows), days_to_expiry)
+        return cls(expiry, time_to_expiry, tuple(rows), days_to_expiry, tuple(flow))
+
+    @property
+    def has_flow(self) -> bool:
+        return bool(self.flow)
 
 
 class OpenInterestProvider(Protocol):
@@ -206,10 +264,25 @@ class StrikeGex:
     gamma: float
     call_gex: float
     put_gex: float
+    #: The signs this strike's GEX was actually computed with, after the
+    #: measured flow was blended against the prior. Printed in the strike
+    #: table so a read can be checked against the assumption it started
+    #: from: ``+1.00``/``-1.00`` is an untraded strike carrying the prior
+    #: unchanged, anything else is the tape having moved it. In a blended
+    #: profile these are the OI-weighted mean across the expiries summed.
+    call_sign: float = 0.0
+    put_sign: float = 0.0
+    #: Classified contracts behind those signs, summed across the blend.
+    call_flow: float = 0.0
+    put_flow: float = 0.0
 
     @property
     def net_gex(self) -> float:
         return self.call_gex + self.put_gex
+
+    @property
+    def flow_volume(self) -> float:
+        return self.call_flow + self.put_flow
 
 
 @dataclass(frozen=True)
@@ -261,6 +334,17 @@ class GexProfile:
     #: one. This is what the journal records so a stand-aside can be
     #: attributed after the fact.
     gate: str = ""
+    #: Open-interest-weighted share of this profile's signs that came from
+    #: classified trades rather than from ``call_sign``/``put_sign``. 0.0 is
+    #: the pre-tape system -- every sign assumed; 1.0 would be every sign
+    #: measured. It is a description of the *evidence*, not of the regime,
+    #: and nothing gates on it directly: a low-coverage read is the old read
+    #: and the old read is still the honest fallback. What it is for is
+    #: telling a number driven by the market apart from one driven by the
+    #: convention, in a log line and after the fact in the journal.
+    flow_coverage: float = 0.0
+    #: Classified contracts standing behind the measured part of the signs.
+    flow_volume: float = 0.0
 
     @property
     def direction(self) -> int:
@@ -281,8 +365,13 @@ class GexProfile:
 
         Zero when the book's call and put gamma cancel exactly, one when it
         is all on one side.  This is the quantity the confidence gate
-        thresholds, and it is scale-free -- a bigger book does not read as
-        a more confident one.
+        thresholds, and it is scale-free in the *book* -- a bigger book does
+        not read as a more confident one -- but deliberately not scale-free
+        in the *measurement*: ``gross_gex`` weights the chain's gamma by the
+        sign prior rather than by the blended sign, so a book the tape has
+        measured as dealer-flat reports a small number against a large one
+        and reads unconfident, rather than reporting the direction of
+        whatever prior survived the shrinkage as though it were positioning.
         """
         if self.gross_gex <= 0.0:
             return 0.0
@@ -310,20 +399,30 @@ class GexProfile:
 
     def describe(self) -> str:
         flip = f"{self.flip_point:,.1f}" if self.flip_point is not None else "none found"
+        measured = (
+            f", signs {self.flow_coverage:.0%} measured"
+            if self.flow_coverage > 0.0 else ""
+        )
         return (
             f"GEX {self.total_gex / 1e6:+,.1f}M/1% at {self.spot:,.2f}, "
             f"flip {flip}, confidence {self.confidence:.0%}, regime {self.regime}"
+            f"{measured}"
         )
 
     def table(self, limit: int = 15) -> str:
         """The strikes carrying the most gamma, for eyeballing a live read."""
         rows = sorted(self.by_strike, key=lambda s: -abs(s.net_gex))[:limit]
         rows.sort(key=lambda s: s.strike)
-        lines = [f"{'strike':>9} {'call OI':>9} {'put OI':>9} {'net GEX ($M/1%)':>17}"]
+        lines = [
+            f"{'strike':>9} {'call OI':>9} {'put OI':>9} {'net GEX ($M/1%)':>17} "
+            f"{'call sgn':>9} {'put sgn':>9} {'flow':>9}"
+        ]
         for row in rows:
             lines.append(
                 f"{row.strike:>9,.0f} {row.call_oi:>9,.0f} {row.put_oi:>9,.0f} "
-                f"{row.net_gex / 1e6:>17,.2f}"
+                f"{row.net_gex / 1e6:>17,.2f} "
+                f"{row.call_sign:>9,.2f} {row.put_sign:>9,.2f} "
+                f"{row.flow_volume:>9,.0f}"
             )
         return "\n".join(lines)
 
@@ -344,13 +443,25 @@ class GexProfile:
 
 
 class PreparedBook(NamedTuple):
-    """One expiry's open interest, windowed and arrayed, ready to price."""
+    """One expiry's book, windowed and arrayed, ready to price.
+
+    ``call_signs``/``put_signs`` are per-strike and already blended: the
+    measured dealer sign where the tape has classified enough of it, the
+    configured prior where it has not, and a weighted mix in between.  They
+    are computed once here rather than inside ``_curve`` because the flip
+    search evaluates the same book at sixty-one hypothetical spots and the
+    signs do not depend on spot.
+    """
 
     book: ExpiryBook
     strikes: np.ndarray
     calls: np.ndarray
     puts: np.ndarray
     tenor: float
+    call_signs: np.ndarray
+    put_signs: np.ndarray
+    call_flow: np.ndarray
+    put_flow: np.ndarray
 
 
 class GexCalculator:
@@ -363,12 +474,17 @@ class GexCalculator:
         surface: VolSurface,
         risk_free_rate: float = 0.0,
         gates: GatesConfig | None = None,
+        flow_confidence_scale: float = 1.0,
     ):
         self.cfg = cfg
         self.source = source
         self.surface = surface
         self.risk_free_rate = risk_free_rate
         self.gates = gates if gates is not None else GatesConfig()
+        #: Multiplier on ``cfg.flow_confidence_contracts``, so an ensemble
+        #: member can be built that trusts the tape more or less readily
+        #: without a second copy of the config. 1.0 is the traded setting.
+        self.flow_confidence_scale = float(flow_confidence_scale)
 
     # -- the profile -----------------------------------------------------
 
@@ -414,20 +530,53 @@ class GexCalculator:
         by_expiry: list[ExpiryGex] = []
         total = gross = call_total = put_total = 0.0
 
-        for book, strikes, calls, puts, tenor in prepared:
+        measured_oi = flow_volume = total_oi = 0.0
+        for entry in prepared:
+            book, strikes, calls, puts, tenor = (
+                entry.book, entry.strikes, entry.calls, entry.puts, entry.tenor
+            )
             gamma = black76_gamma(
                 spot, strikes, tenor, self._vols(spot, strikes, atm_iv),
                 self.risk_free_rate,
             )
-            call_gex = scale * gamma * self.cfg.call_sign * calls
-            put_gex = scale * gamma * self.cfg.put_sign * puts
+            call_gex = scale * gamma * entry.call_signs * calls
+            put_gex = scale * gamma * entry.put_signs * puts
+            # Coverage is open-interest weighted: what is being reported is
+            # the share of the *positioning in the profile* whose sign was
+            # measured, not the share of strikes -- a measured sign on a
+            # strike carrying no open interest changes nothing and should
+            # not read as evidence.
+            call_weight = self._flow_weight(entry.call_flow)
+            put_weight = self._flow_weight(entry.put_flow)
+            measured_oi += float((call_weight * calls + put_weight * puts).sum())
+            total_oi += float(calls.sum() + puts.sum())
+            flow_volume += float(entry.call_flow.sum() + entry.put_flow.sum())
             expiry_total = float((call_gex + put_gex).sum())
             # Gross is the gamma in the book, summed per *leg* rather than
-            # per strike. Summing net-per-strike would collapse to zero for
-            # a chain with matched call and put interest -- which is a
-            # maximally gamma-laden book, not an empty one -- and the
-            # confidence gate below divides by this.
-            expiry_gross = float((np.abs(call_gex) + np.abs(put_gex)).sum())
+            # per strike, and weighted by the magnitude of the *prior* --
+            # not of the blended sign.
+            #
+            # Per leg, because summing net-per-strike would collapse to zero
+            # for a chain with matched call and put interest, which is a
+            # maximally gamma-laden book rather than an empty one.
+            #
+            # At the prior, because dividing by a gross that carried the
+            # blended sign would make the confidence ratio scale-invariant
+            # in the measurement itself: a book the tape has measured as
+            # dealer-flat has both a tiny numerator and a tiny denominator,
+            # and their ratio would report whatever residual prior survived
+            # the shrinkage as a confident read on an essentially empty
+            # book. Against the gamma the prior says is there, a flat book
+            # reads flat -- which is what the classification measured and
+            # what the gate exists to catch. Where nothing has been
+            # measured the blended sign *is* the prior, so this is exactly
+            # the old quantity and a run without a feed is unchanged.
+            expiry_gross = float(
+                (
+                    abs(self.cfg.call_sign) * np.abs(scale * gamma * calls)
+                    + abs(self.cfg.put_sign) * np.abs(scale * gamma * puts)
+                ).sum()
+            )
             total += expiry_total
             gross += expiry_gross
             call_total += float(call_gex.sum())
@@ -441,13 +590,24 @@ class GexCalculator:
                     gross_gex=expiry_gross,
                 )
             )
-            for k, c, p, g, cg, pg in zip(strikes, calls, puts, gamma, call_gex, put_gex):
-                row = per_strike.setdefault(float(k), [0.0, 0.0, 0.0, 0.0, 0.0])
+            for k, c, p, g, cg, pg, cs, ps, cf, pf in zip(
+                strikes, calls, puts, gamma, call_gex, put_gex,
+                entry.call_signs, entry.put_signs, entry.call_flow, entry.put_flow,
+            ):
+                row = per_strike.setdefault(float(k), [0.0] * 9)
                 row[0] += float(c)
                 row[1] += float(p)
                 row[2] += float(g)
                 row[3] += float(cg)
                 row[4] += float(pg)
+                # The displayed sign is OI-weighted across the expiries so a
+                # strike whose open interest sits almost entirely in one
+                # series reports that series' sign rather than an unweighted
+                # average of it with an empty one.
+                row[5] += float(cs) * float(c)
+                row[6] += float(ps) * float(p)
+                row[7] += float(cf)
+                row[8] += float(pf)
 
         flip = self._flip_point(spot, prepared, atm_iv)
         regime, reason, gate = self._classify(spot, total, gross, flip)
@@ -463,15 +623,27 @@ class GexCalculator:
             regime=regime,
             reason=reason,
             gate=gate,
+            flow_coverage=(measured_oi / total_oi) if total_oi > 0.0 else 0.0,
+            flow_volume=flow_volume,
             by_strike=tuple(
                 StrikeGex(
                     strike=strike, call_oi=row[0], put_oi=row[1], gamma=row[2],
                     call_gex=row[3], put_gex=row[4],
+                    call_sign=(row[5] / row[0]) if row[0] > 0.0 else self.cfg.call_sign,
+                    put_sign=(row[6] / row[1]) if row[1] > 0.0 else self.cfg.put_sign,
+                    call_flow=row[7], put_flow=row[8],
                 )
                 for strike, row in sorted(per_strike.items())
             ),
             by_expiry=tuple(by_expiry),
         )
+
+    def _flow_weight(self, volume: np.ndarray) -> np.ndarray:
+        """``n / (n + confidence)`` -- the share of a sign that is measured."""
+        confidence = self.cfg.flow_confidence_contracts * self.flow_confidence_scale
+        if not self.cfg.use_flow_signs or confidence <= 0.0:
+            return np.zeros(volume.shape, dtype=float)
+        return volume / (volume + confidence)
 
     def total_at(
         self,
@@ -510,13 +682,33 @@ class GexCalculator:
     ) -> EnsembleResult:
         """Recompute the regime over perturbed assumptions and check agreement.
 
-        Two inputs are varied, and they are exactly the two the README
-        flags as load-bearing: the skew slope, which prices every gamma in
-        the profile and therefore moves the flip point, and the dealer sign
-        convention, which decides what open interest *means*.  A regime
-        that reverses under a plausible change to either was a property of
-        the model rather than a reading of the market, and the strategy has
-        no business acting on it.
+        Three inputs are varied, and they are exactly the ones the README
+        flags as load-bearing:
+
+        * the **skew slope**, which prices every gamma in the profile and
+          therefore moves the flip point;
+        * the **sign prior**, which decides what open interest means at a
+          strike the tape has said nothing about;
+        * how readily a measured sign **overrules that prior** --
+          ``gex.flow_confidence_contracts``, scaled by
+          ``gates.ensemble_flow_confidence_scales``.
+
+        The third axis is there because measuring the sign did not remove
+        the assumption, it moved it.  "The flow I classified at this strike
+        represents the book standing at it" is the new load-bearing claim,
+        and it is strongest where a strike is heavily traded and weakest
+        where the read rests on a handful of prints -- which is precisely
+        the difference the scales expose.  Where the tape is thick every
+        scale agrees and the axis is free; where it is thin they diverge and
+        the gate blocks, which is the behaviour wanted in both cases.
+
+        With no flow at all the axis is a no-op -- every scale gives the
+        same profile -- so it collapses to a single member and a run without
+        a trade feed pays nothing for it.
+
+        A regime that reverses under a plausible change to any of the three
+        was a property of the model rather than a reading of the market, and
+        the strategy has no business acting on it.
 
         Unanimity is over the regime, including NEUTRAL: a member that
         cannot make up its mind counts as dissent.  That is deliberate --
@@ -524,20 +716,24 @@ class GexCalculator:
         "no, one of them would stand aside" is a no.
         """
         gates = self.gates
+        measured = self.cfg.use_flow_signs and any(book.has_flow for book in books)
+        scales = gates.flow_confidence_scales() if measured else [1.0]
         regimes: list[str] = []
         for delta in gates.ensemble_skew_slope_deltas:
             surface = self._perturbed_surface(float(delta))
             for call_sign, put_sign in gates.sign_conventions():
-                member = GexCalculator(
-                    dataclasses.replace(
-                        self.cfg, call_sign=call_sign, put_sign=put_sign
-                    ),
-                    self.source,
-                    surface,
-                    self.risk_free_rate,
-                    gates,
-                )
-                regimes.append(member.blended_profile(spot, books, atm_iv).regime)
+                for scale in scales:
+                    member = GexCalculator(
+                        dataclasses.replace(
+                            self.cfg, call_sign=call_sign, put_sign=put_sign
+                        ),
+                        self.source,
+                        surface,
+                        self.risk_free_rate,
+                        gates,
+                        flow_confidence_scale=scale,
+                    )
+                    regimes.append(member.blended_profile(spot, books, atm_iv).regime)
 
         distinct = sorted(set(regimes))
         unanimous = len(distinct) == 1
@@ -550,10 +746,15 @@ class GexCalculator:
             counts = ", ".join(
                 f"{name} x{regimes.count(name)}" for name in distinct
             )
+            axis = (
+                "assumed skew, the sign prior or how far the classified tape "
+                "is trusted"
+                if measured else "assumed skew or sign convention"
+            )
             detail = (
                 f"the ensemble does not agree ({counts} across {len(regimes)} "
-                "members): the regime is a property of the assumed skew or "
-                "sign convention rather than of the chain"
+                f"members): the regime is a property of the {axis} rather "
+                "than of the chain"
             )
         return EnsembleResult(unanimous, regime, tuple(regimes), detail)
 
@@ -587,13 +788,64 @@ class GexCalculator:
             strikes, calls, puts = self._arrays(spot, book.rows)
             if not strikes.size:
                 continue
+            call_signs, call_flow = self._signs(book, strikes, CALL)
+            put_signs, put_flow = self._signs(book, strikes, PUT)
             prepared.append(
                 PreparedBook(
                     book, strikes, calls, puts,
                     self._effective_tenor(book.time_to_expiry),
+                    call_signs, put_signs, call_flow, put_flow,
                 )
             )
         return prepared
+
+    def _signs(
+        self, book: ExpiryBook, strikes: np.ndarray, right: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The dealer sign at each strike, and the tape behind it.
+
+        The shrinkage in one place: ``w = n / (n + confidence)`` with ``n``
+        the classified contracts at that strike and right, and the answer
+        ``w * measured + (1 - w) * prior``.  Three properties make it the
+        right functional form here rather than a threshold:
+
+        * a strike with no flow returns the prior *exactly*, so attaching a
+          feed can never change a read it has no evidence about;
+        * a strike with overwhelming flow returns the measurement, so the
+          assumption stops mattering where it stopped being needed;
+        * nothing between them is a cliff, so the profile does not jump the
+          moment one more contract prints.
+
+        ``strike_flow`` is indexed rather than zipped because the flow rows
+        and the open-interest rows are different sets: an option can trade
+        at a strike carrying no listed open interest, and open interest sits
+        at strikes that have not traded all day.
+        """
+        prior = self.cfg.call_sign if right == CALL else self.cfg.put_sign
+        signs = np.full(strikes.shape, float(prior), dtype=float)
+        volume = np.zeros(strikes.shape, dtype=float)
+        if not self.cfg.use_flow_signs or not book.flow:
+            return signs, volume
+
+        by_strike = {float(row.strike): row for row in book.flow}
+        measured = np.zeros(strikes.shape, dtype=float)
+        for i, strike in enumerate(strikes):
+            row = by_strike.get(float(strike))
+            if row is None:
+                continue
+            sign = row.sign(right)
+            n = row.volume(right)
+            if sign is None or n <= 0.0:
+                continue
+            measured[i] = sign
+            volume[i] = n
+        # One definition of the weight, shared with the coverage figure: two
+        # copies of ``n / (n + confidence)`` would be two things to keep in
+        # step, and a profile whose reported coverage disagreed with the
+        # signs it actually used would be worse than one reporting nothing.
+        # A strike with no flow has weight 0 and keeps the prior exactly.
+        weights = self._flow_weight(volume)
+        return weights * measured + (1.0 - weights) * signs, volume
 
     def _arrays(
         self, spot: float, open_interest: Sequence[StrikeOpenInterest]
@@ -634,7 +886,7 @@ class GexCalculator:
             gamma = black76_gamma(
                 column, strikes[None, :], entry.tenor, vols, self.risk_free_rate
             )
-            weight = self.cfg.call_sign * entry.calls + self.cfg.put_sign * entry.puts
+            weight = entry.call_signs * entry.calls + entry.put_signs * entry.puts
             out = out + (scale * gamma * weight[None, :]).sum(axis=1)
         return out
 

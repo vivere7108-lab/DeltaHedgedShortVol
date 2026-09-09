@@ -3,13 +3,15 @@
 One bar (or one live poll) at a time, in this order:
 
   1. mark the open straddle and recompute greeks
-  2. read GEX at the current spot -- total, flip point, regime -- across the
+  2. drain the option tape since the last bar, classify every execution's
+     aggressor side, and fold it into the measured dealer sign per strike
+  3. read GEX at the current spot -- total, flip point, regime -- across the
      front expiries, and update the persistence streak
-  3. check exits -- the DTE floor, a *confirmed* regime flip, the
+  4. check exits -- the DTE floor, a *confirmed* regime flip, the
      directional stop/target, the daily loss limit
-  4. check entry -- if flat, inside the entry window and past every gate,
+  5. check entry -- if flat, inside the entry window and past every gate,
      take the side the regime implies
-  5. check the delta band and hedge
+  6. check the delta band and hedge
 
 The direction is not a parameter.  It is whatever dealer positioning says::
 
@@ -67,23 +69,43 @@ Every block is recorded as an event carrying the gate that caused it, which
 is what makes ``deltahedger sweep --gates`` and the live journal able to say
 *why* nothing was traded rather than only that nothing was.
 
+The tape
+--------
+Step 2 is what makes the direction a measurement rather than an assumption.
+``OpenInterestProvider`` says how many contracts sit at a strike;
+``OptionTradeFeed`` says who was the aggressor on the ones that traded, and
+therefore which side the dealer took -- from CME MDP 3.0's aggressor flag
+where the feed carries it, from the market-by-order book change where it
+carries that, and from the Lee-Ready quote and tick rules otherwise.  The
+feed is drained **every bar**, on the bar's own interval, while open
+interest is re-read on ``gex.refresh_seconds``: a stock can be sampled on a
+timer, a flow cannot be, and a tape pulled every fifteen minutes would
+simply be a tape with most of itself missing.
+
+No feed attached is a supported configuration and the default one.  Every
+strike then falls back to ``gex.call_sign``/``gex.put_sign`` and the system
+behaves exactly as it did before -- which is why ``flow.source`` defaults to
+``"none"`` rather than to a generated tape.
+
 This class holds no market-data or broker dependency: it is handed a
-``MarketBar``, an ``OpenInterestProvider`` and an ``ExecutionHandler``.  The
-backtest loop and the live runner both call ``on_bar`` and differ only in
-where those come from.
+``MarketBar``, an ``OpenInterestProvider``, an ``OptionTradeFeed`` and an
+``ExecutionHandler``.  The backtest loop and the live runner both call
+``on_bar`` and differ only in where those come from.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from typing import Sequence
 
 from .broker.base import ExecutionHandler, Fill, OrderStateUnknown
 from .chain import StraddleQuote, TenorPolicy, price_option, select_expiry, select_atm_straddle
 from .config import Config
 from .data.base import MarketBar
 from .events import EventCalendar
+from .flow import DealerFlowBook, OptionTradeFeed, build_flow_book
 from .gex import (
     GATE_ENSEMBLE,
     GATE_ENTRY_WINDOW,
@@ -182,6 +204,15 @@ class BarState:
     band_half_width: float = 0.0
     #: The scheduled event whose blackout this bar fell inside, if any.
     event_blackout: str = ""
+    #: Open-interest-weighted share of the bar's GEX signs that came from
+    #: classified trades rather than from the configured prior. 0.0 is the
+    #: pre-tape read. Recorded per bar so a walk can be split after the fact
+    #: into the part that was measured and the part that was assumed --
+    #: which is the only way to tell whether replacing the convention
+    #: changed anything.
+    gex_flow_coverage: float | None = None
+    #: Classified contracts standing behind that coverage.
+    gex_flow_volume: float | None = None
 
 
 class GexStraddleStrategy:
@@ -192,6 +223,7 @@ class GexStraddleStrategy:
         margin_model: MarginModel | None = None,
         open_interest: OpenInterestProvider | None = None,
         events: EventCalendar | None = None,
+        trade_feed: OptionTradeFeed | None = None,
     ):
         self.cfg = cfg
         self.source = source or cfg.source
@@ -215,6 +247,11 @@ class GexStraddleStrategy:
             else EventCalendar.from_config(cfg.strategy, self.clock.tz)
         )
         self.open_interest = open_interest
+        #: The option tape, and the classified dealer position it implies.
+        #: ``None`` is a supported configuration -- every strike keeps the
+        #: configured sign prior -- and is what the default config does.
+        self.trade_feed = trade_feed
+        self.flow: DealerFlowBook = build_flow_book(cfg, self.source)
         self.portfolio = Portfolio(cfg.starting_equity, self.source)
 
         self.events: list[StrategyEvent] = []
@@ -226,6 +263,9 @@ class GexStraddleStrategy:
         self.regime_trades: dict[str, int] = {}
 
         self._last_hedge_time: datetime | None = None
+        #: When the previous bar landed, which is how wide a window the
+        #: first tape pull for a newly listed expiry takes.
+        self._last_bar_time: datetime | None = None
         self._session_date: date | None = None
         self._session_start_equity = cfg.starting_equity
         self._entry_attempts_this_session = 0
@@ -246,6 +286,12 @@ class GexStraddleStrategy:
         self._oi: dict[date, list[StrikeOpenInterest]] = {}
         self._oi_read_at: datetime | None = None
         self._oi_expiries: tuple[date, ...] = ()
+        #: The high-water mark of the tape, per expiry. Feeds are pulled
+        #: with the half-open interval since this, so a trade is folded into
+        #: the dealer position exactly once -- double-counting one would
+        #: move a strike's sign with no way for anything downstream to see
+        #: that it had happened.
+        self._flow_read_at: dict[date, datetime] = {}
         #: The books the last profile was built from, kept so the ensemble
         #: gate can re-price the same input without re-reading it.
         self._books: list[ExpiryBook] = []
@@ -299,6 +345,7 @@ class GexStraddleStrategy:
 
         state = self._snapshot(bar, moment, quote, profile)
         self.bar_states.append(state)
+        self._last_bar_time = moment
         return state
 
     # -- session bookkeeping --------------------------------------------
@@ -468,17 +515,92 @@ class GexStraddleStrategy:
             self._oi_read_at = moment
             self._oi_expiries = tuple(expiries)
 
+        self._read_flow(moment, expiries)
+
         self._books = [
             ExpiryBook.of(
                 expiry,
                 self.clock.time_to_expiry(moment, expiry),
                 self._oi.get(expiry, []),
                 self.clock.days_to_expiry(moment, expiry),
+                self.flow.rows(expiry, moment),
             )
             for expiry in expiries
         ]
         self._profile = self.gex.blended_profile(bar.close, self._books, bar.atm_iv)
         return self._profile
+
+    # -- the tape --------------------------------------------------------
+
+    def _read_flow(self, moment: datetime, expiries: Sequence[date]) -> None:
+        """Drain the tape since the last bar and classify what came back.
+
+        Every bar, not on the open-interest timer: open interest is a stock
+        and can be sampled, the tape is a flow and cannot -- pulling it every
+        fifteen minutes would not give a coarser measurement of the dealer
+        sign, it would give one built from a fifteenth of the executions.
+
+        The first pull for an expiry has no previous mark to work from, so
+        it takes the bar's own interval rather than reaching back to the
+        beginning of time: an unbounded first window would make the opening
+        bar of a run mean something different from every bar after it, and
+        on a live restart it would re-read the whole session and double it
+        into a book that already had it. ``flow.backfill_seconds`` is where
+        deliberate history-on-startup belongs, and it is the live feed's
+        subscription that honours it.
+
+        A feed that raises is logged and skipped, exactly as a failed
+        open-interest read is: the profile falls back towards the sign prior
+        for that expiry, which is a worse read than the measured one and a
+        far better one than no read at all.  The high-water mark advances
+        only on a *successful* pull, so the next bar asks for the window the
+        failed one dropped rather than stepping over it -- a tick stream
+        that blips for one poll should cost a delayed measurement, not a
+        permanently missing one.  ``flow.backfill_seconds`` bounds how far
+        that recovery can reach back, so an outage lasting an hour does not
+        turn into an hour-wide re-read the moment the feed returns.
+        """
+        if self.trade_feed is None:
+            return
+        horizon = timedelta(seconds=self.cfg.flow.backfill_seconds)
+        for expiry in expiries:
+            start = self._flow_read_at.get(expiry)
+            if start is None:
+                start = moment - self._bar_interval(moment)
+            start = max(start, moment - horizon) if horizon else start
+            if moment <= start:
+                continue
+            # Recorded before the pull, so a failure leaves the mark where
+            # the dropped window began rather than where it would have
+            # ended.
+            self._flow_read_at[expiry] = start
+            try:
+                trades = self.trade_feed.trades(start, moment, expiry)
+            except Exception as exc:  # noqa: BLE001 - a bad read must not halt the run
+                log.warning(
+                    "could not read the option tape for %s (%s); holding the "
+                    "flow measured so far and retrying that window on the "
+                    "next bar", expiry, exc,
+                )
+                continue
+            self._flow_read_at[expiry] = moment
+            for trade in trades:
+                self.flow.observe(trade)
+        self.flow.prune(moment.date())
+
+    def _bar_interval(self, moment: datetime) -> timedelta:
+        """How far back the first tape pull for an expiry reaches.
+
+        The gap since the previous bar, so a restart or a newly listed
+        expiry takes the same window every other bar takes rather than an
+        arbitrary one. Falls back to the open-interest refresh interval on
+        the very first bar of a run, when there is no previous bar to
+        measure against.
+        """
+        previous = self._last_bar_time
+        if previous is not None and moment > previous:
+            return moment - previous
+        return timedelta(seconds=self.cfg.gex.refresh_seconds)
 
     # -- persistence -----------------------------------------------------
 
@@ -1382,6 +1504,8 @@ class GexStraddleStrategy:
             distance_to_flip=profile.distance_to_flip if profile else None,
             gex_confidence=profile.confidence if profile else None,
             gex_gate=profile.gate if profile else "",
+            gex_flow_coverage=profile.flow_coverage if profile else None,
+            gex_flow_volume=profile.flow_volume if profile else None,
             confirmed_regime=self._confirmed_regime,
             days_to_expiry=(
                 self.clock.days_to_expiry(moment, expiry) if expiry else None
