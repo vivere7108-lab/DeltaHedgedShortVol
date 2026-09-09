@@ -11,6 +11,7 @@ change shows up as an edited assertion with a reason rather than as a
 silent flip.  See the plan in the commit that added this file.
 """
 
+import logging
 import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -19,8 +20,6 @@ import pytest
 
 from deltahedger.broker.base import ExecutionError, OrderStateUnknown
 from deltahedger.chain import OptionQuote, StraddleQuote
-import logging
-
 from deltahedger.config import Config
 from deltahedger.pricing import black76
 
@@ -399,23 +398,61 @@ class TestWhatIfMargin:
         model.straddle_requirement(straddle(), 5000.0, cfg.source, +1)
         assert conn.ib.whatif_orders == []
 
-    def test_a_silent_fallback_when_ibkr_returns_no_margin(self, conn, cfg):
-        """The gap behind issue 4, and how the original bug stayed hidden.
+    def test_the_fallback_is_used_but_said_out_loud(self, conn, cfg, caplog):
+        """How the original bug stayed hidden.
 
         ``use_whatif_margin: true`` reads as "size against the real
         number". When the probe comes back empty -- routine for a CME FOP
-        combo -- the model drops to the heuristic and logs a warning, and
-        sizing proceeds as if nothing had changed. For as long as that
+        combo -- the model drops to the heuristic, and for as long as that
         heuristic was wrong the account was sized off it with no signal
-        anywhere but one log line. Phase 4 makes it loud.
+        anywhere but one WARNING line among the ordinary ones.
+
+        Still falling back, because refusing to trade on a failed probe
+        would mean never trading on some accounts. But at ERROR, naming
+        the estimate, and pointing at the account figure that can check it.
         """
         conn.ib.margin_change = None  # OrderState.initMarginChange stays ''
         fallback = self.Heuristic()
         model = WhatIfMarginModel(conn, fallback)
-        assert model.straddle_requirement(
-            straddle(), 5000.0, cfg.source, -1
-        ) == 1234.0
-        assert fallback.short_calls == 1
+        with caplog.at_level(logging.ERROR, logger="deltahedger.broker.ibkr"):
+            assert model.straddle_requirement(
+                straddle(), 5000.0, cfg.source, -1
+            ) == 1234.0
+        assert fallback.short_calls >= 1
+        assert "not on IBKR" in caplog.text
+        assert "FullInitMarginReq" in caplog.text
+
+    def test_the_loud_fallback_does_not_repeat_forever(self, conn, cfg, caplog):
+        """A probe that never works would otherwise print the same line on
+        every entry, which is how a real warning stops being read."""
+        conn.ib.margin_change = None
+        model = WhatIfMarginModel(conn, self.Heuristic())
+        with caplog.at_level(logging.ERROR, logger="deltahedger.broker.ibkr"):
+            for _ in range(10):
+                model.straddle_requirement(straddle(), 5000.0, cfg.source, -1)
+        assert caplog.text.count("not on IBKR") <= 3
+
+    def test_a_model_far_from_the_brokers_number_is_reported(
+        self, conn, cfg, caplog
+    ):
+        """IBKR's figure is used either way; the comparison is a check on
+        the *model*, which is what the backtest sized against and what the
+        live path falls back to when a probe fails."""
+        conn.ib.margin_change = 16_800.0  # against a fallback that says 1234
+        model = WhatIfMarginModel(conn, self.Heuristic())
+        with caplog.at_level(logging.WARNING, logger="deltahedger.broker.ibkr"):
+            used = model.straddle_requirement(straddle(), 5000.0, cfg.source, -1)
+        assert used == pytest.approx(16_800.0), "IBKR's number is the one used"
+        assert "margin model is off by" in caplog.text
+
+    def test_a_model_close_to_the_brokers_number_is_not_reported(
+        self, conn, cfg, caplog
+    ):
+        conn.ib.margin_change = 1_500.0  # within a factor of two of 1234
+        model = WhatIfMarginModel(conn, self.Heuristic())
+        with caplog.at_level(logging.WARNING, logger="deltahedger.broker.ibkr"):
+            model.straddle_requirement(straddle(), 5000.0, cfg.source, -1)
+        assert "margin model is off by" not in caplog.text
 
     def test_a_zero_or_negative_margin_change_is_not_trusted(self, conn, cfg):
         conn.ib.margin_change = 0.0

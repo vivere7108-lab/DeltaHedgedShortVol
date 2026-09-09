@@ -172,6 +172,33 @@ class IbkrConnection:
             )
         return price
 
+    # -- account ---------------------------------------------------------
+
+    def account_values(self) -> dict[str, float]:
+        """The account's numeric summary tags, in the base currency.
+
+        ``NetLiquidation`` is what the strategy should be sized against --
+        the account's own value, rather than a number typed into a config
+        file that a reconnect resets it to. ``FullInitMarginReq`` is what
+        the broker is actually holding against the book, which is the only
+        independent check there is on the margin model being right.
+        """
+        values: dict[str, float] = {}
+        for row in self.ib.accountValues(self.account):
+            currency = getattr(row, "currency", "")
+            if currency not in ("", "USD", "BASE"):
+                continue
+            try:
+                values[row.tag] = float(row.value)
+            except (TypeError, ValueError):
+                continue  # several tags are strings by design
+        return values
+
+    def net_liquidation(self) -> float | None:
+        """The account's value, or ``None`` if IBKR did not report it."""
+        value = self.account_values().get("NetLiquidation")
+        return value if value is not None and value > 0 else None
+
     def hedge_price(self) -> float:
         ticker = self.ib.reqTickers(self.hedge_contract)[0]
         price = _pick_price(ticker)
@@ -439,6 +466,10 @@ class WhatIfMarginModel:
     connection: IbkrConnection
     fallback: Any
     probe_quantity: int = 1
+    #: Log the fallback loudly only the first few times. A probe that never
+    #: works would otherwise fill the journal with the same line every
+    #: entry, which is how a real warning stops being read.
+    _fallbacks: list[int] = field(default_factory=list, repr=False, compare=False)
 
     def straddle_requirement(
         self, quote: StraddleQuote, future_price: float, source: RiskSource,
@@ -448,14 +479,69 @@ class WhatIfMarginModel:
             return self.fallback.straddle_requirement(
                 quote, future_price, source, direction
             )
+        why = ""
         try:
             margin = self._probe_short(quote)
             if margin is not None:
+                self._compare(margin, quote, future_price, source)
                 return margin
-            log.warning("whatIf returned no margin change; using the fallback model")
+            why = "IBKR returned no margin change for the combo"
         except Exception as exc:  # noqa: BLE001 - never block sizing on a probe
-            log.warning("whatIf margin probe failed (%s); using the fallback model", exc)
-        return self.fallback.straddle_requirement(quote, future_price, source, direction)
+            why = f"the probe failed ({exc})"
+        return self._fall_back(why, quote, future_price, source)
+
+    def _fall_back(
+        self, why: str, quote: StraddleQuote, future_price: float,
+        source: RiskSource,
+    ) -> float:
+        """Use the heuristic, and be loud that the real number is missing.
+
+        ``use_whatif_margin: true`` reads as "size against what the account
+        will actually be charged". When the probe comes back empty --
+        routine for a CME options combo -- the requirement silently
+        reverted to a model, and for as long as that model was wrong the
+        account was sized off it with no signal anywhere. The fallback is
+        still the right behaviour, because refusing to trade on a failed
+        probe would mean never trading on some accounts; being quiet about
+        it was not.
+        """
+        estimate = self.fallback.straddle_requirement(
+            quote, future_price, source, -1
+        )
+        self._fallbacks.append(1)
+        if len(self._fallbacks) <= 3:
+            log.error(
+                "sizing on the margin MODEL, not on IBKR's number: %s. The "
+                "estimate is $%s per straddle and nothing has confirmed it -- "
+                "the account is the only check on the model being right, so "
+                "watch FullInitMarginReq.", why, f"{estimate:,.0f}",
+            )
+        return estimate
+
+    def _compare(
+        self, margin: float, quote: StraddleQuote, future_price: float,
+        source: RiskSource,
+    ) -> None:
+        """Say when the model and the broker disagree badly.
+
+        Not a check on the trade -- IBKR's number is used either way -- but
+        on the model, which is what the backtest sized against and what the
+        live path falls back to when a probe fails.
+        """
+        estimate = self.fallback.straddle_requirement(
+            quote, future_price, source, -1
+        )
+        if estimate <= 0 or margin <= 0:
+            return
+        ratio = margin / estimate
+        if 0.5 <= ratio <= 2.0:
+            return
+        log.warning(
+            "the margin model is off by %.1fx against IBKR: it estimates $%s "
+            "per straddle where the account is charged $%s. The live path uses "
+            "IBKR's, but the backtest sized against the model.",
+            ratio, f"{estimate:,.0f}", f"{margin:,.0f}",
+        )
 
     def _probe_short(self, quote: StraddleQuote) -> float | None:
         """Margin for selling both legs together, as one combined position.

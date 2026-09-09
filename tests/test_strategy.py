@@ -280,22 +280,37 @@ class TestEntry:
         assert "entry_skipped" in kinds(strategy)
         assert strategy.portfolio.straddle is None
 
+    def _all_in(self, cfg, strategy, direction):
+        """What the open book costs: the option leg plus its hedge."""
+        from deltahedger.sizing import hedge_contracts_per_straddle
+
+        quote = _entry_quote(strategy)
+        per = strategy.margin_model.straddle_requirement(
+            quote, 5000.0, cfg.source, direction
+        )
+        hedge = hedge_contracts_per_straddle(cfg.source) * (
+            strategy.margin_model.hedge_margin(cfg.source)
+        )
+        return abs(strategy.portfolio.straddle.quantity) * (per + hedge)
+
     def test_the_short_position_respects_the_margin_budget(self):
+        """Budget covers the straddles *and* the futures needed to hedge
+        them: a straddle cannot be carried without its hedge."""
         cfg = make_cfg(**{"sizing.buying_power_pct": 0.15})
         strategy = drive(cfg, [bar(0)], regime=POSITIVE)
-        budget = cfg.starting_equity * 0.15 * (1 - cfg.sizing.hedge_margin_reserve_pct)
-        quote = _entry_quote(strategy)
-        per = strategy.margin_model.straddle_requirement(quote, 5000.0, cfg.source, -1)
-        assert abs(strategy.portfolio.straddle.quantity) * per <= budget * 1.001
+        budget = cfg.starting_equity * 0.15
+        assert self._all_in(cfg, strategy, -1) <= budget * 1.001
 
     def test_the_long_position_never_spends_more_than_the_budget(self):
-        """A long straddle is paid for in cash; the debit is the constraint."""
+        """A long straddle is paid for in cash; the debit plus the hedge
+        behind it is the constraint."""
         cfg = make_cfg(**{"sizing.buying_power_pct": 0.15})
         strategy = drive(cfg, [bar(0)], regime=NEGATIVE)
-        budget = cfg.starting_equity * 0.15 * (1 - cfg.sizing.hedge_margin_reserve_pct)
+        budget = cfg.starting_equity * 0.15
         position = strategy.portfolio.straddle
         debit = position.premium_at_risk(cfg.source.option.multiplier)
-        assert 0 < debit <= budget * 1.001
+        assert debit > 0
+        assert self._all_in(cfg, strategy, 1) <= budget * 1.001
 
     def test_open_interest_is_cached_rather_than_re_read_every_bar(self):
         """One read per expiry in the blend on the first bar, then nothing
@@ -574,7 +589,10 @@ class TestHedging:
         """Under Whalley-Wilmott the band scales with gamma, so a bigger
         allocation -- more straddles -- is held to a wider band in delta
         units, and a flat book to none at all."""
-        small = drive(make_cfg(**{"sizing.buying_power_pct": 0.10}), [bar(0), bar(5)])
+        # Both allocations have to open something: the hedge is charged per
+        # straddle now, so a tenth of a half-million account no longer
+        # covers even one straddle plus the ten micros behind it.
+        small = drive(make_cfg(**{"sizing.buying_power_pct": 0.30}), [bar(0), bar(5)])
         large = drive(make_cfg(**{"sizing.buying_power_pct": 0.80}), [bar(0), bar(5)])
         assert large.bar_states[-1].band_half_width > small.bar_states[-1].band_half_width > 0
         flat = drive(make_cfg(), [bar(0)], regime=NEUTRAL)

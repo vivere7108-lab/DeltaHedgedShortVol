@@ -339,6 +339,8 @@ class LiveRunner:
                 every = self.cfg.live.reconcile_seconds
                 if every is not None and now - last_reconcile >= every:
                     self._verify_positions(conn)
+                    self._check_broker_margin(conn)
+                    self._rebase_equity(conn)
                     last_reconcile = now
                 if now - last_heartbeat >= self.cfg.live.heartbeat_seconds:
                     log.info(
@@ -534,6 +536,12 @@ class LiveRunner:
         if not hedge_rows and straddle is None:
             log.info("no existing positions to adopt")
 
+        # After adoption, so the guard inside it sees the book the account
+        # actually left us with. What decides whether the arithmetic is
+        # exact is whether *the account* holds a straddle, not whether the
+        # book happened to be empty a moment ago.
+        self._rebase_equity(conn)
+
     def _verify_positions(self, conn) -> None:
         """Re-check the broker against the book, mid-session.
 
@@ -590,6 +598,89 @@ class LiveRunner:
             book.hedge.quantity = broker_hedge
             if hedge_rows:
                 book.hedge.avg_price = hedge_rows[0].entry_price
+
+    def _rebase_equity(self, conn) -> None:
+        """Size against the account's own value, not against the config.
+
+        ``starting_equity`` is a number in a YAML file, and the book's
+        equity is that number plus whatever this *process* has realised.
+        A reconnect rebuilds the strategy, so the realised part resets to
+        zero -- after a drawdown and the nightly gateway restart, the
+        strategy sizes its next entry as though the loss had not happened.
+
+        Only done while the option book is flat, which is when it can be
+        exact: ``NetLiquidation`` already values open positions at market,
+        so re-basing on top of a position would count its open P&L twice
+        -- once inside the broker's number and again in ``unrealised``.
+        Flat, the only unrealised is the hedge leg's, and that is
+        subtractable because the hedge has a mark. Entries only happen
+        when flat, so sizing always sees the broker's figure.
+        """
+        assert self.strategy is not None
+        book = self.strategy.portfolio
+        if book.straddle is not None:
+            return
+        try:
+            nav = conn.net_liquidation()
+        except Exception as exc:  # noqa: BLE001 - never block on an account read
+            log.warning("could not read the account value (%s); keeping %s",
+                        exc, f"${book.starting_equity:,.0f}")
+            return
+        if nav is None:
+            log.warning(
+                "IBKR reported no NetLiquidation; sizing stays on the "
+                "configured $%s", f"{book.starting_equity:,.0f}",
+            )
+            return
+
+        hedge_mark = conn.hedge_price() if book.hedge.quantity else 0.0
+        unrealised = book.hedge.unrealised(hedge_mark, self.source.hedge.multiplier)
+        rebased = nav - book.realised_pnl + book.fees_paid - unrealised
+        if abs(rebased - book.starting_equity) < 1.0:
+            return
+        log.info(
+            "sizing against the account: NetLiquidation $%s (the book was "
+            "carrying $%s)", f"{nav:,.0f}", f"{book.starting_equity:,.0f}",
+        )
+        book.starting_equity = rebased
+
+    def _check_broker_margin(self, conn) -> None:
+        """Compare what the broker is holding with what was budgeted.
+
+        The one check that does not go through the margin model, and so
+        the only one that can catch the model itself being wrong.  That is
+        not hypothetical: a ``future_initial_margin`` carrying the micro
+        contract's figure made every short straddle look a tenth as
+        expensive as CME charges, and the book was sized several times too
+        large with the sizing arithmetic, the entry log and the equity
+        curve all internally consistent and all wrong.  Nothing derived
+        from the model could have noticed.  This would have, within one
+        reconcile interval, because it asks the account.
+        """
+        assert self.strategy is not None
+        if self.strategy.halted:
+            return
+        try:
+            values = conn.account_values()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not read the account's margin (%s)", exc)
+            return
+        held = values.get("FullInitMarginReq")
+        nav = values.get("NetLiquidation")
+        if not held or not nav or nav <= 0:
+            return
+
+        limit = self.cfg.sizing.buying_power_pct * nav
+        if held <= limit:
+            return
+        self.strategy.halt_entries(
+            f"the broker is holding ${held:,.0f} of initial margin against a "
+            f"${nav:,.0f} account -- {held / nav:.0%}, past the "
+            f"{self.cfg.sizing.buying_power_pct:.0%} buying-power limit the book "
+            "is sized to. Either the margin model understates what this "
+            "position costs or something was opened outside it; both mean the "
+            "next entry would be sized off a number that is not true."
+        )
 
     def _read_positions(self, conn) -> tuple[list["_PositionRow"], list["_PositionRow"]]:
         """The account's positions in our two instruments, split by leg."""

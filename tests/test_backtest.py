@@ -288,13 +288,31 @@ class TestCorrectness:
             f"({abs(mean) / standard_error:.1f} standard errors from zero)"
         )
 
-    def test_the_option_and_hedge_legs_offset_each_other(self):
-        """Delta hedging converts the straddle into a pure vol bet: the two
-        legs must be strongly opposed, not independently profitable."""
+    def test_the_hedge_leg_is_a_first_order_contributor(self):
+        """Delta hedging converts the straddle into a vol bet, so the
+        outcome is not simply the option mark: the hedge leg has to be
+        doing at least as much of the work.
+
+        This used to assert the stronger ``option_pnl * hedge_pnl < 0`` --
+        that the two legs strictly oppose. That is not an invariant, and it
+        was passing on the strength of a mis-sized book: before the hedge
+        was charged for, this config opened 268 straddles on a $250k
+        account, tripped the daily loss limit repeatedly, and produced a
+        large negative option leg partly offset by hedging. Sized properly
+        the same twenty days leave both legs positive, and pinning either
+        regime on its own shows the long branch losing on *both* -- gamma
+        that realised vol did not pay for, which is an ordinary outcome and
+        not a defect. A strict sign rule holds for one hedged straddle held
+        to expiry, not for a sample of trades with stops and regime flips
+        in it.
+        """
         cfg = ungated(synthetic(days=20))
         cfg.costs.enabled = False
         m = run_backtest(cfg, source=pin_implied_vol(cfg)).metrics
-        assert m.option_pnl * m.hedge_pnl < 0, "legs did not offset"
+        assert m.option_pnl != 0 and m.hedge_pnl != 0
+        assert abs(m.hedge_pnl) > abs(m.option_pnl), (
+            "the hedge leg is a rounding error; the book is not being hedged"
+        )
 
     def test_the_two_regimes_carry_opposite_greeks(self):
         """The signature of the whole design: the long (negative-GEX) side
@@ -401,11 +419,14 @@ class TestHedgeBehaviour:
         """What the cap holds back is sent on the next pass rather than
         forgotten: no single hedge fill exceeds it, and the residual left
         behind is gone within a few bars."""
+        # Low enough that a properly sized book still reaches it: the
+        # book is charged for its hedge now, so it is a fraction of what
+        # it was and a 100-lot cap would never bind.
         cfg = synthetic(days=10)
-        cfg.hedge.max_hedge_contracts = 100
+        cfg.hedge.max_hedge_contracts = 5
         result = run_backtest(cfg)
         hedges = result.fills[result.fills["instrument"] == "hedge"]
-        assert (hedges["quantity"].abs() <= 100).all()
+        assert (hedges["quantity"].abs() <= 5).all()
         assert result.metrics.hedges > 0
         # The flatten on exit is sent in capped orders too, and says so.
         flattens = result.events[result.events["kind"] == "hedge_flatten"]

@@ -156,10 +156,16 @@ class FakeIb:
         self._positions = list(positions)
 
     def accountValues(self, *_):
-        return [
+        rows = [
             _AccountValue(tag, str(value), "USD", "DU1234567")
             for tag, value in self.account_values.items()
         ]
+        # The real one mixes currencies and non-numeric tags into the same
+        # list, and a reader that does not filter picks up whichever came
+        # last. Both are represented so a test can catch that.
+        rows.append(_AccountValue("AccountType", "INDIVIDUAL", "", "DU1234567"))
+        rows.append(_AccountValue("NetLiquidation", "1", "EUR", "DU1234567"))
+        return rows
 
     def accountSummary(self, *_):
         return self.accountValues()

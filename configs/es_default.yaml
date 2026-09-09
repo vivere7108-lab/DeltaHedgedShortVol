@@ -100,11 +100,12 @@ gates:
 sizing:
   # The book is sized to the margin limit, less a buffer. 80% of equity is
   # the buying power the strategy may commit -- short-straddle margin, long-
-  # straddle debit, and the hedge reserve all come out of it -- and the
-  # remaining 20% is never touched. With the 30% hedge reserve that is 56%
-  # of equity to the straddles and 24% to the MES hedge.
+  # straddle debit, and the margin on the futures needed to hedge it all
+  # come out of it -- and the remaining 20% is never touched. The hedge is
+  # charged per straddle at what it will actually cost (ten MES once the
+  # delta has run out), so on ES it is the larger half of the requirement
+  # and it is what decides the count.
   buying_power_pct: 0.80
-  hedge_margin_reserve_pct: 0.30
   min_straddles: 1
   max_straddles: 500          # a backstop against a sizing bug, not a limit
   margin_model: span_scan     # span_scan | reg_t | fixed

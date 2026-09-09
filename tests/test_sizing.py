@@ -9,7 +9,8 @@ from deltahedger.config import SizingConfig, VolConfig
 from deltahedger.sizing import (
     MIN_PLAUSIBLE_SCAN_PCT,
     FixedMarginModel, RegTMarginModel, SpanScanMarginModel,
-    build_margin_model, size_straddles, straddle_debit,
+    build_margin_model, hedge_contracts_per_straddle, size_straddles,
+    straddle_debit,
 )
 from deltahedger.volsurface import VolSurface
 
@@ -213,23 +214,56 @@ class TestBuyingPower:
         result = size_straddles(200_000, straddle(es), F, SHORT, SizingConfig(), es, span)
         assert result.budget == pytest.approx(160_000.0)
 
-    def test_a_reserve_is_held_back_for_the_hedge(self, es, span):
-        cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
-        result = size_straddles(200_000, straddle(es), F, SHORT, cfg, es, span)
-        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
+    @pytest.mark.parametrize("direction", [LONG, SHORT])
+    def test_the_hedge_is_charged_per_straddle(self, es, span, direction):
+        """The hedge leg needs margin whichever way the straddle is facing,
+        and it is charged at what it will cost rather than provisioned as a
+        fraction of anything."""
+        result = size_straddles(
+            200_000, straddle(es), F, direction, SizingConfig(), es, span
+        )
+        per_straddle = hedge_contracts_per_straddle(es) * span.hedge_margin(es)
+        assert result.hedge_margin_at_full_delta == pytest.approx(
+            result.contracts * per_straddle
+        )
 
-    def test_the_reserve_applies_to_the_long_side_too(self, es, span):
-        """The hedge leg needs margin whichever way the straddle is facing."""
-        cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
-        result = size_straddles(200_000, straddle(es), F, LONG, cfg, es, span)
-        assert result.option_budget == pytest.approx(160_000.0 * 0.75)
+    def test_the_budget_covers_the_straddles_and_their_hedge_together(
+        self, es, span
+    ):
+        """A straddle cannot be carried without the futures to hedge it, so
+        the two are one requirement against one budget."""
+        result = size_straddles(200_000, straddle(es), F, SHORT, SizingConfig(), es, span)
+        all_in = result.total_margin + result.hedge_margin_at_full_delta
+        assert all_in <= result.budget
+        # And the budget is used: one more straddle would not fit.
+        per_straddle = (
+            result.margin_per_contract
+            + hedge_contracts_per_straddle(es) * span.hedge_margin(es)
+        )
+        assert all_in + per_straddle > result.budget
+
+    def test_the_hedge_is_sized_at_the_delta_a_straddle_can_reach(self, es):
+        """Ten MES per ES straddle: 100 delta units per option contract, ten
+        per micro. The book is one strike and one expiry, so every straddle
+        in it reaches that delta at the same moment."""
+        assert hedge_contracts_per_straddle(es) == pytest.approx(10.0)
+
+    def test_the_deprecated_reserve_is_ignored_and_says_so(self, caplog):
+        """It held back a flat fraction and never compared it with the hedge
+        it stood behind: decoration in one direction, a silent cap in the
+        other."""
+        with caplog.at_level(logging.WARNING, logger="deltahedger.config"):
+            cfg = SizingConfig(hedge_margin_reserve_pct=0.25)
+            cfg.validate()
+        assert cfg.hedge_margin_reserve_pct is None
+        assert "deprecated" in caplog.text
 
     def test_the_default_cap_does_not_bind_at_an_ordinary_account_size(self, es, span):
         """The count is decided by the budget; max_straddles is a backstop
         against a sizing bug rather than a rule, so at a quarter-million
         account it must not be what sets the size."""
         result = size_straddles(250_000, straddle(es), F, SHORT, SizingConfig(), es, span)
-        assert result.ok and "capped" not in result.reason
+        assert result.ok and result.bound_by == "budget"
         assert result.contracts < SizingConfig().max_straddles
 
     @pytest.mark.parametrize("direction", [LONG, SHORT])

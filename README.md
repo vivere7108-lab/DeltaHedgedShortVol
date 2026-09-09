@@ -773,16 +773,20 @@ on a $250k account at the default sizing:
 
 ```
 moment                premium   SPAN margin   debit    straddles short / long
-0DTE at 09:35 (6.4h)    16.17       $16,791    $809                 8 / 173
-0DTE at 12:00 (4.0h)    12.79       $16,961    $639                 8 / 218
-1DTE at the roll        31.49       $16,026  $1,574                 8 /  88
-2DTE                    44.41       $15,379  $2,221                 9 /  63
+0DTE at 09:35 (6.4h)    16.17       $16,791    $809                 5 /  10
+0DTE at 12:00 (4.0h)    12.79       $16,961    $639                 5 /  10
+1DTE at the roll        31.49       $16,026  $1,574                 5 /  10
+2DTE                    44.41       $15,379  $2,221                 6 /  10
 ```
 
-So the same allocation buys a short book of roughly the same size all day
-and a long book an order of magnitude larger, because a short straddle is
-charged a several-hundred-point scan move and a long one only its premium.
-The two branches carry very different gamma — which is why "Band" in every backtest
+Both counts include **$17,600 of hedge margin per straddle** on top of the
+margin or debit column — ten MES once the straddle's delta has run out. A
+straddle cannot be carried without the futures to hedge it, so the two are
+one requirement against one budget, and on ES the hedge is the larger half
+of it. That is what keeps the counts flat across the table and the two
+branches within a factor of two: charged on the option leg alone, the same
+allocation would buy an order of magnitude more long straddles than short
+ones. The two branches still carry different gamma — which is why "Band" in every backtest
 summary reports the half-width and its width in points per branch (see "The
 delta band" above). A one-day scan is a conservative charge against a 0DTE
 position that will be flat by the bell, and exactly the horizon the rolled

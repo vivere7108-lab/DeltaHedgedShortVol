@@ -393,6 +393,128 @@ class TestPeriodicReconciliation:
         assert not runner.strategy.halted
 
 
+class TestEquityFromTheBroker:
+    """Sizing runs off the account's own value, not off a YAML file."""
+
+    def _with_account(self, tmp_path, monkeypatch, values, positions=(), **live):
+        runner = build_runner(tmp_path, **live)
+        patch_session(monkeypatch, runner)
+        runner.connection.ib.account_values = dict(values)
+        runner.connection.ib.set_positions(list(positions))
+        runner.connection.net_liquidation = (
+            lambda: values.get("NetLiquidation")
+        )
+        runner.connection.account_values = lambda: dict(values)
+        runner.connection.hedge_price = lambda: 5000.0
+        return runner
+
+    def test_the_book_is_sized_against_net_liquidation(self, tmp_path, monkeypatch):
+        """``starting_equity`` is a number in a config file, and the book's
+        equity is that number plus whatever *this process* has realised. A
+        reconnect rebuilds the strategy, so the realised part resets to
+        zero -- after a drawdown and the nightly gateway restart, the
+        strategy would size its next entry as though the loss had not
+        happened."""
+        runner = self._with_account(
+            tmp_path, monkeypatch, {"NetLiquidation": 180_000.0}
+        )
+        runner.run(max_cycles=1)
+        assert runner.strategy.portfolio.starting_equity == pytest.approx(180_000.0)
+
+    def test_an_adopted_hedge_is_not_counted_twice(self, tmp_path, monkeypatch):
+        """NetLiquidation already values open positions at market, so the
+        hedge's open P&L has to come back out or it is counted once inside
+        the broker's figure and again in ``unrealised``."""
+        runner = self._with_account(
+            tmp_path, monkeypatch, {"NetLiquidation": 180_000.0},
+            positions=[fake_position("FUT", "MES", 10, avg_cost=4900.0 * 5.0)],
+        )
+        runner.run(max_cycles=1)
+        book = runner.strategy.portfolio
+        # 10 MES bought at 4900, marked at 5000: $5,000 of open profit.
+        assert book.hedge.unrealised(5000.0, 5.0) == pytest.approx(5_000.0)
+        assert book.equity(None, 5000.0) == pytest.approx(180_000.0)
+
+    def test_a_missing_account_value_keeps_the_configured_equity(
+        self, tmp_path, monkeypatch
+    ):
+        runner = self._with_account(tmp_path, monkeypatch, {})
+        runner.run(max_cycles=1)
+        assert runner.strategy.portfolio.starting_equity == pytest.approx(250_000.0)
+
+    def test_an_account_read_that_raises_is_not_fatal(self, tmp_path, monkeypatch):
+        runner = build_runner(tmp_path)
+        patch_session(monkeypatch, runner)
+
+        def boom():
+            raise RuntimeError("no subscription")
+
+        runner.connection.net_liquidation = boom
+        runner.run(max_cycles=2)
+        assert runner._cycles == 2
+
+    def test_equity_is_not_rebased_while_a_straddle_is_open(
+        self, tmp_path, monkeypatch
+    ):
+        """With a position open the subtraction cannot be done -- the option
+        legs have no mark here -- so it waits until the book is flat. Entries
+        only happen when flat, so sizing always sees the broker's figure."""
+        runner = self._with_account(
+            tmp_path, monkeypatch, {"NetLiquidation": 180_000.0},
+            positions=_straddle_rows(-2),
+        )
+        runner.run(max_cycles=1)
+        assert runner.strategy.portfolio.straddle is not None
+        assert runner.strategy.portfolio.starting_equity == pytest.approx(250_000.0)
+
+
+class TestBrokerMarginGuard:
+    """The one check that does not go through the margin model."""
+
+    def _with_margin(self, tmp_path, monkeypatch, held, nav=250_000.0):
+        runner = build_runner(tmp_path, reconcile_seconds=0.001)
+        patch_session(monkeypatch, runner)
+        values = {"NetLiquidation": nav, "FullInitMarginReq": held}
+        runner.connection.account_values = lambda: dict(values)
+        runner.connection.net_liquidation = lambda: nav
+        runner.connection.hedge_price = lambda: 5000.0
+        return runner
+
+    def test_margin_past_the_buying_power_limit_halts_entries(
+        self, tmp_path, monkeypatch
+    ):
+        """What would have caught the original bug.
+
+        A ``future_initial_margin`` carrying the micro contract's figure
+        made every short straddle look a tenth as expensive as CME charges.
+        The book was sized several times too large with the sizing
+        arithmetic, the entry log and the equity curve all internally
+        consistent and all wrong -- nothing derived from the model could
+        have noticed. This asks the account instead.
+        """
+        runner = self._with_margin(tmp_path, monkeypatch, held=220_000.0)
+        runner.run(max_cycles=4)
+        assert runner.strategy.halted
+        assert "88%" in runner.strategy._halt_reason
+
+    def test_margin_inside_the_limit_is_left_alone(self, tmp_path, monkeypatch):
+        runner = self._with_margin(tmp_path, monkeypatch, held=120_000.0)
+        runner.run(max_cycles=4)
+        assert not runner.strategy.halted
+
+    def test_a_missing_margin_figure_is_not_treated_as_a_breach(
+        self, tmp_path, monkeypatch
+    ):
+        """Absent data is not evidence of anything; halting on it would
+        stop the walk whenever a subscription lapsed."""
+        runner = build_runner(tmp_path, reconcile_seconds=0.001)
+        patch_session(monkeypatch, runner)
+        runner.connection.account_values = lambda: {}
+        runner.connection.net_liquidation = lambda: None
+        runner.run(max_cycles=4)
+        assert not runner.strategy.halted
+
+
 class TestJournal:
     def test_it_writes_records_as_they_happen(self, tmp_path):
         """Flushed per record: a crash keeps everything up to the crash."""

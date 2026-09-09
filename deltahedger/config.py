@@ -169,10 +169,10 @@ class SizingConfig:
     absorbs variation margin and a margin call on a bad day.  The default
     leaves 20% untouched.
 
-    Within the allocation, ``hedge_margin_reserve_pct`` is held back for the
-    MES hedge, and the straddle count is what the rest buys at the
-    per-straddle requirement.  With the defaults that is 56% of equity to
-    the straddles, 24% reserved for the hedge, 20% buffer.
+    The straddle count is what that allocation buys at the *all-in*
+    per-straddle requirement: the option leg's margin or debit, plus the
+    margin on the futures the strategy will need to hedge it.  A straddle
+    cannot be carried without its hedge, so the two are one requirement.
     """
 
     #: Fraction of portfolio equity to allocate as buying power. It covers
@@ -186,9 +186,13 @@ class SizingConfig:
     max_straddles: int = 500
     #: Never open a position smaller than this.
     min_straddles: int = 1
-    #: Fraction of the buying-power budget held back for hedge margin and
-    #: variation margin. The straddle sizing sees the remainder.
-    hedge_margin_reserve_pct: float = 0.30
+    #: Deprecated, and ignored. It held back a flat fraction of the budget
+    #: for the hedge and never compared it with the hedge it stood behind,
+    #: so it was decoration in one direction and a silent cap in the other.
+    #: The hedge is now charged per straddle at what it will actually cost
+    #: -- see ``sizing.size_straddles`` -- which needs no fraction to be
+    #: chosen and cannot be mis-set. Left in place so existing configs load.
+    hedge_margin_reserve_pct: float | None = None
     #: Margin model: "span_scan", "reg_t" or "fixed". See ``sizing.py`` --
     #: "span_scan" reproduces CME SPAN methodology and is the right default
     #: for futures options; "reg_t" is the equity-option rule and will
@@ -210,8 +214,16 @@ class SizingConfig:
     def validate(self) -> None:
         if not 0.0 < self.buying_power_pct <= 1.0:
             raise ValueError("sizing.buying_power_pct must be in (0, 1]")
-        if not 0.0 <= self.hedge_margin_reserve_pct < 1.0:
-            raise ValueError("sizing.hedge_margin_reserve_pct must be in [0, 1)")
+        if self.hedge_margin_reserve_pct is not None:
+            log.warning(
+                "sizing.hedge_margin_reserve_pct (%.2f) is deprecated and is "
+                "being ignored. The hedge is now charged per straddle at what "
+                "it will actually cost and budgeted alongside the option leg, "
+                "so there is no fraction left to choose. Remove it from the "
+                "config; buying_power_pct is the lever.",
+                self.hedge_margin_reserve_pct,
+            )
+            self.hedge_margin_reserve_pct = None
         if self.margin_model not in ("span_scan", "reg_t", "fixed"):
             raise ValueError(
                 "sizing.margin_model must be one of 'span_scan', 'reg_t', 'fixed'"

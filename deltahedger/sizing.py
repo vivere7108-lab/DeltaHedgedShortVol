@@ -2,10 +2,24 @@
 
 The number of straddles is driven by buying power, not by the delta target:
 ``buying_power_pct`` (80% by default -- the margin limit less a 20% buffer)
-of portfolio equity is the budget, part of it is reserved for the hedge
-leg, and the remainder divided by the per-straddle requirement gives the
-count.  The delta band then absorbs whatever delta that position happens
-to carry.
+of portfolio equity is the budget, and the count is what that buys at the
+*all-in* per-straddle requirement.  The delta band then absorbs whatever
+delta the position happens to carry.
+
+All in means the option leg **and its hedge**.  A straddle cannot be
+carried without the futures to hedge it -- ten MES per ES straddle once
+the delta has run out -- so the two are one requirement against one
+budget.  On ES the hedge is the larger half of it, and therefore the thing
+that decides the size of the book.
+
+This replaced a split into an option budget and a flat
+``hedge_margin_reserve_pct`` reserve, which was worse than no split at
+all.  The reserve was never compared with the hedge it stood behind, so
+raising it capped the book for no reason and lowering it left a book that
+could not afford to hedge itself; the count peaked where the two happened
+to bind together and fell away on both sides of it, which is a knob whose
+correct setting has to be solved for.  Charging the hedge per straddle
+needs no fraction to be chosen and cannot be mis-set.
 
 The requirement means different things in the two regimes, and conflating
 them would misstate the risk in both directions:
@@ -64,20 +78,22 @@ is close to flat across the range (measured at 5000, 15 vol, a 250k
 account at the default sizing)::
 
     moment                premium   SPAN margin   debit   straddles short / long
-    0DTE at 09:35 (6.4h)    16.17       $16,791    $809                8 / 173
-    0DTE at 12:00 (4.0h)    12.79       $16,961    $639                8 / 218
-    1DTE at the roll        31.49       $16,026  $1,574                8 /  88
-    2DTE                    44.41       $15,379  $2,221                9 /  63
+    0DTE at 09:35 (6.4h)    16.17       $16,791    $809                5 /  10
+    0DTE at 12:00 (4.0h)    12.79       $16,961    $639                5 /  10
+    1DTE at the roll        31.49       $16,026  $1,574                5 /  10
+    2DTE                    44.41       $15,379  $2,221                6 /  10
 
-The **long branch is a different story**, because its requirement is the
-debit and the debit roughly doubles between the morning's 0DTE entry and
-the afternoon's 1DTE roll.  The two branches are therefore not remotely
-comparable in size: a short straddle is charged a scan move worth several
-hundred points, a long one only the premium, so the same budget buys an
-order of magnitude more long straddles than short ones.  That is a
-property of the requirement rather than of the signal, and the backtest's
-band section reports median gamma and band per branch so a regime
-comparison cannot mistake it for one.
+Both counts are with the $17,600 of hedge margin per straddle added to the
+figure in the margin or debit column, which is why they move so little
+across the table and why the two branches are within a factor of two of
+each other.  Charged on the option leg alone they would not be: a short
+straddle is margined against a scan move worth several hundred points and
+a long one costs only its premium, so the same budget would buy an order
+of magnitude more long straddles than short ones.  The hedge is the same
+for both -- it is a property of the delta, not of the direction -- and it
+dominates, which is what makes the two branches comparable at all.  The
+backtest's band section still reports median gamma and band per branch so
+a regime comparison can see what is left of the difference.
 
 A one-day scan is a conservative charge against a 0DTE position that will
 be flat by the bell, and exactly the horizon a rolled 1DTE position is
@@ -345,6 +361,14 @@ class SizingResult:
     option_budget: float
     direction: int = 0
     reason: str = ""
+    #: What the hedge for this book will cost once the straddle's delta has
+    #: run all the way out -- part of what the budget had to cover, not an
+    #: afterthought to it.
+    hedge_margin_at_full_delta: float = 0.0
+    #: Which constraint decided the count: "budget" or "max_straddles".
+    #: Worth reporting rather than inferring, because the two mean
+    #: different things about what to change.
+    bound_by: str = ""
 
     @property
     def ok(self) -> bool:
@@ -353,6 +377,23 @@ class SizingResult:
     @property
     def requirement_kind(self) -> str:
         return "debit" if self.direction > 0 else "margin"
+
+
+def hedge_contracts_per_straddle(source: RiskSource) -> float:
+    """Hedge contracts one straddle needs once its delta has run out.
+
+    A straddle's delta is bounded by one contract's worth either way -- it
+    is zero at the money and goes to +/-1 as one leg finishes in the money
+    -- so this is the whole hedge a straddle can ever demand.  For ES
+    against MES it is ten: 100 delta units per option contract, ten per
+    micro.
+
+    It is not a pessimistic reading.  The book is one strike and one
+    expiry, so every straddle in it reaches that delta at the same moment,
+    and the SPAN scan the short branch is margined against is a move large
+    enough to take a same-day straddle there.
+    """
+    return source.delta_units_per_contract(source.option) / source.hedge_quantum
 
 
 def size_straddles(
@@ -376,24 +417,39 @@ def size_straddles(
         return SizingResult(0, 0.0, 0.0, 0.0, 0.0, 0, "no direction to size")
 
     budget = max(equity, 0.0) * cfg.buying_power_pct
-    option_budget = budget * (1.0 - cfg.hedge_margin_reserve_pct)
     per_contract = model.straddle_requirement(quote, future_price, source, direction)
     kind = "debit" if direction > 0 else "margin"
 
-    if per_contract <= 0.0:
+    # The hedge is charged per straddle, at what it will actually cost.
+    # A straddle cannot be carried without the futures to hedge it, so the
+    # two are one requirement and are budgeted as one -- see the module
+    # docstring for why the old split into an option budget and a flat
+    # hedge reserve was worse than no split at all.
+    per_straddle_hedge = hedge_contracts_per_straddle(source)
+    hedge_per_contract = per_straddle_hedge * model.hedge_margin(source)
+    requirement = per_contract + hedge_per_contract
+
+    if requirement <= 0.0:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget, direction,
+            0, per_contract, 0.0, budget, budget, direction,
             f"the {kind} model returned a non-positive requirement",
         )
 
-    raw = int(option_budget // per_contract)
-    contracts = min(raw, cfg.max_straddles)
+    from_budget = int(budget // requirement)
+    contracts = min(from_budget, cfg.max_straddles)
+    bound_by = "max_straddles" if contracts < from_budget else "budget"
+    hedge_margin = contracts * hedge_per_contract
+    option_budget = budget - hedge_margin
+
     if contracts < cfg.min_straddles:
         return SizingResult(
-            0, per_contract, 0.0, budget, option_budget, direction,
-            f"buying power supports {raw} straddles, minimum is "
-            f"{cfg.min_straddles} (${per_contract:,.0f} {kind} each vs "
-            f"${option_budget:,.0f} available)",
+            0, per_contract, 0.0, budget, budget, direction,
+            f"buying power supports {from_budget} straddles, minimum is "
+            f"{cfg.min_straddles} (${per_contract:,.0f} {kind} plus "
+            f"${hedge_per_contract:,.0f} of hedge margin each -- "
+            f"${requirement:,.0f} all in -- vs ${budget:,.0f} available)",
+            hedge_margin_at_full_delta=hedge_per_contract,
+            bound_by="budget",
         )
     return SizingResult(
         contracts=contracts,
@@ -402,5 +458,7 @@ def size_straddles(
         budget=budget,
         option_budget=option_budget,
         direction=direction,
-        reason="capped by max_straddles" if raw > contracts else "",
+        reason="capped by max_straddles" if bound_by == "max_straddles" else "",
+        hedge_margin_at_full_delta=hedge_margin,
+        bound_by=bound_by,
     )

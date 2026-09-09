@@ -37,7 +37,6 @@ gex:
 
 sizing:
   buying_power_pct: 0.80           # the margin limit less a 20% buffer
-  hedge_margin_reserve_pct: 0.30
   max_straddles: 500
 
 strategy:
