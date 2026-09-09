@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from deltahedger.config import Config
-from deltahedger.gex import StrikeOpenInterest
 from deltahedger.live.journal import (
     JournallingStrategy,
     SessionJournal,
@@ -21,73 +20,12 @@ from deltahedger.live.journal import (
 )
 from deltahedger.live.runner import LiveRunner
 
+pytest.importorskip("ib_async", reason="the live path is an optional extra")
+
+from fakes import FakeConnection, FakeOpenInterest, fake_position  # noqa: E402
+
 NY = ZoneInfo("America/New_York")
 OPEN = datetime(2025, 6, 10, 10, 0, tzinfo=NY)
-
-
-class FakeIb:
-    """Just enough ib_async to drive the runner's loop."""
-
-    def __init__(self, drop_after: int | None = None):
-        self.drop_after = drop_after
-        self.sleeps = 0
-        self._connected = False
-
-    def connect(self, *_, **__):
-        self._connected = True
-
-    def disconnect(self):
-        self._connected = False
-
-    def isConnected(self):
-        return self._connected
-
-    def managedAccounts(self):
-        return ["DU1234567"]
-
-    def reqMarketDataType(self, *_):
-        pass
-
-    def positions(self, *_):
-        return []
-
-    def sleep(self, _seconds):
-        self.sleeps += 1
-        if self.drop_after is not None and self.sleeps >= self.drop_after:
-            self._connected = False  # the daily gateway restart
-
-
-class FakeConnection:
-    """Stands in for IbkrConnection: connects, prices, never talks to TWS."""
-
-    def __init__(self, cfg, source, drop_after=None, price=5000.0):
-        self.cfg = cfg
-        self.source = source
-        self.account = "DU1234567"
-        self.price = price
-        self.ib = FakeIb(drop_after)
-        self.connects = 0
-
-    def __enter__(self):
-        self.ib.connect()
-        self.connects += 1
-        return self
-
-    def __exit__(self, *_):
-        self.ib.disconnect()
-
-    def future_price(self):
-        if not self.ib.isConnected():
-            raise ConnectionError("not connected")
-        return self.price
-
-
-class FakeOpenInterest:
-    def open_interest(self, moment, future_price, expiry):
-        return [
-            StrikeOpenInterest(future_price + 5.0 * i, 4000.0, 200.0)
-            for i in range(-20, 21)
-        ]
 
 
 def build_runner(tmp_path, drop_after=None, **live):
@@ -183,6 +121,82 @@ class TestReconnection:
         start = time_module.monotonic()
         runner._sleep(30.0)
         assert time_module.monotonic() - start < 1.0
+
+
+class TestReconciliation:
+    """What the runner does about positions it finds already open.
+
+    Characterised, not endorsed: the refusal below is the single most
+    severe open defect in the system, and Phase 2 is what changes it.
+    """
+
+    def _reconciled(self, tmp_path, monkeypatch, positions, **live):
+        runner = build_runner(tmp_path, **live)
+        patch_session(monkeypatch, runner)
+        runner.connection.ib.set_positions(positions)
+        return runner
+
+    def test_an_existing_hedge_is_adopted_at_its_average_price(
+        self, tmp_path, monkeypatch
+    ):
+        """Starting with a stale in-memory book is how a hedger doubles a
+        position, so the broker's hedge leg is taken as the truth."""
+        runner = self._reconciled(
+            tmp_path, monkeypatch,
+            # IBKR reports avgCost for a future as price x multiplier.
+            [fake_position("FUT", "MES", -12, avg_cost=5000.0 * 5.0)],
+        )
+        runner.run(max_cycles=1)
+        hedge = runner.strategy.portfolio.hedge
+        assert hedge.quantity == -12
+        assert hedge.avg_price == pytest.approx(5000.0)
+
+    def test_an_unrelated_symbol_is_left_alone(self, tmp_path, monkeypatch):
+        runner = self._reconciled(
+            tmp_path, monkeypatch, [fake_position("FUT", "NQ", 3, avg_cost=100.0)]
+        )
+        runner.run(max_cycles=1)
+        assert runner.strategy.portfolio.hedge.quantity == 0
+
+    def test_an_existing_option_position_is_refused(self, tmp_path, monkeypatch):
+        """The runner will not adopt option legs it did not open: a
+        half-known straddle is worse than none."""
+        runner = self._reconciled(
+            tmp_path, monkeypatch, [fake_position("FOP", "ES", -8)],
+            max_reconnect_attempts=2,
+        )
+        with pytest.raises(RuntimeError, match="unmanaged option position"):
+            runner.run(max_cycles=5)
+
+    def test_that_refusal_is_retried_as_though_it_were_a_dropped_socket(
+        self, tmp_path, monkeypatch
+    ):
+        """The deadlock, pinned. Phase 2 is what fixes it.
+
+        The refusal above raises out of ``_run_connected``, where the
+        reconnect loop catches it as a connection failure and retries. It
+        is not one: reconnecting cannot change what positions the account
+        holds, so every attempt fails identically. With the shipped
+        ``max_reconnect_attempts: null`` the runner spins forever at a
+        300-second backoff.
+
+        The position it is refusing to adopt is, on the shipped config,
+        *its own* -- the strategy rolls into tomorrow's series and carries
+        it overnight, and IBKR force-restarts the gateway every night. So
+        this fires on the ordinary path, and the whole time it is spinning
+        there is an open straddle nobody is hedging.
+        """
+        runner = self._reconciled(
+            tmp_path, monkeypatch, [fake_position("FOP", "ES", -8)],
+            max_reconnect_attempts=4,
+        )
+        with pytest.raises(RuntimeError):
+            runner.run(max_cycles=50)
+
+        assert runner.connection.connects == 4, "it retried a refusal it cannot resolve"
+        assert runner._cycles == 0, (
+            "the runner never polled, so the open straddle was never hedged"
+        )
 
 
 class TestJournal:
