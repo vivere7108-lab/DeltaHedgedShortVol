@@ -1015,6 +1015,21 @@ backtest never sees, and produce evidence that outlives it.
   quietly falls back to the prior.
 - **A heartbeat every five minutes**, so a quiet log and a stalled process
   can be told apart.
+- **The Databento session replays the day.** The open-interest print is a
+  once-a-session message, published after overnight clearing, so a runner
+  restarted at 09:49 that subscribed from "now" would never see it and
+  would read zero GEX all day — indistinguishable in the log from a neutral
+  market. Every subscription asks for intraday replay, and a root that
+  turns up after the session started (tomorrow's series, at the roll)
+  restarts the session with every root replayed rather than joining it
+  blind.
+- **Equity and margin are read in the account's base currency and
+  converted.** IBKR reports `NetLiquidation` in the base, which is not
+  always the dollar; an AUD figure read as USD would size an ES book a
+  third too large. `IbkrConnection.account_values` finds the base from the
+  currency whose exchange rate is exactly 1 and divides by the dollar's,
+  and reports nothing monetary — so sizing stays on the configured equity,
+  loudly — when there is no dollar rate to convert at.
 - **The loop does not stop at the bell.** The rolled position is carried
   overnight, so `LiveRunner` keeps polling and hedging (under the widened
   overnight band) for as long as anything is open, honours a pre-market

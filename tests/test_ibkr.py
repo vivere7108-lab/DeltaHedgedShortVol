@@ -34,7 +34,7 @@ from deltahedger.broker.ibkr import (  # noqa: E402
     _pick_price,
     _round_to_tick,
 )
-from fakes import FakeIb, FakeTicker, OrderOutcome, fake_ticker  # noqa: E402
+from fakes import FakeIb, FakeTicker, OrderOutcome, _AccountValue, fake_ticker  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
 NOW = datetime(2025, 6, 10, 10, 0, tzinfo=NY)
@@ -495,3 +495,72 @@ class TestOptionContracts:
         conn.ib.qualifyContracts = lambda *_: []
         with pytest.raises(ExecutionError, match="could not qualify"):
             conn.option_contract(EXPIRY, 4321.0, "C")
+
+
+class TestAccountValues:
+    """IBKR reports equity and margin in the account's *base* currency,
+    which is not always the dollar. The reader has to say which it is
+    reading and convert, because an AUD NetLiquidation read as USD sizes
+    an ES book a third too large."""
+
+    @staticmethod
+    def _rows(*rows):
+        return [_AccountValue(tag, str(value), currency, "DU1234567") for tag, value, currency in rows]
+
+    def test_a_dollar_account_reads_straight_through(self, conn):
+        conn.ib.accountValues = lambda *_: self._rows(
+            ("ExchangeRate", 1.0, "USD"),
+            ("NetLiquidation", 180_000.0, "USD"),
+            ("FullInitMarginReq", 40_000.0, "USD"),
+            ("Cushion", 0.5, ""),
+            ("AccountType", "INDIVIDUAL", ""),
+            ("NetLiquidation", 1.0, "EUR"),
+        )
+
+        values = conn.account_values()
+
+        assert values["NetLiquidation"] == 180_000.0
+        assert values["FullInitMarginReq"] == 40_000.0
+        assert values["Cushion"] == 0.5
+        assert "AccountType" not in values
+        assert conn.net_liquidation() == 180_000.0
+
+    def test_a_dollar_account_with_no_rate_rows_still_reads(self, conn):
+        conn.ib.accountValues = lambda *_: self._rows(("NetLiquidation", 180_000.0, "USD"))
+
+        assert conn.net_liquidation() == 180_000.0
+
+    def test_a_foreign_base_currency_is_converted_at_the_dollar_rate(self, conn):
+        # An Australian-domiciled paper account: AUD is the base, and IBKR
+        # quotes the dollar at 1.3843 AUD. 30,857 AUD is 22,291 USD.
+        conn.ib.accountValues = lambda *_: self._rows(
+            ("ExchangeRate", 1.0, "AUD"),
+            ("ExchangeRate", 1.0, "BASE"),
+            ("ExchangeRate", 1.3842938, "USD"),
+            ("NetLiquidation", 30_856.78, "AUD"),
+            ("FullInitMarginReq", 28_058.26, "AUD"),
+            ("NetLiquidationByCurrency", -676_164.04, "USD"),
+            ("Cushion", 0.09, ""),
+        )
+
+        values = conn.account_values()
+
+        assert values["NetLiquidation"] == pytest.approx(22_290.9, abs=1.0)
+        assert values["FullInitMarginReq"] == pytest.approx(20_269.3, abs=1.0)
+        assert values["Cushion"] == 0.09  # unitless, untouched
+        # A per-currency breakdown row in dollars is not the base figure.
+        assert "NetLiquidationByCurrency" not in values
+        assert conn.net_liquidation() == pytest.approx(22_290.9, abs=1.0)
+
+    def test_a_foreign_base_with_no_dollar_rate_reports_nothing_monetary(self, conn, caplog):
+        conn.ib.accountValues = lambda *_: self._rows(
+            ("ExchangeRate", 1.0, "AUD"),
+            ("NetLiquidation", 30_856.78, "AUD"),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            values = conn.account_values()
+
+        assert values == {}
+        assert conn.net_liquidation() is None
+        assert "base currency is AUD" in caplog.text

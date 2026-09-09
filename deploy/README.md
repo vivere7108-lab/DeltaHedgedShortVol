@@ -271,6 +271,8 @@ an event it already handles.
 | Strategy process dies | systemd restarts it after 30s; it re-reconciles positions against the broker rather than trusting a stale book. |
 | VPS reboot | Both units are enabled, so both come back. IBKR may want 2FA. |
 | Journal write fails | Logged as an error; **trading continues**. Losing the log must not take the position with it. |
+| Restart after the morning's open-interest print | The Databento subscriptions replay the session (up to a day), so the print, the definitions and the tape so far arrive on connect rather than at the next morning's clearing. |
+| Paper account in a non-USD base currency | Equity and margin are converted at IBKR's dollar rate before sizing. An account with no dollar rate at all keeps the configured equity and says so. |
 | An option position it did not open | Refuses to start. Adopting a half-known straddle is how a book ends up long gamma while the strategy believes it is short it. |
 
 Restart limits are deliberate on both units (5 starts per 10 minutes). A
@@ -315,6 +317,22 @@ Do it outside market hours. A restart mid-session is safe — positions are
 re-read from the broker — but it drops the in-memory session P&L baselines
 the position-P&L exits are measured against, so an open long straddle would
 have its stop reset.
+
+## The paper account has to be able to carry one straddle
+
+The sizing charges each ES straddle its option margin or debit **plus the
+margin on the ten MES that hedge it once the delta has run out** — about
+$17,600 of hedge margin per straddle on top of the option leg. So
+`buying_power_pct` of the account's NetLiquidation has to cover at least
+one all-in straddle, roughly $19k for a long and $35k for a short at
+today's margins, or every entry is skipped with `buying power supports 0
+straddles` in the journal. An IBKR paper account that has drifted to a few
+tens of thousands, or one carrying a large negative cash balance in one
+currency against cash in another, will do exactly that; **reset the paper
+account** from Account Management (it comes back at the base-currency
+equivalent of $1M, flat) before starting a walk, and check that the
+runner's `sizing against the account: NetLiquidation` log line says a
+number the strategy can trade.
 
 ## Before you read anything into the results
 

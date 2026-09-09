@@ -177,23 +177,65 @@ class IbkrConnection:
     # -- account ---------------------------------------------------------
 
     def account_values(self) -> dict[str, float]:
-        """The account's numeric summary tags, in the base currency.
+        """The account's numeric summary tags, in US dollars.
 
         ``NetLiquidation`` is what the strategy should be sized against --
         the account's own value, rather than a number typed into a config
         file that a reconnect resets it to. ``FullInitMarginReq`` is what
         the broker is actually holding against the book, which is the only
         independent check there is on the margin model being right.
+
+        IBKR reports both in the account's *base* currency, and that is not
+        always the dollar: an Australian-domiciled account reports an AUD
+        NetLiquidation, and reading it as dollars sizes an ES book a third
+        too large.  The base is the currency whose ``ExchangeRate`` is
+        exactly 1, and every base-currency figure is divided by the dollar's
+        rate (base units per dollar) on the way out.  An account whose base
+        is not the dollar and which reports no dollar rate cannot be
+        converted, and reports nothing monetary rather than something
+        mislabelled -- the caller then stays on the configured equity and
+        says so.
         """
-        values: dict[str, float] = {}
-        for row in self.ib.accountValues(self.account):
-            currency = getattr(row, "currency", "")
-            if currency not in ("", "USD", "BASE"):
+        rows = list(self.ib.accountValues(self.account))
+        rates: dict[str, float] = {}
+        for row in rows:
+            if row.tag != "ExchangeRate" or row.currency in ("", "BASE"):
                 continue
             try:
-                values[row.tag] = float(row.value)
+                rates[row.currency] = float(row.value)
+            except (TypeError, ValueError):
+                continue
+        if rates.get("USD") == 1.0 or not rates:
+            base = "USD"
+        else:
+            base = next((c for c, r in rates.items() if r == 1.0), "USD")
+        to_usd = 1.0 if base == "USD" else rates.get("USD")
+        if to_usd is None or to_usd <= 0.0:
+            if not getattr(self, "_warned_base", False):
+                self._warned_base = True
+                log.warning(
+                    "the account's base currency is %s and IBKR reports no USD "
+                    "exchange rate, so its equity and margin cannot be read in "
+                    "dollars; sizing stays on the configured equity", base,
+                )
+            return {}
+        if base != "USD" and not getattr(self, "_reported_base", False):
+            self._reported_base = True
+            log.info(
+                "the account's base currency is %s; equity and margin are read "
+                "at %.4f %s per USD", base, to_usd, base,
+            )
+
+        values: dict[str, float] = {}
+        for row in rows:
+            currency = getattr(row, "currency", "")
+            if currency not in ("", base, "BASE"):
+                continue
+            try:
+                value = float(row.value)
             except (TypeError, ValueError):
                 continue  # several tags are strings by design
+            values[row.tag] = value / to_usd if currency else value
         return values
 
     def net_liquidation(self) -> float | None:

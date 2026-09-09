@@ -75,10 +75,11 @@ class FakeLive:
     def __init__(self):
         self.subscriptions: list[tuple] = []
         self.started = False
+        self.stopped = False
         self.start_call_count = 0
 
-    def subscribe(self, dataset, schema, stype_in, symbols):
-        self.subscriptions.append((dataset, schema, stype_in, symbols))
+    def subscribe(self, dataset, schema, stype_in, symbols, start=None):
+        self.subscriptions.append((dataset, schema, stype_in, symbols, start))
 
     def add_callback(self, *_a, **_kw):
         pass
@@ -89,6 +90,10 @@ class FakeLive:
 
     def stop(self):
         self.started = False
+        self.stopped = True
+
+    def block_for_close(self, timeout=None):
+        pass
 
 
 @pytest.fixture
@@ -276,15 +281,89 @@ class TestEnsureSubscribed:
 
     def test_a_different_root_gets_its_own_subscription(self, session):
         session._live = FakeLive()
+        session._new_client = FakeLive
         conn = FakeConnection(session.source, trading_class="E2B")
         session.ensure_subscribed(EXPIRY, conn)
+        first = session._live
 
         conn2 = FakeConnection(session.source, trading_class="E2C")
         session.ensure_subscribed(OTHER_EXPIRY, conn2)
 
         assert session._root_by_expiry == {EXPIRY: "E2B", OTHER_EXPIRY: "E2C"}
+        # Databento only replays subscriptions made before a session starts,
+        # so the second root is served by a new session carrying both.
+        assert first.stopped
+        assert session._live is not first
+        assert {s[3] for s in session._live.subscriptions} == {"E2B.OPT", "E2C.OPT"}
         assert len(session._live.subscriptions) == 6
-        assert session._live.start_call_count == 1  # still only once
+        assert session._live.start_call_count == 1
+
+
+class TestReplay:
+    """A runner restarted mid-session must still see the morning's
+    open-interest print, which was published before it subscribed."""
+
+    def test_every_subscription_asks_for_the_full_intraday_replay(self, session):
+        session._live = FakeLive()
+        conn = FakeConnection(session.source, trading_class="E2B")
+
+        session.ensure_subscribed(EXPIRY, conn)
+
+        assert [s[4] for s in session._live.subscriptions] == [0, 0, 0]
+
+    def test_a_late_root_replays_every_root_not_just_the_new_one(self, session):
+        session._live = FakeLive()
+        session._new_client = FakeLive
+        session.ensure_subscribed(EXPIRY, FakeConnection(session.source, trading_class="E2B"))
+
+        session.ensure_subscribed(
+            OTHER_EXPIRY, FakeConnection(session.source, trading_class="E2C")
+        )
+
+        assert all(s[4] == 0 for s in session._live.subscriptions)
+        assert session._live.started
+
+    def test_a_restart_keeps_the_prints_but_drops_what_the_replay_rebuilds(self, session):
+        session._live = FakeLive()
+        session._new_client = FakeLive
+        session.ensure_subscribed(EXPIRY, FakeConnection(session.source, trading_class="E2B"))
+        with session._lock:
+            session._definitions[1] = _Definition(strike=5000.0, right="C", expiry=EXPIRY)
+            session._oi[1] = (877.0, 1_000)
+            session._flow[1] = 40.0
+            session._trades[EXPIRY] = [buffered(1)]
+            session._dropped_trades = 3
+
+        session.ensure_subscribed(
+            OTHER_EXPIRY, FakeConnection(session.source, trading_class="E2C")
+        )
+
+        # The print and the definition survive: a replayed print overwrites
+        # them and the read never goes dark across the switch.
+        assert session._definitions[1].strike == 5000.0
+        assert session._oi[1] == (877.0, 1_000)
+        # The flow since the print and the buffered tape do not: the replay
+        # re-delivers the trades behind both, and keeping them would count
+        # every one twice.
+        assert session._flow == {}
+        assert session._trades == {}
+        assert session._dropped_trades == 0
+
+    def test_an_old_client_that_will_not_close_does_not_block_the_restart(self, session):
+        class Stubborn(FakeLive):
+            def stop(self):
+                raise RuntimeError("socket already gone")
+
+        session._live = Stubborn()
+        session._new_client = FakeLive
+        session.ensure_subscribed(EXPIRY, FakeConnection(session.source, trading_class="E2B"))
+
+        session.ensure_subscribed(
+            OTHER_EXPIRY, FakeConnection(session.source, trading_class="E2C")
+        )
+
+        assert session._live.started
+        assert len(session._live.subscriptions) == 6
 
     def test_a_missing_trading_class_from_ibkr_is_a_loud_error(self, session):
         session._live = FakeLive()

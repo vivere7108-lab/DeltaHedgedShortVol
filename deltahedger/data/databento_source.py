@@ -65,6 +65,23 @@ runs the connection's I/O on a background thread it manages internally
 (see ``databento.Live``'s docstring); this module's job is to keep the
 caches consistent under a lock while that thread writes to them and the
 live runner's poll loop reads them.
+
+Every subscription asks for **intraday replay** (``start=0``: everything
+the gateway still holds, up to a day). The open-interest print is a
+once-a-session message, published after overnight clearing; a session
+subscribed from "now" -- which is what a runner restarted at 09:49 does --
+would never see it, and the strategy would read zero GEX, stand aside all
+day, and look in the log exactly like a market reading neutral. Replay
+hands the morning's print, the definitions and the day's tape to a
+process that started after them. Databento only honours ``start`` on
+subscriptions made before the session starts, so a root that turns up
+later -- tomorrow's series, at the roll -- is handled by stopping the
+session and opening a new one with every root subscribed from the start
+again (``_restart_with_replay``). The replay covers the gap that costs;
+the flow and the buffered tape are cleared first so nothing the old
+session already counted is counted again when it is replayed, while the
+open-interest prints and definitions are kept, because a replayed print
+simply overwrites the one held and the read never goes dark.
 """
 
 from __future__ import annotations
@@ -104,6 +121,7 @@ class DatabentoSession:
         self._root_by_expiry: dict[date, str] = {}
         self._subscribed_roots: set[str] = set()
         self._live = None
+        self._key: str | None = None
         self._started = False
         self._warned_expiries: set[date] = set()
         #: Executions kept for ``DatabentoTradeFeed``, per expiry, oldest
@@ -131,15 +149,27 @@ class DatabentoSession:
                 f"set {self.cfg.api_key_env} to a Databento API key with "
                 f"{self.cfg.dataset} entitlement"
             )
-        # Imported here, after the key check, so a missing key is reported
-        # plainly even when the optional `databento` extra isn't installed.
+        self._key = key
+        self._live = self._new_client()
+
+    def _new_client(self):
+        """A fresh ``databento.Live`` with this session's callbacks attached.
+
+        One place, because the session builds a client twice: at ``start``
+        and again in ``_restart_with_replay`` when a new root has to be
+        subscribed with replay after the first client is already running.
+        """
+        # Imported here, after the key check in ``start``, so a missing key
+        # is reported plainly even when the optional `databento` extra
+        # isn't installed.
         import databento as db
 
-        self._live = db.Live(
-            key=key,
+        live = db.Live(
+            key=self._key,
             reconnect_policy="reconnect" if self.cfg.reconnect else "none",
         )
-        self._live.add_callback(self._on_record, self._on_error)
+        live.add_callback(self._on_record, self._on_error)
+        return live
 
     def close(self) -> None:
         if self._live is not None and self._started:
@@ -187,22 +217,73 @@ class DatabentoSession:
             self._subscribed_roots.add(root)
         self._subscribe_root(root)
 
+    #: Seconds to wait for the old client to close in a restart before the
+    #: new one is started on top of it.
+    RESTART_TIMEOUT = 10.0
+
     def _subscribe_root(self, root: str) -> None:
+        if self._started:
+            # Databento honours ``start`` only on subscriptions made before
+            # the session starts, and this root's print is already in the
+            # past -- so the session is rebuilt with every root replayed
+            # rather than this one subscribed from now and left blind.
+            self._restart_with_replay(root)
+            return
+        self._subscribe(self._live, root)
+        self._live.start()
+        self._started = True
+        log.info(
+            "databento subscribed to %s.OPT with intraday replay (dataset=%s)",
+            root, self.cfg.dataset,
+        )
+
+    def _subscribe(self, live: Any, root: str) -> None:
         parent = f"{root}.OPT"
         for schema in ("definition", "statistics", "trades"):
-            self._live.subscribe(
+            live.subscribe(
                 dataset=self.cfg.dataset,
                 schema=schema,
                 stype_in="parent",
                 symbols=parent,
+                # Everything the gateway still holds, up to a day: the
+                # morning's open-interest print above all, which a session
+                # opened after it would otherwise never see.
+                start=0,
             )
-        # .start() may only be called once, after at least one subscription
-        # exists; later roots just add more subscriptions to the same
-        # already-running session.
-        if not self._started:
-            self._live.start()
-            self._started = True
-        log.info("databento subscribed to %s (dataset=%s)", parent, self.cfg.dataset)
+
+    def _restart_with_replay(self, root: str) -> None:
+        """Replace the running client with one that replays every root.
+
+        The old client is stopped *before* the caches are touched, so a
+        trade it delivers on the way out is either counted once by it or
+        once by the replay, never by both.  What the replay will rebuild --
+        the signed flow since each print and the buffered tape -- is
+        cleared; what it will merely overwrite -- the prints and the
+        definitions -- is kept, so ``rows`` never reads empty across the
+        switch.  The replay then re-delivers everything from the gateway's
+        buffer, the gap included.
+        """
+        old = self._live
+        try:
+            old.stop()
+            old.block_for_close(timeout=self.RESTART_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - the old client is being discarded
+            log.warning("databento: the old session did not close cleanly (%s)", exc)
+        with self._lock:
+            roots = sorted(self._subscribed_roots)
+            self._flow.clear()
+            self._trades.clear()
+            self._dropped_trades = 0
+        live = self._new_client()
+        self._live = live
+        for each in roots:
+            self._subscribe(live, each)
+        live.start()
+        log.info(
+            "databento session restarted with intraday replay for %s to add "
+            "%s.OPT (dataset=%s)", ", ".join(f"{r}.OPT" for r in roots), root,
+            self.cfg.dataset,
+        )
 
     # -- record handling ----------------------------------------------------
 
