@@ -12,13 +12,15 @@ Differences from the backtest that are worth being explicit about:
     of each poll rather than a settled OHLC;
   * fills come from the exchange and can be partial or missing entirely.
     The strategy books what came back rather than what was asked for, and
-    squares a half-filled straddle before it records anything -- but the
-    book is reconciled against IBKR's positions only **once, at connect**
-    (``_reconcile``), not on every cycle.  Between two connects the book
-    is this process's own record of its fills, so an order that IBKR fills
-    after ``IbkrExecution._send`` has given up on it and cancelled it is
-    invisible until the next reconnect.  Per-cycle reconciliation is the
-    missing safety net here;
+    squares a half-filled straddle before it records anything.  On top of
+    that the book is checked against IBKR's own positions at connect
+    (``_reconcile``, which adopts them) and then on the
+    ``live.reconcile_seconds`` timer (``_verify_positions``, which halts
+    entries on any disagreement).  That second check is the one that
+    matters: between two connects the book is only this process's record
+    of its own fills, and an order IBKR fills *after*
+    ``IbkrExecution._send`` has given up waiting and cancelled it is
+    invisible to that record;
   * the ATM implied vol comes from the live chain rather than a historical
     series;
   * open interest is the exchange's, read through
@@ -41,7 +43,8 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 
 from ..broker.ibkr import (
     IbkrChainProvider,
@@ -57,11 +60,114 @@ from ..data.databento_source import (
     DatabentoOpenInterestProvider,
     DatabentoSession,
 )
+from ..instruments import RiskSource
+from ..portfolio import StraddlePosition
 from ..sizing import build_margin_model
 from ..strategy import GexStraddleStrategy
 from .journal import JournallingStrategy, SessionJournal
 
 log = logging.getLogger(__name__)
+
+#: The regime an adopted position is booked under. It is not a GEX read --
+#: this process never made one for it -- and giving it a real regime name
+#: would put P&L the runner cannot attribute into a bucket that is supposed
+#: to answer whether reading GEX paid.
+ADOPTED = "adopted"
+
+
+class ReconciliationError(RuntimeError):
+    """The broker holds something the strategy cannot safely manage.
+
+    Deliberately not a ``ConnectionError``: reconnecting cannot change what
+    the account holds, so the reconnect loop must let this one out rather
+    than retrying it forever against an unchanging answer.
+    """
+
+
+@dataclass(frozen=True)
+class _PositionRow:
+    """One position the broker reports, in the terms the book works in."""
+
+    quantity: int
+    entry_price: float
+    expiry: date | None = None
+    strike: float = 0.0
+    right: str = ""
+
+
+def _parse_expiry(value: str) -> date:
+    """IBKR's ``YYYYMMDD`` contract month, as a date.
+
+    A row we cannot parse is a reconciliation failure rather than a
+    programming one: it has to surface as ``ReconciliationError`` so the
+    reconnect loop lets it out. Raising anything else would put it back in
+    the retry path, where reconnecting cannot change the answer and the
+    runner would spin on it exactly as it used to on the old refusal.
+    """
+    text = str(value)[:8]
+    try:
+        return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+    except ValueError as exc:
+        raise ReconciliationError(
+            f"cannot read an expiry from the contract month {value!r}: {exc}"
+        ) from exc
+
+
+def _straddle_from_rows(
+    rows: list[_PositionRow], source: RiskSource, adopted_at: datetime
+) -> StraddlePosition | None:
+    """The straddle these option rows describe, or ``None`` when flat.
+
+    Raises ``ReconciliationError`` for anything that is not one matched
+    straddle.  The strategy has exactly one shape of option position and no
+    way to represent a lone leg, two strikes or two expiries, so adopting
+    such a book would mean hedging a delta it had computed wrongly -- which
+    is the failure the old blanket refusal was reaching for.  The change
+    here is only that a *matched* straddle is now adopted instead of
+    refused along with everything else.
+    """
+    if not rows:
+        return None
+
+    def described() -> str:
+        return ", ".join(
+            f"{row.quantity:+d} {row.expiry} {row.strike:g}{row.right}"
+            for row in sorted(rows, key=lambda r: (str(r.expiry), r.strike, r.right))
+        )
+
+    expiries = {row.expiry for row in rows}
+    strikes = {row.strike for row in rows}
+    rights = {row.right for row in rows}
+    if len(rows) != 2 or len(expiries) != 1 or len(strikes) != 1 or rights != {"C", "P"}:
+        raise ReconciliationError(
+            f"the account holds {len(rows)} {source.option.symbol} option "
+            f"position(s) that are not one matched straddle ({described()}). "
+            "The strategy can only represent a call and a put on one strike and "
+            "one expiry, so this cannot be adopted -- close it, or restart once "
+            "flat."
+        )
+
+    call = next(row for row in rows if row.right == "C")
+    put = next(row for row in rows if row.right == "P")
+    if call.quantity != put.quantity:
+        raise ReconciliationError(
+            f"the {source.option.symbol} legs are not the same size "
+            f"({described()}); that is a naked option, not a straddle, and "
+            "adopting it would leave the hedger working from the wrong delta."
+        )
+
+    return StraddlePosition(
+        strike=call.strike,
+        expiry=call.expiry,
+        quantity=call.quantity,
+        call_entry=call.entry_price,
+        put_entry=put.entry_price,
+        # The real entry time is not recoverable from a position row. This
+        # is when the book picked it up, which is also when its P&L
+        # baselines start, so the two agree rather than quietly disagreeing.
+        entry_time=adopted_at,
+        regime=ADOPTED,
+    )
 
 
 class LiveRunner:
@@ -98,8 +204,16 @@ class LiveRunner:
         Each reconnection rebuilds the strategy and re-reconciles against
         the broker's positions rather than resuming the in-memory book: the
         book may be minutes or hours stale by then, and the broker is the
-        only thing that knows what is actually open.  The journal is what
-        carries the record across the gap.
+        only thing that knows what is actually open.  It is also the only
+        thing that can say so -- the journal records fills but not which
+        strike, right or expiry they were on, so it cannot rebuild a
+        position; what it carries across the gap is the decision history,
+        not the book.
+
+        A ``ReconciliationError`` is deliberately not caught here.  It is
+        not a connection failure, and retrying it would mean asking the
+        same question of the same account and getting the same answer
+        until the process is killed.
         """
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -114,6 +228,18 @@ class LiveRunner:
                     self._run_connected(max_cycles)
                     backoff = self.cfg.live.reconnect_backoff_seconds
                     attempts = 0
+                except ReconciliationError:
+                    # Not a connection failure, so the reconnect loop must
+                    # not treat it as one. Reconnecting cannot change what
+                    # the account holds: every retry would fail identically,
+                    # forever at the shipped max_reconnect_attempts of null,
+                    # while whatever is open goes unhedged the whole time.
+                    # Dying here is loud, and a supervisor restart is honest.
+                    log.error(
+                        "cannot reconcile against the broker; stopping rather "
+                        "than retrying an answer that will not change"
+                    )
+                    raise
                 except Exception as exc:  # noqa: BLE001 - the point is to survive it
                     if self._stop:
                         break
@@ -188,6 +314,7 @@ class LiveRunner:
             execution = IbkrExecution(conn, self.cfg, dry_run=self.dry_run)
             chain_provider = IbkrChainProvider(conn, self.cfg)
             self._reconcile(conn)
+            last_reconcile = time.monotonic()
 
             log.info(
                 "live runner started on %s (%s), polling every %.1fs%s",
@@ -209,6 +336,10 @@ class LiveRunner:
                     break
 
                 now = time.monotonic()
+                every = self.cfg.live.reconcile_seconds
+                if every is not None and now - last_reconcile >= every:
+                    self._verify_positions(conn)
+                    last_reconcile = now
                 if now - last_heartbeat >= self.cfg.live.heartbeat_seconds:
                     log.info(
                         "alive: %d cycles, %d events, %d fills",
@@ -241,6 +372,15 @@ class LiveRunner:
             f"data.open_interest == {self.cfg.data.open_interest!r} is not a "
             "live source; use 'ibkr', 'databento' or 'databento_flow'"
         )
+
+    def _now(self) -> datetime:
+        """The exchange-local moment, from the strategy's own clock.
+
+        Read through the strategy rather than from ``datetime`` directly so
+        the tests that freeze the clock freeze this too.
+        """
+        assert self.strategy is not None
+        return datetime.now(self.strategy.clock.tz)
 
     def _holding(self) -> bool:
         """Whether there is anything to hedge right now.
@@ -343,42 +483,152 @@ class LiveRunner:
         return straddle.iv
 
     def _reconcile(self, conn) -> None:
-        """Adopt whatever positions IBKR already reports for our contracts.
+        """Take the broker's positions as the book, at the start of a session.
 
         Starting a live session with a stale in-memory book is how a hedger
-        ends up doubling a position, so the runner trusts the broker, not
-        itself.
+        ends up doubling a position, so the runner trusts the broker rather
+        than itself.
+
+        The hedge leg is adopted outright.  The option leg is adopted only
+        when it is a *matched* straddle -- one expiry, one strike, a call
+        and a put in the same signed size -- because that is the only shape
+        the strategy can represent, and anything else genuinely is the
+        half-known book the old refusal was written to avoid.
+
+        Why the broker rather than the journal.  Everything that drives a
+        decision survives the trip: the expiry and strike come off the
+        contract, and ``avgCost`` divided by the multiplier recovers each
+        leg's entry price, which is the entry premium both exit rules are
+        written against.  What is lost is attribution only -- the entry
+        time, the entry vol, and which GEX regime opened it -- so an
+        adopted position is booked under the ``adopted`` regime rather than
+        pretending to a read this process never made.
+
+        One consequence worth stating: the P&L baselines start at
+        adoption, so the long branch's stop measures the scalp from the
+        restart rather than from the original entry.  That understates a
+        position that has already moved, which is the safe direction for a
+        stop and the wrong one for a target.
         """
         assert self.strategy is not None
-        positions = conn.ib.positions(conn.account)
-        hedge_symbol = self.source.hedge.symbol
-        adopted = 0
-        for position in positions:
-            contract = position.contract
-            if contract.secType == "FUT" and contract.symbol == hedge_symbol:
-                self.strategy.portfolio.hedge.quantity = int(position.position)
-                self.strategy.portfolio.hedge.avg_price = float(position.avgCost) / (
-                    self.source.hedge.multiplier or 1.0
-                )
-                adopted += 1
-                log.warning(
-                    "adopted an existing hedge position: %+d %s @ %.2f",
-                    self.strategy.portfolio.hedge.quantity, hedge_symbol,
-                    self.strategy.portfolio.hedge.avg_price,
-                )
-            elif contract.secType == "FOP" and contract.symbol == self.source.option.symbol:
-                log.error(
-                    "an existing %s option position is open (%+d %s %g%s). This "
-                    "runner will not adopt option legs it did not open -- close it "
-                    "or restart once flat. Adopting a half-known straddle is how a "
-                    "book ends up long gamma while the strategy believes it is "
-                    "short it.",
-                    contract.symbol, int(position.position),
-                    contract.lastTradeDateOrContractMonth, contract.strike, contract.right,
-                )
-                raise RuntimeError("refusing to start with an unmanaged option position")
-        if not adopted:
+        hedge_rows, option_rows = self._read_positions(conn)
+        book = self.strategy.portfolio
+
+        for row in hedge_rows:
+            book.hedge.quantity = row.quantity
+            book.hedge.avg_price = row.entry_price
+            log.warning(
+                "adopted an existing hedge position: %+d %s @ %.2f",
+                row.quantity, self.source.hedge.symbol, row.entry_price,
+            )
+
+        straddle = _straddle_from_rows(option_rows, self.source, self._now())
+        if straddle is not None:
+            book.open_straddle(straddle)
+            log.warning(
+                "adopted an existing %+d %s %g straddle @ %.2f (C %.2f / P %.2f). "
+                "P&L for it is measured from now, not from when it was opened.",
+                straddle.quantity, straddle.expiry, straddle.strike,
+                straddle.entry_premium, straddle.call_entry, straddle.put_entry,
+            )
+        if not hedge_rows and straddle is None:
             log.info("no existing positions to adopt")
+
+    def _verify_positions(self, conn) -> None:
+        """Re-check the broker against the book, mid-session.
+
+        Between two connects the book is only this process's record of its
+        own fills, and that record can be wrong in the one direction that
+        matters: an order the runner gave up waiting on, cancelled, and
+        reported as unfilled can still be filled by the exchange.  The
+        strategy then believes it is flat, sizes a fresh entry against the
+        full budget, and does it again on the next poll.
+
+        So this compares the two and, on any disagreement about the option
+        leg, halts entries rather than trading on a number it cannot
+        trust.  It does *not* silently re-adopt: a position that appeared
+        without the runner placing it is exactly the moment a person should
+        look, and quietly absorbing it would erase the only evidence that
+        anything went wrong.  Hedging and the exits carry on, because
+        whatever is open still has to be managed.
+        """
+        assert self.strategy is not None
+        strategy = self.strategy
+        if strategy.halted:
+            return
+        try:
+            hedge_rows, option_rows = self._read_positions(conn)
+            broker_straddle = _straddle_from_rows(option_rows, self.source, self._now())
+        except ReconciliationError as exc:
+            # Not a shape the strategy can hold, so it certainly is not the
+            # one the book thinks it holds.
+            strategy.halt_entries(str(exc))
+            return
+
+        book = strategy.portfolio
+        broker_quantity = broker_straddle.quantity if broker_straddle else 0
+        book_quantity = book.straddle.quantity if book.straddle else 0
+        if broker_quantity != book_quantity:
+            strategy.halt_entries(
+                f"the broker reports {broker_quantity:+d} straddles and the book "
+                f"holds {book_quantity:+d}. The book is this process's record of "
+                "its own fills and something has filled outside it; entries stop "
+                "until a person has looked."
+            )
+            return
+
+        broker_hedge = hedge_rows[0].quantity if hedge_rows else 0
+        if broker_hedge != book.hedge.quantity:
+            # The hedge is adopted rather than halted on: it is a single
+            # signed number with no shape to get wrong, and the band puts
+            # it right on the next pass.
+            log.warning(
+                "hedge drift: the broker reports %+d %s, the book held %+d; "
+                "taking the broker's",
+                broker_hedge, self.source.hedge.symbol, book.hedge.quantity,
+            )
+            book.hedge.quantity = broker_hedge
+            if hedge_rows:
+                book.hedge.avg_price = hedge_rows[0].entry_price
+
+    def _read_positions(self, conn) -> tuple[list["_PositionRow"], list["_PositionRow"]]:
+        """The account's positions in our two instruments, split by leg."""
+        hedge_rows: list[_PositionRow] = []
+        option_rows: list[_PositionRow] = []
+        for position in conn.ib.positions(conn.account):
+            contract = position.contract
+            quantity = int(position.position)
+            if quantity == 0:
+                continue  # IBKR reports closed positions as zero rows
+            if contract.secType == "FUT" and contract.symbol == self.source.hedge.symbol:
+                hedge_rows.append(
+                    _PositionRow(
+                        quantity=quantity,
+                        entry_price=float(position.avgCost)
+                        / (self.source.hedge.multiplier or 1.0),
+                    )
+                )
+            elif (
+                contract.secType == "FOP"
+                and contract.symbol == self.source.option.symbol
+            ):
+                try:
+                    strike = float(contract.strike)
+                except (TypeError, ValueError) as exc:
+                    raise ReconciliationError(
+                        f"cannot read a strike from {contract.strike!r}: {exc}"
+                    ) from exc
+                option_rows.append(
+                    _PositionRow(
+                        quantity=quantity,
+                        entry_price=float(position.avgCost)
+                        / (self.source.option.multiplier or 1.0),
+                        expiry=_parse_expiry(contract.lastTradeDateOrContractMonth),
+                        strike=strike,
+                        right=str(contract.right).upper()[:1],
+                    )
+                )
+        return hedge_rows, option_rows
 
 
 def run_live(cfg: Config, dry_run: bool = False, max_cycles: int | None = None):

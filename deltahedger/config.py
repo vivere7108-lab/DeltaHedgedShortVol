@@ -714,8 +714,18 @@ class LiveConfig:
     #: Log a heartbeat line this often even when nothing happens, so a
     #: silent log can be told apart from a stalled process.
     heartbeat_seconds: float = 300.0
+    #: Re-check the broker's positions against the in-memory book this
+    #: often, seconds. Between two connects the book is only this
+    #: process's record of its own fills, and an order the broker filled
+    #: after the runner gave up waiting on it is invisible to that record
+    #: -- so a book that has drifted keeps trading on a position it does
+    #: not know the size of. This is what notices. ``None`` checks only at
+    #: connect, which is the old behaviour and is not recommended.
+    reconcile_seconds: float | None = 300.0
 
     def validate(self) -> None:
+        if self.reconcile_seconds is not None and self.reconcile_seconds <= 0:
+            raise ValueError("live.reconcile_seconds must be positive, or null")
         if self.reconnect_backoff_seconds <= 0:
             raise ValueError("live.reconnect_backoff_seconds must be > 0")
         if self.max_reconnect_backoff_seconds < self.reconnect_backoff_seconds:

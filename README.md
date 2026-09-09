@@ -888,9 +888,15 @@ Routing real orders is the one irreversible thing here, so:
 - Every order is size-checked before it is sent, against both the config
   limits and a hard `MAX_ORDER_CONTRACTS` backstop. A flatten larger than
   the hedge cap is sent as a sequence of capped orders rather than refused.
-- On startup the runner **reconciles against IBKR positions**. It adopts an
-  existing MES hedge, and refuses to start if there is an option position it
-  did not open.
+- The runner **reconciles against IBKR positions**, at connect and then
+  every `live.reconcile_seconds`. It adopts an existing MES hedge, and
+  adopts an existing option position only when it is a *matched* straddle —
+  one expiry, one strike, a call and a put in the same signed size, which
+  is the only shape the strategy can represent. Anything else stops the
+  runner rather than being adopted or ignored, and that refusal is not
+  retried as though it were a dropped connection. Mid-session, a book that
+  disagrees with the broker halts new entries while continuing to hedge and
+  exit what is open.
 
 None of that makes the strategy safe. It makes an accident require intent.
 

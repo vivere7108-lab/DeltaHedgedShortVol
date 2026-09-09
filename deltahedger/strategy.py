@@ -230,6 +230,15 @@ class GexStraddleStrategy:
         self._session_start_equity = cfg.starting_equity
         self._entries_this_session = 0
         self._halted_for_session = False
+        #: A halt that outlives the session roll, unlike the daily loss
+        #: limit's. Set when something outside the strategy has established
+        #: that the book cannot be trusted -- the live runner finding the
+        #: broker holding a position this book does not know about. Nothing
+        #: clears it: a book that has drifted does not un-drift, and
+        #: resuming entries at the next midnight would be the runner
+        #: quietly overruling the only check that caught the problem.
+        self._halted_for_run = False
+        self._halt_reason = ""
         self._profile: GexProfile | None = None
         #: Cached open interest per expiry, and when it was read. OI is an
         #: end-of-day figure, so it is re-read on a timer while the
@@ -249,6 +258,26 @@ class GexStraddleStrategy:
         # Baselines for measuring one position's P&L, set at each entry.
         self._hedge_realised_at_entry = 0.0
         self._fees_at_entry = 0.0
+
+    # -- external halt ---------------------------------------------------
+
+    def halt_entries(self, reason: str) -> None:
+        """Stop opening new positions for the rest of the run.
+
+        Hedging and the exits are deliberately left alone.  Whatever is
+        open still has to be managed -- an unhedged straddle is the thing
+        this system exists to avoid -- so a halt stops the book growing
+        rather than stopping the runner.
+        """
+        if self._halted_for_run:
+            return
+        self._halted_for_run = True
+        self._halt_reason = reason
+        log.error("entries halted for the rest of the run: %s", reason)
+
+    @property
+    def halted(self) -> bool:
+        return self._halted_for_run
 
     # -- main loop ------------------------------------------------------
 
@@ -523,6 +552,12 @@ class GexStraddleStrategy:
         execution: ExecutionHandler,
     ) -> None:
         cfg = self.cfg.strategy
+        if self._halted_for_run:
+            self._record(
+                moment, "entry_skipped",
+                f"entries are halted for the rest of the run: {self._halt_reason}",
+            )
+            return
         if self._halted_for_session:
             return
         if self._entries_this_session >= 1 and not cfg.reenter_after_exit:

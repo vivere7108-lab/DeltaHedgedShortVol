@@ -687,6 +687,56 @@ class TestLegFills:
         assert net == 2 * position.quantity
 
 
+class TestHaltingEntries:
+    """An external halt: something outside the strategy has established
+    that the book cannot be trusted."""
+
+    def test_a_halt_blocks_entries(self):
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        strategy.halt_entries("the broker holds a position this book does not")
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is None
+        assert "halted" in " ".join(details(strategy, "entry_skipped"))
+
+    def test_a_halt_does_not_stop_the_exits_or_the_hedger(self):
+        """Whatever is open still has to be managed: a halt that stopped
+        hedging would leave an unhedged straddle, which is worse than the
+        thing it was reacting to."""
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        assert strategy.portfolio.straddle is not None
+
+        strategy.halt_entries("drift")
+        strategy.on_bar(bar(5, 5010.0), execution)
+        assert [f for f in strategy.fills if f.instrument == "hedge"], "never hedged"
+        assert strategy.portfolio.straddle is not None, "the position was not held"
+
+    def test_a_halt_outlives_the_session_roll(self):
+        """Unlike the daily loss limit's halt, which is meant to clear.
+
+        A book that has drifted does not un-drift overnight, and resuming
+        entries at the next midnight would be the strategy quietly
+        overruling the only check that caught the problem.
+        """
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = SimulatedExecution(cfg.costs, cfg.source)
+        strategy.halt_entries("drift")
+        strategy.on_bar(bar(0), execution)
+        strategy.on_bar(session_bar(1, minutes=30), execution)  # a new session
+        assert strategy.halted
+        assert strategy.portfolio.straddle is None
+
+    def test_halting_twice_keeps_the_first_reason(self):
+        strategy = GexStraddleStrategy(make_cfg(), open_interest=FixedRegime(POSITIVE))
+        strategy.halt_entries("the first thing that went wrong")
+        strategy.halt_entries("a later symptom of it")
+        assert strategy._halt_reason == "the first thing that went wrong"
+
+
 class TestExitLegFills:
     """A close that half-happens must be recorded, not thrown away.
 
