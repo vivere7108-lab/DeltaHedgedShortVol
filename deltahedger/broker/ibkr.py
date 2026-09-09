@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -34,13 +35,9 @@ from ..gex import StrikeOpenInterest
 from ..instruments import ContractSpec, RiskSource
 from ..pricing import black76, implied_vol
 from ..volsurface import VolSurface
-from .base import ExecutionError, Fill
+from .base import MAX_ORDER_CONTRACTS, ExecutionError, Fill, OrderStateUnknown
 
 log = logging.getLogger(__name__)
-
-#: Hard ceiling on any single order, regardless of config. A backstop against
-#: a sizing bug turning into a position nobody intended.
-MAX_ORDER_CONTRACTS = 500
 
 
 def _is_paper_account(account: str) -> bool:
@@ -507,7 +504,12 @@ class IbkrExecution:
     connection: IbkrConnection
     cfg: Config
     dry_run: bool = False
+    #: Wall-clock seconds to wait for an order to finish before cancelling.
     fill_timeout: float = 30.0
+    #: Wall-clock seconds to wait for that cancel to be confirmed. Shorter
+    #: than the fill timeout because a cancel either lands quickly or the
+    #: connection is in trouble, and the caller is blocked meanwhile.
+    cancel_timeout: float = 10.0
 
     def execute_option(
         self, quote: OptionQuote, quantity: int, moment: datetime
@@ -541,7 +543,7 @@ class IbkrExecution:
         action = "BUY" if quantity > 0 else "SELL"
         size = abs(quantity)
 
-        if self.cfg.ibkr.hedge_order_type.upper() == "LMT":
+        if self.cfg.ibkr.order_type.upper() == "LMT":
             cross = self.cfg.ibkr.limit_cross_ticks * spec.tick_size
             limit = reference_price + (cross if quantity > 0 else -cross)
             limit = _round_to_tick(max(limit, spec.tick_size), spec.tick_size)
@@ -558,34 +560,100 @@ class IbkrExecution:
             return Fill(quantity, reference_price, 0.0, moment, instrument, "dry-run")
 
         trade = self.connection.ib.placeOrder(contract, order)
-        self.connection.ib.waitOnUpdate(timeout=self.fill_timeout)
-        while not trade.isDone():
-            if not self.connection.ib.waitOnUpdate(timeout=self.fill_timeout):
-                break
+        name = getattr(contract, "localSymbol", instrument)
+        if self._await_done(trade, self.fill_timeout):
+            return self._fill_from(trade, quantity, moment, instrument, name)
+        return self._cancel_and_settle(trade, order, quantity, moment, instrument, name)
 
-        if not trade.orderStatus.filled:
+    # -- waiting, cancelling, and finding out what happened ---------------
+
+    def _await_done(self, trade: Any, timeout: float) -> bool:
+        """Wait for ``trade`` to reach a done state. True if it did.
+
+        Bounded by the wall clock rather than by gaps between updates.
+        ``waitOnUpdate`` wakes on *any* traffic on the socket -- a tick on
+        one of the option-chain subscriptions counts -- so a loop written
+        as "wait while this trade is not done" runs for as long as the
+        market is busy, whatever the timeout is nominally set to, and the
+        whole poll loop stalls behind it. Nothing is hedged while it does.
+        """
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while not trade.isDone():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            self.connection.ib.waitOnUpdate(timeout=remaining)
+        return True
+
+    def _cancel_and_settle(
+        self, trade: Any, order: Any, quantity: int, moment: datetime,
+        instrument: str, name: str,
+    ) -> Fill | None:
+        """Cancel an order still working, then establish what it did.
+
+        The cancel is not the end of the story and must not be treated as
+        one.  Sending it and returning "no fill" -- which is what this used
+        to do -- is a guess, and IBKR is free to fill the order while the
+        cancel is in flight.  When it does, the strategy is told the leg
+        did not fill, believes itself flat, and opens a fresh position on
+        the next poll, five seconds later, at full size.  Nothing bounds
+        that: it is the mechanism behind a book several times larger than
+        anyone asked for.
+
+        So the cancel is *awaited*, and whatever filled before it landed is
+        reported as the fill it was.  If the cancel cannot be confirmed the
+        outcome is genuinely unknown, and saying "nothing happened" is the
+        one answer not available -- hence ``OrderStateUnknown`` rather than
+        ``None``.
+        """
+        log.warning(
+            "%s %d %s is still working after %.0fs (status %s); cancelling",
+            order.action, int(order.totalQuantity), name, self.fill_timeout,
+            trade.orderStatus.status,
+        )
+        self.connection.ib.cancelOrder(order)
+        if not self._await_done(trade, self.cancel_timeout):
+            raise OrderStateUnknown(
+                f"sent {order.action} {int(order.totalQuantity)} {name} and could "
+                f"not confirm the cancel within {self.cancel_timeout:.0f}s; it "
+                f"was last {trade.orderStatus.status} with "
+                f"{int(trade.orderStatus.filled)} filled. The account may hold a "
+                "position this book has no record of -- do not assume it is flat."
+            )
+        return self._fill_from(trade, quantity, moment, instrument, name)
+
+    def _fill_from(
+        self, trade: Any, quantity: int, moment: datetime, instrument: str, name: str,
+    ) -> Fill | None:
+        """The ``Fill`` a finished trade amounts to, or ``None`` if nothing
+        traded.
+
+        Reached both by an order that finished on its own and by one that
+        was cancelled: a cancelled order that filled first still filled,
+        and the difference matters only to the log line.
+        """
+        filled = int(trade.orderStatus.filled)
+        wanted = abs(quantity)
+        if filled == 0:
             log.error(
                 "order not filled: %s %d %s (status %s)",
-                action, size, getattr(contract, "localSymbol", instrument),
+                "BUY" if quantity > 0 else "SELL", wanted, name,
                 trade.orderStatus.status,
             )
-            self.connection.ib.cancelOrder(order)
             return None
-
-        filled = int(trade.orderStatus.filled)
-        avg_price = float(trade.orderStatus.avgFillPrice)
-        fees = sum(
-            float(f.commissionReport.commission or 0.0)
-            for f in trade.fills
-            if f.commissionReport
-        )
-        signed = filled if quantity > 0 else -filled
-        if filled != size:
-            log.warning("partial fill: %d of %d %s", filled, size, instrument)
+        if filled != wanted:
+            log.warning(
+                "partial fill: %d of %d %s (status %s)",
+                filled, wanted, instrument, trade.orderStatus.status,
+            )
         return Fill(
-            quantity=signed,
-            price=avg_price,
-            fees=fees,
+            quantity=filled if quantity > 0 else -filled,
+            price=float(trade.orderStatus.avgFillPrice),
+            fees=sum(
+                float(f.commissionReport.commission or 0.0)
+                for f in trade.fills
+                if f.commissionReport
+            ),
             timestamp=moment,
             instrument=instrument,
             note=trade.orderStatus.status,

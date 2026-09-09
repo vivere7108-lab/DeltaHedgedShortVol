@@ -8,6 +8,7 @@ Load from YAML with ``Config.from_yaml`` or build in code.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import time
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any
 import yaml
 
 from .instruments import RiskSource, get_risk_source
+
+log = logging.getLogger(__name__)
 
 
 def _parse_time(value: Any) -> time:
@@ -215,6 +218,21 @@ class SizingConfig:
             )
         if self.max_straddles < self.min_straddles:
             raise ValueError("sizing.max_straddles < min_straddles")
+        # The per-order hard ceiling in broker.ibkr is applied as
+        # min(MAX_ORDER_CONTRACTS, max_straddles), so it can only ever bind
+        # when it is the smaller of the two. At equal values it is inert,
+        # and a backstop nobody can see is not one -- say so rather than
+        # leaving it to be discovered.
+        from .broker.base import MAX_ORDER_CONTRACTS
+
+        if self.max_straddles >= MAX_ORDER_CONTRACTS:
+            log.warning(
+                "sizing.max_straddles is %d and the per-order hard ceiling is "
+                "%d, so the ceiling can never bind and the only cap on an "
+                "order is the config one. Lower sizing.max_straddles to give "
+                "the backstop something to catch.",
+                self.max_straddles, MAX_ORDER_CONTRACTS,
+            )
 
 
 @dataclass
@@ -495,8 +513,12 @@ class StrategyConfig:
     #: Allow another entry after an exit, so a regime flip can be traded
     #: rather than just closed out.
     reenter_after_exit: bool = True
-    #: Ceiling on entries per session, so a spot level oscillating across
-    #: the flip point cannot churn the book all day.
+    #: Ceiling on entry *attempts* per session, so a spot level oscillating
+    #: across the flip point cannot churn the book all day -- and so a leg
+    #: that keeps failing cannot be retried indefinitely. Attempts rather
+    #: than fills is the load-bearing part: a leg reported as unfilled that
+    #: the exchange filled anyway would otherwise put the strategy straight
+    #: back into an entry, at full size, every poll.
     max_entries_per_session: int = 3
 
     def tenor(self) -> "TenorPolicy":
@@ -655,10 +677,30 @@ class IBKRConfig:
     poll_seconds: float = 5.0
     #: Ask IBKR for real margin via whatIf orders instead of the heuristic.
     use_whatif_margin: bool = True
-    #: Order type for hedges: "MKT" or "LMT".
-    hedge_order_type: str = "MKT"
-    #: For LMT hedges, cross the spread by this many ticks.
+    #: Order type for every order this system sends -- straddle legs and
+    #: hedges alike: "MKT" or "LMT". It was called ``hedge_order_type``,
+    #: which was wrong: there has only ever been one setting and ``_send``
+    #: has always read it for both instruments, so switching hedges to
+    #: limit orders silently switched the option legs too.
+    order_type: str = "MKT"
+    #: The old name, still accepted so existing configs keep working. When
+    #: set it wins, and ``validate`` says so once.
+    hedge_order_type: str | None = None
+    #: For LMT orders, cross the spread by this many ticks.
     limit_cross_ticks: float = 1.0
+
+    def validate(self) -> None:
+        if self.hedge_order_type is not None:
+            log.warning(
+                "ibkr.hedge_order_type is deprecated and has been renamed to "
+                "ibkr.order_type -- it was never hedge-only, and %r is being "
+                "applied to the straddle legs as well. Rename it in the config.",
+                self.hedge_order_type,
+            )
+            self.order_type = self.hedge_order_type
+            self.hedge_order_type = None
+        if self.order_type.upper() not in ("MKT", "LMT"):
+            raise ValueError('ibkr.order_type must be "MKT" or "LMT"')
 
 
 @dataclass
@@ -772,7 +814,8 @@ class Config:
             raise ValueError("starting_equity must be positive")
         get_risk_source(self.risk_source)  # raises on an unknown symbol
         for section in (
-            self.hedge, self.sizing, self.gex, self.gates, self.strategy, self.live,
+            self.hedge, self.sizing, self.gex, self.gates, self.strategy,
+            self.ibkr, self.live,
         ):
             section.validate()
 

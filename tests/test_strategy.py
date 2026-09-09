@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from deltahedger.broker.base import OrderStateUnknown
 from deltahedger.broker.paper import SimulatedExecution
 from deltahedger.chain import OptionQuote, select_atm_straddle
 from deltahedger.config import Config, CostsConfig
@@ -735,6 +736,131 @@ class TestHaltingEntries:
         strategy.halt_entries("the first thing that went wrong")
         strategy.halt_entries("a later symptom of it")
         assert strategy._halt_reason == "the first thing that went wrong"
+
+
+class TestUnresolvedOrders:
+    """An order whose outcome could not be established.
+
+    ``OrderStateUnknown`` means the account may hold something this book
+    has no record of. The one response not available is to carry on as
+    though the book were still right.
+    """
+
+    class UnresolvedPut(SimulatedExecution):
+        def execute_option(self, quote, quantity, moment):
+            if quote.right == "P":
+                raise OrderStateUnknown("could not confirm the cancel")
+            return super().execute_option(quote, quantity, moment)
+
+    class UnresolvedCall(SimulatedExecution):
+        def execute_option(self, quote, quantity, moment):
+            if quote.right == "C":
+                raise OrderStateUnknown("could not confirm the cancel")
+            return super().execute_option(quote, quantity, moment)
+
+    def test_an_unresolved_call_leaves_the_book_flat_and_halts(self):
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        strategy.on_bar(bar(0), self.UnresolvedCall(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is None
+        assert strategy.halted, "it carried on with a book it cannot trust"
+
+    def test_an_unresolved_put_unwinds_the_call_it_does_know_about(self):
+        """The call filled -- that part is known -- so it is undone. Only
+        the unknown part is left to a person."""
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        strategy.on_bar(bar(0), self.UnresolvedPut(cfg.costs, cfg.source))
+        net = sum(f.quantity for f in strategy.fills if f.instrument == "option")
+        assert net == 0, "the call leg was left on"
+        assert strategy.portfolio.straddle is None
+        assert strategy.halted
+
+    def test_it_does_not_send_a_second_order_on_top_of_an_unresolved_one(self):
+        """The runaway, in one assertion.
+
+        A leg reported as unfilled used to put the strategy straight back
+        into an entry on the next poll, at full size, indefinitely.
+        """
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.UnresolvedCall(cfg.costs, cfg.source)
+        for minute in range(0, 60, 5):
+            strategy.on_bar(bar(minute), execution)
+        assert len([e for e in strategy.events if e.kind == "entry_failed"]) == 1
+
+
+    class UnresolvedHedge(SimulatedExecution):
+        def execute_hedge(self, quantity, price, moment):
+            raise OrderStateUnknown("could not confirm the cancel")
+
+    def test_an_unresolved_hedge_order_still_leaves_a_bar_on_the_record(self):
+        """It is recorded, not raised.
+
+        An exception escaping ``on_bar`` skips the snapshot, so the poll
+        leaves no trace in the journal at all -- and the journal is the
+        only evidence a forward walk produces.
+        """
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.UnresolvedHedge(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        strategy.on_bar(bar(5, 5010.0), execution)
+
+        assert len(strategy.bar_states) == 2
+        assert any("unresolved" in d for d in details(strategy, "hedge_failed"))
+
+    def test_an_unresolved_hedge_does_not_halt_the_run(self):
+        """Hedge drift is the one kind the runner corrects from the broker
+        rather than halting on: one signed number, no shape to get wrong."""
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.UnresolvedHedge(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        strategy.on_bar(bar(5, 5010.0), execution)
+        assert not strategy.halted
+
+
+class TestEntryAttemptsAreBounded:
+    """``max_entries_per_session`` counts attempts, not successes."""
+
+    class NeverFills(SimulatedExecution):
+        def execute_option(self, quote, quantity, moment):
+            return None
+
+    def test_a_failing_entry_is_not_retried_without_limit(self):
+        """The bound that was missing.
+
+        ``_entries_this_session`` only counted entries that succeeded, so a
+        leg that kept reporting "did not fill" -- including one the
+        exchange filled anyway -- could be retried every poll for the whole
+        session, each time at full size.
+        """
+        cfg = make_cfg(**{"strategy.max_entries_per_session": 3})
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.NeverFills(cfg.costs, cfg.source)
+        for minute in range(0, 120, 5):
+            strategy.on_bar(bar(minute), execution)
+
+        attempts = len([e for e in strategy.events if e.kind == "entry_failed"])
+        assert attempts == 3, f"{attempts} attempts against a cap of 3"
+
+    def test_the_budget_still_resets_with_the_session(self):
+        cfg = make_cfg(**{"strategy.max_entries_per_session": 1})
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        execution = self.NeverFills(cfg.costs, cfg.source)
+        strategy.on_bar(bar(0), execution)
+        strategy.on_bar(bar(5), execution)
+        assert len([e for e in strategy.events if e.kind == "entry_failed"]) == 1
+        strategy.on_bar(session_bar(1, minutes=30), execution)
+        assert len([e for e in strategy.events if e.kind == "entry_failed"]) == 2
+
+    def test_a_successful_entry_still_counts(self):
+        cfg = make_cfg()
+        strategy = GexStraddleStrategy(cfg, open_interest=FixedRegime(POSITIVE))
+        strategy.on_bar(bar(0), SimulatedExecution(cfg.costs, cfg.source))
+        assert strategy.portfolio.straddle is not None
+        assert strategy._entry_attempts_this_session == 1
 
 
 class TestExitLegFills:

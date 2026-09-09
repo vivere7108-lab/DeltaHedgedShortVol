@@ -194,5 +194,5 @@ ibkr:
   use_delayed_data: false
   poll_seconds: 5.0
   use_whatif_margin: true
-  hedge_order_type: MKT
+  order_type: MKT
   limit_cross_ticks: 1.0

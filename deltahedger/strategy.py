@@ -79,7 +79,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 
-from .broker.base import ExecutionHandler, Fill
+from .broker.base import ExecutionHandler, Fill, OrderStateUnknown
 from .chain import StraddleQuote, TenorPolicy, price_option, select_expiry, select_atm_straddle
 from .config import Config
 from .data.base import MarketBar
@@ -228,7 +228,7 @@ class GexStraddleStrategy:
         self._last_hedge_time: datetime | None = None
         self._session_date: date | None = None
         self._session_start_equity = cfg.starting_equity
-        self._entries_this_session = 0
+        self._entry_attempts_this_session = 0
         self._halted_for_session = False
         #: A halt that outlives the session roll, unlike the daily loss
         #: limit's. Set when something outside the strategy has established
@@ -323,7 +323,7 @@ class GexStraddleStrategy:
                 moment,
             )
         self._session_start_equity = self.portfolio.equity(quote, future_price)
-        self._entries_this_session = 0
+        self._entry_attempts_this_session = 0
         self._halted_for_session = False
 
     def _record(
@@ -560,9 +560,9 @@ class GexStraddleStrategy:
             return
         if self._halted_for_session:
             return
-        if self._entries_this_session >= 1 and not cfg.reenter_after_exit:
+        if self._entry_attempts_this_session >= 1 and not cfg.reenter_after_exit:
             return
-        if self._entries_this_session >= cfg.max_entries_per_session:
+        if self._entry_attempts_this_session >= cfg.max_entries_per_session:
             return
 
         # The entry window is checked here rather than in the bar loop, so
@@ -675,6 +675,14 @@ class GexStraddleStrategy:
             return
 
         quantity = direction * sizing.contracts
+        # Counted here, before the order goes out, rather than after it
+        # comes back. An attempt that fails is still an attempt, and
+        # counting only the ones that succeeded left the per-session cap
+        # unable to bound anything: a leg that reports "did not fill" --
+        # including one the exchange filled anyway -- put the strategy
+        # straight back here on the next poll, at full size, for as long
+        # as the session lasted.
+        self._entry_attempts_this_session += 1
         fills = self._open_legs(quote, quantity, moment, execution)
         if fills is None:
             return
@@ -701,7 +709,6 @@ class GexStraddleStrategy:
                 regime=profile.regime,
             )
         )
-        self._entries_this_session += 1
         self.regime_trades[profile.regime] = self.regime_trades.get(profile.regime, 0) + 1
 
         side = "bought" if direction > 0 else "sold"
@@ -777,14 +784,36 @@ class GexStraddleStrategy:
         contracts the account does not hold.  In the backtest neither case
         can happen; in live both can, which is the case worth writing for.
         """
-        call_fill = execution.execute_option(quote.call, quantity, moment)
+        try:
+            call_fill = execution.execute_option(quote.call, quantity, moment)
+        except OrderStateUnknown as exc:
+            # Nothing is booked and nothing can be unwound, because what to
+            # unwind is exactly what is not known. Stop rather than send a
+            # second order on top of one whose fate is undecided.
+            self._record(moment, "entry_failed", f"the call leg is unresolved: {exc}")
+            self.halt_entries(f"an unresolved call order: {exc}")
+            return None
         if call_fill is None or call_fill.quantity == 0:
             self._record(moment, "entry_failed", "the call leg did not fill")
             return None
         self.fills.append(call_fill)
         self.portfolio.charge_fees(call_fill.fees)
 
-        put_fill = execution.execute_option(quote.put, quantity, moment)
+        try:
+            put_fill = execution.execute_option(quote.put, quantity, moment)
+        except OrderStateUnknown as exc:
+            # The call did fill, so unwind that much -- it is the part that
+            # is known -- and halt on the part that is not.
+            unwound = self._unwind_leg(
+                quote.call, call_fill.quantity, call_fill.price, moment, execution
+            )
+            self._record(
+                moment, "entry_failed",
+                f"the put leg is unresolved ({exc}); the call leg was "
+                + ("unwound" if unwound else "left on and needs manual attention"),
+            )
+            self.halt_entries(f"an unresolved put order: {exc}")
+            return None
         if put_fill is not None and put_fill.quantity != 0:
             self.fills.append(put_fill)
             self.portfolio.charge_fees(put_fill.fees)
@@ -1095,7 +1124,16 @@ class GexStraddleStrategy:
         # again on the next bar and sends that leg a second time. Repeat
         # once a poll and the account accumulates a position nobody asked
         # for while the strategy still believes it holds a flat straddle.
-        call_fill = execution.execute_option(quote.call, -quantity, moment)
+        try:
+            call_fill = execution.execute_option(quote.call, -quantity, moment)
+        except OrderStateUnknown as exc:
+            self._record(
+                moment, "exit_failed",
+                f"could not close ({reason}); the call leg is unresolved: {exc}",
+                regime=regime,
+            )
+            self.halt_entries(f"an unresolved closing call order: {exc}")
+            return
         if call_fill is None or call_fill.quantity == 0:
             self._record(
                 moment, "exit_failed",
@@ -1106,7 +1144,21 @@ class GexStraddleStrategy:
         self.fills.append(call_fill)
         self.portfolio.charge_fees(call_fill.fees)
 
-        put_fill = execution.execute_option(quote.put, -quantity, moment)
+        try:
+            put_fill = execution.execute_option(quote.put, -quantity, moment)
+        except OrderStateUnknown as exc:
+            restored = self._unwind_leg(
+                quote.call, call_fill.quantity, call_fill.price, moment, execution
+            )
+            self._record(
+                moment, "exit_failed",
+                f"could not close ({reason}); the put leg is unresolved ({exc}) "
+                + ("and the call leg was put back" if restored else
+                   "and the call leg could not be put back -- manual attention"),
+                regime=regime,
+            )
+            self.halt_entries(f"an unresolved closing put order: {exc}")
+            return
         if put_fill is None or put_fill.quantity == 0:
             # Put the call leg back, so the book and the account agree again
             # and the next bar retries the close from a known state.
@@ -1190,7 +1242,18 @@ class GexStraddleStrategy:
         remaining, closed, pnl, orders, notional = wanted, 0, 0.0, 0, 0.0
         while remaining != 0:
             chunk = max(-cap, min(cap, remaining))
-            fill = execution.execute_hedge(chunk, bar.close, moment)
+            try:
+                fill = execution.execute_hedge(chunk, bar.close, moment)
+            except OrderStateUnknown as exc:
+                # Stop sending: another chunk on top of one whose fate is
+                # undecided is how a flatten overshoots into a position the
+                # other way. What is left is hedge drift, which the live
+                # runner's reconciliation adopts from the broker.
+                self._record(
+                    moment, "hedge_failed",
+                    f"a flatten order is unresolved and the rest was not sent: {exc}",
+                )
+                break
             if fill is None or fill.quantity == 0:
                 break
             self.fills.append(fill)
@@ -1239,7 +1302,20 @@ class GexStraddleStrategy:
         if not decision.should_hedge:
             return
 
-        fill = execution.execute_hedge(decision.contracts, bar.close, moment)
+        try:
+            fill = execution.execute_hedge(decision.contracts, bar.close, moment)
+        except OrderStateUnknown as exc:
+            # Recorded rather than raised, so the bar is still snapshotted
+            # and the journal keeps an unbroken record of the poll. The
+            # book's hedge quantity is wrong until the runner reconciles,
+            # and hedge drift is the one kind it corrects from the broker
+            # rather than halting on -- one signed number, no shape to get
+            # wrong, and the band puts it right on the next pass.
+            self._record(
+                moment, "hedge_failed",
+                f"the hedge order is unresolved: {exc}", net_delta,
+            )
+            return
         if fill is None:
             self._record(moment, "hedge_failed", decision.reason, net_delta)
             return

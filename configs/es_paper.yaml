@@ -76,7 +76,7 @@ ibkr:
   use_delayed_data: true             # paper account has no CME real-time entitlement of its own
   poll_seconds: 5.0
   use_whatif_margin: true
-  hedge_order_type: MKT
+  order_type: MKT               # straddle legs and hedges alike
 
 live:
   # Write every decision to disk as it happens. A forward walk that only

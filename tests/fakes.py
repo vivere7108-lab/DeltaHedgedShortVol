@@ -29,6 +29,7 @@ survive -- how much leaks through *after* a cancel has been sent.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -107,6 +108,9 @@ class FakeIb:
         #: this is what a busy market does to a loop written as "wait until
         #: this trade is done".
         self.idle_updates = idle_updates
+        #: Ceiling on how long a quiet ``waitOnUpdate`` actually sleeps, so
+        #: a test can use a production-sized timeout without paying for it.
+        self.max_quiet_sleep = 0.05
 
         #: Every order the fake was asked to place, in order, and every
         #: cancel it was asked to send. What the broker *did*, as opposed
@@ -249,6 +253,11 @@ class FakeIb:
         if self.idle_updates > 0:
             self.idle_updates -= 1
             return True
+        # Quiet socket: the real one blocks for the whole timeout before
+        # reporting the timeout. Sleeping here rather than returning at
+        # once is what makes a wall-clock deadline observable in a test --
+        # and what stops a caller that loops on this from spinning.
+        time.sleep(min(max(timeout, 0.0), self.max_quiet_sleep))
         return False
 
     def whatIfOrder(self, contract, order: Order) -> OrderState:

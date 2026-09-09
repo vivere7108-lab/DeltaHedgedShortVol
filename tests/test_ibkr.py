@@ -11,13 +11,16 @@ change shows up as an edited assertion with a reason rather than as a
 silent flip.  See the plan in the commit that added this file.
 """
 
+import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from deltahedger.broker.base import ExecutionError
+from deltahedger.broker.base import ExecutionError, OrderStateUnknown
 from deltahedger.chain import OptionQuote, StraddleQuote
+import logging
+
 from deltahedger.config import Config
 from deltahedger.pricing import black76
 
@@ -167,12 +170,12 @@ class TestOrderRouting:
 
 class TestOrderType:
     def test_mkt_is_the_default(self, conn, cfg):
-        cfg.ibkr.hedge_order_type = "MKT"
+        cfg.ibkr.order_type = "MKT"
         IbkrExecution(conn, cfg).execute_hedge(1, 5000.0, NOW)
         assert conn.ib.placed[0][1].orderType == "MKT"
 
     def test_a_limit_crosses_the_spread_in_the_direction_that_fills(self, conn, cfg):
-        cfg.ibkr.hedge_order_type = "LMT"
+        cfg.ibkr.order_type = "LMT"
         cfg.ibkr.limit_cross_ticks = 2.0
         execution = IbkrExecution(conn, cfg)
         execution.execute_hedge(1, 5000.0, NOW)     # a buy pays up
@@ -183,23 +186,36 @@ class TestOrderType:
         assert sell.lmtPrice == pytest.approx(5000.0 - 2 * tick)
 
     def test_the_limit_is_rounded_to_the_instrument_tick(self, conn, cfg):
-        cfg.ibkr.hedge_order_type = "LMT"
+        cfg.ibkr.order_type = "LMT"
         cfg.ibkr.limit_cross_ticks = 0.3  # lands off-tick on purpose
         IbkrExecution(conn, cfg).execute_hedge(1, 5000.0, NOW)
         limit = conn.ib.placed[0][1].lmtPrice
         assert limit == _round_to_tick(limit, cfg.source.hedge.tick_size)
 
-    def test_the_hedge_order_type_also_governs_option_orders(self, conn, cfg):
-        """Pinned because the name says otherwise.
+    def test_one_setting_governs_both_instruments(self, conn, cfg):
+        """And is now named for that.
 
-        ``ibkr.hedge_order_type`` is the only order-type setting there is,
-        and ``_send`` reads it for both instruments -- so switching hedges
-        to limit orders silently switches the straddle legs too. Phase 3
-        renames it; this records that today they cannot be set apart.
+        ``_send`` has always read a single setting for straddle legs and
+        hedges alike, so the old ``hedge_order_type`` was misleading:
+        switching hedges to limit orders silently switched the option legs
+        too. The behaviour is unchanged; the name is honest.
         """
-        cfg.ibkr.hedge_order_type = "LMT"
+        cfg.ibkr.order_type = "LMT"
         IbkrExecution(conn, cfg).execute_option(option(), 1, NOW)
         assert conn.ib.placed[0][1].orderType == "LMT"
+
+    def test_the_old_name_still_works_and_says_it_is_deprecated(self, caplog):
+        """Renaming a config key that ships in every example file has to
+        keep the old one working, or the rename is a breaking change."""
+        with caplog.at_level(logging.WARNING, logger="deltahedger.config"):
+            cfg = Config.from_dict({"ibkr": {"hedge_order_type": "LMT"}})
+        assert cfg.ibkr.order_type == "LMT"
+        assert "deprecated" in caplog.text
+        assert "ibkr.order_type" in caplog.text
+
+    def test_an_unknown_order_type_is_refused_at_load(self):
+        with pytest.raises(ValueError, match="order_type"):
+            Config.from_dict({"ibkr": {"order_type": "STP"}})
 
 
 class TestOrderSizeCheck:
@@ -214,96 +230,129 @@ class TestOrderSizeCheck:
         with pytest.raises(ExecutionError, match="refusing to send"):
             IbkrExecution(conn, cfg).execute_hedge(-6, 5000.0, NOW)
 
-    def test_the_hard_backstop_never_binds_at_the_shipped_config(self, conn, cfg):
-        """The defect behind issue 5, stated as arithmetic.
+    def test_the_hard_backstop_is_inert_while_it_equals_the_config_limit(
+        self, conn, cfg
+    ):
+        """Issue 5, stated as arithmetic and left as a config decision.
 
         ``MAX_ORDER_CONTRACTS`` is described as a backstop against a sizing
         bug turning into a position nobody intended. It is applied as
-        ``min(MAX_ORDER_CONTRACTS, max_straddles)`` and both are 500, so
-        the config limit is always the binding one and the backstop can
-        never fire. Phase 3 gives it something to catch.
+        ``min(MAX_ORDER_CONTRACTS, max_straddles)`` and both default to
+        500, so the config limit is always the binding one and the
+        backstop cannot fire.
+
+        No number is invented here to fix that. The original margin bug
+        sized 83 straddles, and no order-count ceiling anywhere near a
+        plausible setting would have caught it -- the margin cross-check
+        does, and that is phase 4. What phase 3 adds is that the condition
+        is now said out loud at startup instead of being invisible; see
+        ``deltahedger.config``. Lowering ``sizing.max_straddles`` is the
+        owner's call.
         """
         assert cfg.sizing.max_straddles == MAX_ORDER_CONTRACTS
         conn.ib.outcome_for = lambda c, o: OrderOutcome(price=8.0)
         fill = IbkrExecution(conn, cfg).execute_option(option(), MAX_ORDER_CONTRACTS, NOW)
-        assert fill.quantity == MAX_ORDER_CONTRACTS, "the backstop did not fire"
+        assert fill.quantity == MAX_ORDER_CONTRACTS
 
 
 class TestAnOrderThatDoesNotFill:
-    """The timeout path -- and the race that makes it dangerous."""
+    """The timeout path: cancel, then find out what the order actually did."""
 
     STILL_WORKING = OrderOutcome(updates_before_done=None, filled=0, status="Submitted")
 
+    def _execution(self, conn, cfg):
+        return IbkrExecution(conn, cfg, fill_timeout=0.01, cancel_timeout=0.01)
+
     def test_an_unfilled_order_is_cancelled_and_read_as_no_fill(self, conn, cfg):
         conn.ib.outcome_for = lambda c, o: self.STILL_WORKING
-        execution = IbkrExecution(conn, cfg, fill_timeout=0.01)
-        assert execution.execute_option(option(), 5, NOW) is None
+        assert self._execution(conn, cfg).execute_option(option(), 5, NOW) is None
         assert conn.ib.cancelled, "the working order was left on the book"
         assert conn.ib.filled_quantity() == 0, "nothing traded, correctly reported"
 
-    def test_an_order_filling_after_the_cancel_is_still_reported_as_nothing(
+    def test_an_order_filling_after_the_cancel_is_reported_as_the_fill_it_was(
         self, conn, cfg
     ):
-        """The race behind issue 2, and the reason a book can drift.
+        """The race behind issue 2, closed.
 
-        ``_send`` cancels and returns ``None`` without waiting for the
-        cancel to be confirmed. IBKR is free to fill in the meantime, and
-        it does. The strategy reads ``None`` as "the leg did not fill",
-        believes it is flat, and tries again on the next poll -- five
-        seconds later, at full size, with no limit on the retries, because
-        ``_entries_this_session`` only counts entries that succeeded.
+        ``_send`` used to cancel and return ``None`` without waiting for
+        the cancel to be confirmed. IBKR is free to fill in the meantime,
+        and it does. The strategy read ``None`` as "the leg did not fill",
+        believed it was flat, and opened again on the next poll -- five
+        seconds later, at full size, with nothing bounding the retries.
 
-        Phase 3 makes this return the fill. Until then, this is what the
-        exchange holds that the book does not.
+        The cancel is now awaited, and whatever filled before it landed is
+        reported as the fill it was. The book and the account agree.
         """
         conn.ib.outcome_for = lambda c, o: OrderOutcome(
             updates_before_done=None, filled=0, status="Submitted",
             fills_on_cancel=5, price=8.0,
         )
-        execution = IbkrExecution(conn, cfg, fill_timeout=0.01)
-        reported = execution.execute_option(option(), -5, NOW)
+        fill = self._execution(conn, cfg).execute_option(option(), -5, NOW)
 
-        assert reported is None, "today the strategy is told nothing happened"
-        assert conn.ib.cancelled, "the order was cancelled"
-        # ... and the exchange filled it anyway. Five short options the
-        # strategy has no record of, and it will size a fresh entry on the
-        # next poll as though the book were flat.
-        assert conn.ib.filled_quantity() == -5
-
-    def test_the_fill_timeout_does_not_bound_how_long_send_blocks(self, conn, cfg):
-        """``fill_timeout`` is a gap between updates, not a deadline.
-
-        The wait loop is written as "keep waiting while this trade is not
-        done", and ``waitOnUpdate`` returns True for *any* traffic on the
-        socket -- a tick on one of the option-chain subscriptions counts.
-        So on a busy market a working order keeps the loop awake and
-        ``_send`` blocks for as long as the market is noisy, whatever
-        ``fill_timeout`` is set to. The whole poll loop is stalled behind
-        it, which means no hedging while it lasts.
-
-        Pinned rather than fixed: Phase 3 owns the wait loop.
-        """
-        conn.ib.idle_updates = 40
-        conn.ib.outcome_for = lambda c, o: self.STILL_WORKING
-        IbkrExecution(conn, cfg, fill_timeout=0.01).execute_option(option(), 5, NOW)
-        assert conn.ib.idle_updates == 0, (
-            "the loop should have consumed every unrelated update before "
-            "giving up -- a single fill_timeout did not bound it"
+        assert conn.ib.cancelled
+        assert fill is not None, "the strategy was told nothing happened"
+        assert fill.quantity == -5
+        assert fill.quantity == conn.ib.filled_quantity(), (
+            "the book and the exchange disagree about what was traded"
         )
 
-    def test_an_unconfirmed_cancel_is_also_read_as_no_fill(self, conn, cfg):
-        """An unknown order state is not the same as a flat book.
+    def test_a_partial_fill_before_the_cancel_is_reported(self, conn, cfg):
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            updates_before_done=None, filled=0, status="Submitted",
+            fills_on_cancel=2, price=8.0,
+        )
+        fill = self._execution(conn, cfg).execute_option(option(), -5, NOW)
+        assert fill.quantity == -2
+        assert conn.ib.filled_quantity() == -2
 
-        Nothing here distinguishes "cancelled, nothing traded" from "we do
-        not know" -- both return ``None``, and the caller treats ``None``
-        as flat.
+    def test_an_unconfirmed_cancel_raises_rather_than_reporting_a_flat_book(
+        self, conn, cfg
+    ):
+        """"We do not know" is not "nothing happened".
+
+        Those two call for opposite responses: one can be retried, the
+        other means the account may hold a position this process has no
+        record of, and retrying is how one such position becomes several.
+        Returning ``None`` made them indistinguishable to the caller, which
+        then assumed the safe-looking one.
         """
         conn.ib.outcome_for = lambda c, o: OrderOutcome(
             updates_before_done=None, filled=0, status="Submitted",
             cancel_confirms=False,
         )
-        execution = IbkrExecution(conn, cfg, fill_timeout=0.01)
-        assert execution.execute_option(option(), -5, NOW) is None
+        with pytest.raises(OrderStateUnknown, match="do not assume it is flat"):
+            self._execution(conn, cfg).execute_option(option(), -5, NOW)
+
+    def test_the_unknown_state_is_distinguishable_from_a_refusal(self, conn, cfg):
+        """A refusal happens before anything is sent, so the book is still
+        correct and a retry is safe. They must not share a type."""
+        assert issubclass(OrderStateUnknown, ExecutionError)
+        cfg.sizing.max_straddles = 1
+        with pytest.raises(ExecutionError) as refused:
+            IbkrExecution(conn, cfg).execute_option(option(), 5, NOW)
+        assert not isinstance(refused.value, OrderStateUnknown)
+
+    def test_the_wait_is_bounded_by_the_clock_not_by_gaps_between_updates(
+        self, conn, cfg
+    ):
+        """``fill_timeout`` is now a deadline.
+
+        It used to be a gap between updates, and ``waitOnUpdate`` returns
+        True for *any* traffic on the socket -- a tick on one of the
+        option-chain subscriptions counts. So a working order on a busy
+        market kept the loop awake for as long as the market was noisy,
+        with the whole poll loop stalled behind it and nothing being
+        hedged meanwhile.
+        """
+        conn.ib.outcome_for = lambda c, o: self.STILL_WORKING
+        conn.ib.idle_updates = 10**9  # a market that never goes quiet
+        execution = IbkrExecution(conn, cfg, fill_timeout=0.2, cancel_timeout=0.2)
+
+        started = time.monotonic()
+        assert execution.execute_option(option(), 5, NOW) is None
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"blocked for {elapsed:.1f}s on a 0.2s timeout"
+        assert conn.ib.idle_updates > 0, "it drained the market instead of the clock"
 
 
 class TestWhatIfMargin:

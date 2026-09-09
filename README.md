@@ -886,8 +886,22 @@ Routing real orders is the one irreversible thing here, so:
   session is logged into, not by this flag.
 - `--dry-run` computes and logs every decision and places nothing.
 - Every order is size-checked before it is sent, against both the config
-  limits and a hard `MAX_ORDER_CONTRACTS` backstop. A flatten larger than
-  the hedge cap is sent as a sequence of capped orders rather than refused.
+  limits and a hard `MAX_ORDER_CONTRACTS` backstop. The backstop is applied
+  as `min(MAX_ORDER_CONTRACTS, sizing.max_straddles)`, so it only binds when
+  it is the smaller of the two — at the shipped defaults they are equal and
+  it cannot fire, which `sizing.validate` now says at startup. A flatten
+  larger than the hedge cap is sent as a sequence of capped orders rather
+  than refused.
+- **An order that does not fill in `fill_timeout` is cancelled, and the
+  cancel is awaited.** Whatever filled before it landed is reported as the
+  fill it was, rather than as nothing: IBKR is free to fill while a cancel
+  is in flight, and reading that as "flat" is what let a book grow a
+  position per poll. If the cancel cannot be confirmed the outcome is
+  genuinely unknown, and `OrderStateUnknown` is raised rather than a `None`
+  the caller would read as a flat book — the strategy then unwinds the leg
+  it does know about and halts entries.
+- `strategy.max_entries_per_session` counts **attempts**, not fills, so a
+  leg that keeps failing cannot be retried all session.
 - The runner **reconciles against IBKR positions**, at connect and then
   every `live.reconcile_seconds`. It adopts an existing MES hedge, and
   adopts an existing option position only when it is a *matched* straddle —
