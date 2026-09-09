@@ -643,8 +643,16 @@ class FlowConfig:
     loudly rather than silently synthesising flow.
     """
 
-    #: ``"none"`` | ``"csv"`` | ``"synthetic"`` | ``"ibkr"``. ``ibkr`` needs
-    #: a live connection and is built by the live runner, not here.
+    #: ``"none"`` | ``"csv"`` | ``"synthetic"`` | ``"ibkr"`` |
+    #: ``"databento"``. The last two need a live connection and are built
+    #: by the live runner, not here.
+    #:
+    #: ``databento`` is the one that reads MDP 3.0's aggressor flag
+    #: directly, so rule 1 of the classification chain resolves the tape
+    #: and the Lee-Ready rules never have to run. It shares the session the
+    #: Databento open-interest providers own, so it needs
+    #: ``data.open_interest`` set to ``databento`` or ``databento_flow``
+    #: too; ``ibkr`` relays no flag and falls back to Lee-Ready.
     source: str = "none"
     #: CSV replay: a tape with
     #: ``timestamp,expiry,strike,right,price,size`` and, where the export
@@ -694,10 +702,12 @@ class FlowConfig:
     synthetic_seed: int = 23
 
     def validate(self) -> None:
-        if self.source.lower() not in ("none", "csv", "synthetic", "ibkr"):
+        if self.source.lower() not in (
+            "none", "csv", "synthetic", "ibkr", "databento"
+        ):
             raise ValueError(
                 f"unknown flow.source {self.source!r}; use 'none', 'csv', "
-                "'synthetic' or 'ibkr'"
+                "'synthetic', 'ibkr' or 'databento'"
             )
         if self.source.lower() == "csv" and not self.csv_path:
             raise ValueError("flow.csv_path must be set when flow.source == 'csv'")

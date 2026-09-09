@@ -23,6 +23,14 @@ that lives in ``broker.ibkr`` with the rest of the live path:
     own open interest would produce a confidence gate firing constantly for
     reasons that have nothing to do with any market.
 
+The two live feeds live with their connections -- ``IbkrTradeFeed`` in
+``broker.ibkr`` and ``DatabentoTradeFeed`` in ``databento_source`` -- and
+they are not equivalent.  Databento reads MDP 3.0's aggressor flag, so
+rule 1 of the classification chain resolves the tape outright; IBKR relays
+no such flag, so its feed falls back to the Lee-Ready quote and tick rules.
+Same interface, materially different evidence, and
+``DealerFlowBook.rule_counts`` is what says which one a given read got.
+
 ``NullTradeFeed``
     No tape at all, which is the default.  Every strike then falls back to
     ``gex.call_sign``/``gex.put_sign`` and the system behaves exactly as it
@@ -101,7 +109,15 @@ class CsvTradeFeed:
                 f"found {', '.join(frame.columns)}"
             )
         stamps = pd.to_datetime(frame["timestamp"])
-        if getattr(stamps.dt, "tz", None) is None and self.tz is not None:
+        if getattr(stamps.dt, "tz", None) is None:
+            if self.tz is None:
+                raise ValueError(
+                    f"{self.path} has naive timestamps and no timezone was "
+                    "supplied to localise them with. The strategy compares "
+                    "them against timezone-aware bar times, so a naive tape "
+                    "would silently classify nothing -- give the column an "
+                    "offset, or build the feed with a tz."
+                )
             stamps = stamps.dt.tz_localize(self.tz)
         frame["timestamp"] = stamps
         frame["expiry"] = pd.to_datetime(frame["expiry"]).dt.date
@@ -291,6 +307,11 @@ def _unit_draw(*parts: object) -> float:
 
 
 def build_trade_feed(cfg, source: RiskSource, open_interest=None, tz=None):
+    # ``tz`` localises a replayed tape whose timestamps carry no offset.
+    # The strategy compares trade times against timezone-aware bar times,
+    # so a naive tape has to be given a zone or refused -- comparing the
+    # two raises, which the strategy would catch and log as a feed failure
+    # once per bar while quietly classifying nothing.
     """Construct the feed named by ``cfg.flow.source``.
 
     ``ibkr`` is not constructible here -- it needs a live connection -- so
@@ -305,13 +326,13 @@ def build_trade_feed(cfg, source: RiskSource, open_interest=None, tz=None):
         return CsvTradeFeed(cfg.flow, source, tz=tz)
     if kind == "synthetic":
         return SyntheticTradeFeed(cfg.flow, source, open_interest)
-    if kind == "ibkr":
+    if kind in ("ibkr", "databento"):
         raise ValueError(
-            "flow.source == 'ibkr' needs a live IBKR connection; it is "
+            f"flow.source == {kind!r} needs a live connection; it is "
             "available in `deltahedger live`, not in a backtest. Use 'csv' to "
             "replay a real option tape historically."
         )
     raise ValueError(
         f"unknown flow source {cfg.flow.source!r}; use 'none', 'csv', "
-        "'synthetic' or 'ibkr'"
+        "'synthetic', 'ibkr' or 'databento'"
     )

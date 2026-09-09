@@ -65,7 +65,9 @@ def run_backtest(
     tape = (
         trade_feed
         if trade_feed is not None
-        else build_trade_feed(cfg, risk_source, oi)
+        else build_trade_feed(
+            cfg, risk_source, oi, tz=ZoneInfo(risk_source.timezone)
+        )
     )
     strategy = GexStraddleStrategy(
         cfg, risk_source, open_interest=oi, trade_feed=tape

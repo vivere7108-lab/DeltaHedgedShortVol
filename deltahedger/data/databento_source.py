@@ -19,6 +19,23 @@ synthetic, CSV and IBKR providers do -- see ``data.openinterest`` -- so
     measurement. See its docstring for exactly what it does and does not
     claim.
 
+``DatabentoTradeFeed``
+    Not an open-interest provider at all: it hands ``deltahedger.flow``
+    the individual executions, each carrying MDP 3.0's own aggressor side,
+    so the dealer *sign* at each strike is measured rather than assumed.
+    This is the one live path on which rule 1 of the classification chain
+    actually fires -- IBKR relays no aggressor flag, so the IBKR feed falls
+    back to Lee-Ready.  The session already decodes every ``TradeMsg`` for
+    the flow-adjusted provider above; this only keeps them.
+
+    The two are different quantities off the same messages and it is worth
+    being explicit about which is which.  The flow-adjusted provider uses
+    aggressor side to guess how much open interest has been *added* at a
+    strike since the print.  The trade feed uses it to say who ended up
+    *holding* what -- the dealer is the resting side.  One adjusts a
+    magnitude, the other decides a sign, and neither substitutes for the
+    other.
+
 There is no single parent symbol for this instrument family
 --------------------------------------------------------------
 Confirmed empirically, 2026-09-08: Databento's parent-symbol grouping
@@ -56,10 +73,11 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from ..config import Config
+from ..flow import BUY, CALL, PUT, SELL, UNKNOWN, OptionTrade
 from ..gex import StrikeOpenInterest
 from ..instruments import RiskSource
 
@@ -88,6 +106,14 @@ class DatabentoSession:
         self._live = None
         self._started = False
         self._warned_expiries: set[date] = set()
+        #: Executions kept for ``DatabentoTradeFeed``, per expiry, oldest
+        #: first. Off unless something asks for them: the session decodes
+        #: every trade anyway for the flow-adjusted provider, but keeping
+        #: them costs memory that a walk not measuring the dealer sign has
+        #: no use for.
+        self._capture_trades = False
+        self._trades: dict[date, list[OptionTrade]] = {}
+        self._dropped_trades = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -223,15 +249,30 @@ class DatabentoSession:
             # accumulated against the old print no longer applies.
             self._flow[record.instrument_id] = 0.0
 
-    def _on_trade(self, record: object) -> None:
-        import databento_dbn as dbn
+    #: Per-expiry cap on kept executions. A drain that stops happening --
+    #: the poll loop wedged, the strategy standing aside all day -- must
+    #: not turn into unbounded memory on a walk that runs for days. Past
+    #: the cap the oldest are dropped and the count is reported, because
+    #: silently keeping the *newest* would bias the measured sign towards
+    #: whatever the last few minutes did.
+    MAX_BUFFERED_TRADES = 20_000
 
-        if record.side == dbn.Side.BID:
+    def enable_trade_capture(self) -> None:
+        """Start keeping decoded executions for ``DatabentoTradeFeed``."""
+        with self._lock:
+            self._capture_trades = True
+
+    def _on_trade(self, record: object) -> None:
+        if self._capture_trades:
+            self._capture(record)
+
+        side = _aggressor_side(record.side)
+        if side == BUY:
             signed = float(record.size)
-        elif record.side == dbn.Side.ASK:
+        elif side == SELL:
             signed = -float(record.size)
         else:
-            return
+            return  # no aggressor named: an implied or administrative fill
         with self._lock:
             base = self._oi.get(record.instrument_id)
             if base is None:
@@ -243,7 +284,76 @@ class DatabentoSession:
                 self._flow.get(record.instrument_id, 0.0) + signed
             )
 
+    def _capture(self, record: object) -> None:
+        """Keep one execution for the dealer-sign measurement.
+
+        Deliberately *before* the two early returns the flow-adjusted
+        provider makes below.  Those are right for adjusting an open-
+        interest print -- a trade that predates the print is already inside
+        it, and a strike with no print yet has nothing to adjust -- and
+        wrong here.  Who took which side of an execution is evidence about
+        dealer positioning whether or not there is an open-interest figure
+        at that strike to attach it to, and discarding it would make the
+        measured sign depend on the arrival order of an unrelated message.
+        """
+        with self._lock:
+            definition = self._definitions.get(record.instrument_id)
+        if definition is None:
+            return  # no strike/right yet; the definition message is late
+        side = _aggressor_side(record.side)
+        trade = OptionTrade(
+            timestamp=datetime.fromtimestamp(
+                record.ts_event / 1e9, tz=timezone.utc
+            ),
+            expiry=definition.expiry,
+            strike=definition.strike,
+            right=definition.right,
+            price=float(record.pretty_price),
+            size=float(record.size),
+            # MDP 3.0 states the aggressor outright, so rule 1 of the
+            # classification chain resolves this and the Lee-Ready rules
+            # never run. No quote is attached because none is needed and
+            # the trades schema does not carry one -- attaching a stale
+            # top-of-book from another subscription would add a worse
+            # answer underneath a better one.
+            aggressor=side,
+        )
+        with self._lock:
+            kept = self._trades.setdefault(definition.expiry, [])
+            kept.append(trade)
+            if len(kept) > self.MAX_BUFFERED_TRADES:
+                overflow = len(kept) - self.MAX_BUFFERED_TRADES
+                del kept[:overflow]
+                self._dropped_trades += overflow
+
     # -- reads --------------------------------------------------------------
+
+    def take_trades(
+        self, expiry: date, start: datetime, end: datetime
+    ) -> list[OptionTrade]:
+        """Executions in ``(start, end]``, removing what is now in the past.
+
+        Half-open, like every other feed: a trade folded into the dealer
+        position twice would move a strike's sign with nothing downstream
+        able to see that it had.  Anything at or before ``end`` is dropped
+        on the way out, because a window is only ever asked for once and
+        keeping it would only grow the buffer.
+        """
+        with self._lock:
+            rows = self._trades.get(expiry)
+            if not rows:
+                return []
+            kept = [t for t in rows if start < t.timestamp <= end]
+            self._trades[expiry] = [t for t in rows if t.timestamp > end]
+            dropped, self._dropped_trades = self._dropped_trades, 0
+        if dropped:
+            log.warning(
+                "databento: dropped %d buffered executions for %s before they "
+                "were read (buffer cap %d) -- the measured dealer sign for "
+                "that expiry is missing them",
+                dropped, expiry, self.MAX_BUFFERED_TRADES,
+            )
+        return kept
 
     def rows(self, expiry: date, adjusted: bool) -> list[StrikeOpenInterest]:
         """Every strike with a known OI print for ``expiry``.
@@ -284,6 +394,66 @@ class DatabentoSession:
             StrikeOpenInterest(strike=strike, call_oi=sides["C"], put_oi=sides["P"])
             for strike, sides in sorted(by_strike.items())
         ]
+
+
+def _aggressor_side(side: object) -> str:
+    """MDP 3.0's aggressor side, as ``deltahedger.flow`` spells it.
+
+    Databento reports the side that *initiated* the trade: ``Bid`` for a
+    buy aggressor, ``Ask`` for a sell aggressor, and ``None`` where the
+    match names no aggressor (an implied or administrative fill).  That
+    last case is left ``UNKNOWN`` and falls through to the rest of the
+    classification chain rather than being guessed at.
+
+    This is the single definition of that mapping.  ``_on_trade`` above
+    uses the same convention to sign its open-interest adjustment, and two
+    copies of a direction this load-bearing is two chances to invert one.
+    """
+    import databento_dbn as dbn
+
+    if side == dbn.Side.BID:
+        return BUY
+    if side == dbn.Side.ASK:
+        return SELL
+    return UNKNOWN
+
+
+class DatabentoTradeFeed:
+    """The option tape off MDP 3.0, carrying its own aggressor flag.
+
+    An ``OptionTradeFeed`` (see ``deltahedger.flow``) reading the executions
+    the shared ``DatabentoSession`` has already decoded.  Construction turns
+    capture on; before that the session throws each trade away once it has
+    adjusted its open-interest figure with it.
+
+    This is the feed the flow layer was written for.  Every other live path
+    infers the aggressor -- IBKR relays no flag, so it runs Lee-Ready
+    against the prevailing quote -- and inference has an error rate that is
+    worse for wide quotes and thin books and is not symmetric between the
+    two sides.  Here the exchange states the aggressor in the trade summary
+    message and rule 1 resolves essentially the whole tape, which is
+    visible as ``aggressor_flag`` dominating ``DealerFlowBook.rule_counts``.
+
+    It subscribes nothing of its own: the roots are already subscribed by
+    whichever open-interest provider is running, so a walk wanting measured
+    signs off this feed needs ``data.open_interest`` on one of the Databento
+    providers too.  ``build_trade_feed`` says so rather than silently
+    delivering an empty tape.
+    """
+
+    def __init__(self, session: DatabentoSession, connection: Any):
+        self._session = session
+        self._connection = connection
+        session.enable_trade_capture()
+
+    def trades(
+        self, start: datetime, end: datetime, expiry: date
+    ) -> list[OptionTrade]:
+        # Same lazy subscription the open-interest providers make: an
+        # expiry entering the blend has to have its root resolved and
+        # subscribed before anything arrives for it.
+        self._session.ensure_subscribed(expiry, self._connection)
+        return self._session.take_trades(expiry, start, end)
 
 
 class DatabentoOpenInterestProvider:

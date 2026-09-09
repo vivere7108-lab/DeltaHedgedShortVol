@@ -58,6 +58,7 @@ from ..data.databento_source import (
     DatabentoFlowAdjustedOpenInterestProvider,
     DatabentoOpenInterestProvider,
     DatabentoSession,
+    DatabentoTradeFeed,
 )
 from ..sizing import build_margin_model
 from ..strategy import GexStraddleStrategy
@@ -178,19 +179,16 @@ class LiveRunner:
                 if self.cfg.ibkr.use_whatif_margin
                 else fallback
             )
-            # Built per connection: a tick-by-tick subscription does not
-            # survive the gateway's nightly restart, so a feed carried
-            # across a reconnect would be a live-looking object delivering
-            # nothing.
-            self.trade_feed = (
-                IbkrTradeFeed(conn, self.cfg)
-                if self.cfg.flow.source.lower() == "ibkr" else None
-            )
+            # Open interest first: the Databento trade feed rides the
+            # session those providers own, so it has to exist before the
+            # feed asks it to start capturing.
+            open_interest = self._open_interest_provider(conn)
+            self.trade_feed = self._trade_feed(conn)
             strategy = GexStraddleStrategy(
                 self.cfg,
                 self.source,
                 margin_model,
-                open_interest=self._open_interest_provider(conn),
+                open_interest=open_interest,
                 trade_feed=self.trade_feed,
             )
             self.strategy = strategy
@@ -231,12 +229,50 @@ class LiveRunner:
                     last_heartbeat = now
                 conn.ib.sleep(self.cfg.ibkr.poll_seconds)
 
-            if self.trade_feed is not None:
-                # The subscriptions die with the socket either way, but
-                # cancelling them explicitly keeps a reconnect from landing
-                # on an account that still counts them against its limit.
+            if self.trade_feed is not None and hasattr(self.trade_feed, "close"):
+                # IBKR only: the subscriptions die with the socket either
+                # way, but cancelling them explicitly keeps a reconnect from
+                # landing on an account that still counts them against its
+                # limit. The Databento feed holds no subscriptions of its
+                # own -- the session it rides is closed with the runner.
                 self.trade_feed.close()
             log.info("live runner stopped after %d cycles", self._cycles)
+
+    def _trade_feed(self, conn):
+        """The option tape, from whichever live feed is configured.
+
+        Built per connection rather than carried across one: an IBKR
+        tick-by-tick subscription does not survive the gateway's nightly
+        restart, so a feed held over a reconnect would be a live-looking
+        object delivering nothing.  The Databento session *does* survive
+        (it has its own connection and reconnect cycle), but the feed
+        wrapping it is cheap and rebuilding it keeps the two paths the
+        same shape.
+
+        ``databento`` is the feed that reads MDP 3.0's aggressor flag, and
+        it rides the session the Databento open-interest providers own --
+        so it needs one of those running. Asking for it without one is
+        refused here rather than silently delivering an empty tape, which
+        would look exactly like a quiet market and leave every dealer sign
+        on the prior.
+        """
+        kind = self.cfg.flow.source.lower()
+        if kind == "ibkr":
+            return IbkrTradeFeed(conn, self.cfg)
+        if kind == "databento":
+            if self._databento is None:
+                raise ValueError(
+                    "flow.source == 'databento' reads the option tape off the "
+                    "Databento session the open-interest providers own, so "
+                    "data.open_interest must be 'databento' or "
+                    f"'databento_flow' too (it is "
+                    f"{self.cfg.data.open_interest!r}). Use flow.source "
+                    "'ibkr' to measure the dealer sign off IBKR's tape "
+                    "instead -- it carries no MDP 3.0 aggressor flag, so it "
+                    "classifies with the Lee-Ready rules."
+                )
+            return DatabentoTradeFeed(self._databento, conn)
+        return None
 
     def _open_interest_provider(self, conn):
         """Build the OI provider named by ``cfg.data.open_interest``.
@@ -353,6 +389,11 @@ class LiveRunner:
         subscriptions that have to be re-centred as spot moves.
         """
         if self.trade_feed is None or self.strategy is None:
+            return
+        if not hasattr(self.trade_feed, "subscribe"):
+            # Databento: the roots are already subscribed by the
+            # open-interest provider sharing its session, and the feed
+            # resolves a newly listed expiry itself on the first pull.
             return
         try:
             self.trade_feed.subscribe(

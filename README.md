@@ -212,9 +212,33 @@ a read sits, and the strike table shows the signs actually used:
 | `none` *(default)* | No feed. Every strike keeps the prior and the system behaves exactly as it did before — a deployment either has an aggressor-carrying feed or it does not, and the wrong response to not having one is to invent it. |
 | `csv` | Replays a real tape: `timestamp,expiry,strike,right,price,size` required, `bid,ask,aggressor,bid_size_delta,ask_size_delta` used when present. `aggressor` takes MDP 3.0 tag 5797 verbatim. |
 | `synthetic` | A **harness**, not a market model. It exercises the classification path end to end in a generated run, and is built to agree with the generated open interest rather than contradict it. It says the machinery works, never that the signal works. |
-| `ibkr` | The live tape, via tick-by-tick `AllLast` plus top-of-book. Live runs only. |
+| `ibkr` | The live tape, via tick-by-tick `AllLast` plus top-of-book. No aggressor flag, so Lee-Ready does the work. Live runs only. |
+| `databento` | The live tape off **CME MDP 3.0 directly**, carrying the exchange's own aggressor side. Rule 1 resolves essentially the whole tape. Rides the session the Databento open-interest providers own, so it needs `data.open_interest` on `databento` or `databento_flow` too. Live runs only. |
 
-**What IBKR does and does not relay.** IBKR passes CME's data through but
+**The two live feeds are not equivalent.** Same precedence chain, materially
+different evidence reaching it — and `DealerFlowBook.rule_counts` is what
+says which one a read got:
+
+| | aggressor flag | book deltas | what actually classifies |
+|---|---|---|---|
+| `databento` | yes (tag 5797) | — | rule 1, essentially all of it |
+| `ibkr` | no | no | rules 3–4, Lee-Ready inference |
+
+Databento's `TradeMsg.side` *is* MDP 3.0's aggressor side (`BID` = buy
+aggressor → dealer short; `ASK` = sell aggressor → dealer long). That
+mapping has one definition in the codebase, shared with the flow-adjusted
+open-interest provider that signs its adjustment off the same field —
+inverting it would not degrade the strategy, it would reverse it.
+
+Note the two uses of those same messages are different quantities:
+`DatabentoFlowAdjustedOpenInterestProvider` uses aggressor side to estimate
+how much open interest has been *added* at a strike since the last print;
+`DatabentoTradeFeed` uses it to say who ended up *holding* what. One adjusts
+a magnitude, the other decides a sign, and neither substitutes for the
+other.
+
+**What IBKR does and does not relay**, for walks on that path. IBKR passes
+CME's data through but
 **not** MDP 3.0's `AggressorSide` or the market-by-order deltas — a
 tick-by-tick record carries the print, and `reqMktData` carries the top of
 book. So on the IBKR path rules 1 and 2 never fire and Lee-Ready does all

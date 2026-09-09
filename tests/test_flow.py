@@ -366,11 +366,29 @@ class TestFeeds:
     def test_the_null_feed_delivers_nothing(self):
         assert NullTradeFeed().trades(NOW, NOW + timedelta(minutes=5), EXPIRY) == ()
 
-    def test_the_factory_refuses_ibkr_outside_a_live_run(self):
+    @pytest.mark.parametrize("kind", ["ibkr", "databento"])
+    def test_the_factory_refuses_a_live_feed_in_a_backtest(self, kind):
         cfg = Config()
-        cfg.flow.source = "ibkr"
-        with pytest.raises(ValueError, match="live IBKR connection"):
+        cfg.flow.source = kind
+        with pytest.raises(ValueError, match="live connection"):
             build_trade_feed(cfg, cfg.source)
+
+    def test_databento_is_the_one_live_feed_carrying_the_aggressor_flag(self):
+        """The precedence chain is the same; the evidence reaching it is not.
+
+        Databento decodes MDP 3.0's own ``AggressorSide``, so rule 1
+        resolves the tape. IBKR relays no such flag, so the same chain
+        falls through to Lee-Ready. Asserting the mapping here rather than
+        only in the live path keeps the one direction that cannot be
+        checked against a running feed under test: BID is the *buy*
+        aggressor, and a customer buy leaves the dealer short.
+        """
+        from deltahedger.data.databento_source import _aggressor_side
+
+        dbn = pytest.importorskip("databento_dbn")
+        assert _aggressor_side(dbn.Side.BID) == BUY
+        assert _aggressor_side(dbn.Side.ASK) == SELL
+        assert _aggressor_side(dbn.Side.NONE) == UNKNOWN
 
     def test_the_factory_rejects_an_unknown_source(self):
         cfg = Config()
@@ -423,6 +441,37 @@ class TestFeeds:
         book.observe_all(feed.trades(NOW - timedelta(minutes=1), NOW + timedelta(hours=1), EXPIRY))
         # The tick test alone, and the rule counts say so.
         assert book.rule_counts().get(RULE_TICK) == 10.0
+
+    def test_csv_replay_refuses_naive_timestamps_it_cannot_localise(
+        self, tmp_path, es
+    ):
+        # The strategy compares trade times against timezone-aware bar
+        # times. A naive tape makes that comparison raise, which the
+        # strategy catches and logs as a feed failure once per bar -- so it
+        # would classify nothing while looking like a quiet market.
+        path = tmp_path / "tape.csv"
+        path.write_text(
+            "timestamp,expiry,strike,right,price,size\n"
+            "2025-06-10T10:00:00,2025-06-10,5000,C,10.0,10\n"
+        )
+        feed = CsvTradeFeed(FlowConfig(source="csv", csv_path=str(path)), es)
+        with pytest.raises(ValueError, match="naive timestamps"):
+            feed.trades(NOW, NOW + timedelta(hours=1), EXPIRY)
+
+    def test_csv_replay_localises_naive_timestamps_when_given_a_zone(
+        self, tmp_path, es
+    ):
+        path = tmp_path / "tape.csv"
+        path.write_text(
+            "timestamp,expiry,strike,right,price,size\n"
+            "2025-06-10T10:00:00,2025-06-10,5000,C,10.0,10\n"
+        )
+        feed = CsvTradeFeed(
+            FlowConfig(source="csv", csv_path=str(path)), es, tz=NY
+        )
+        rows = feed.trades(NOW - timedelta(minutes=1), NOW + timedelta(hours=1), EXPIRY)
+        assert len(rows) == 1
+        assert rows[0].timestamp == NOW
 
     def test_csv_replay_rejects_a_file_missing_required_columns(self, tmp_path, es):
         path = tmp_path / "tape.csv"

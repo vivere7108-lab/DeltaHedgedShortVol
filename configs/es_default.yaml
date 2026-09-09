@@ -212,10 +212,16 @@ data:
 # `none` is the honest default: a deployment either has an
 # aggressor-carrying feed or it does not, and without one every strike falls
 # back to gex.call_sign/put_sign and the system behaves as it always did.
-# `ibkr` is only available in `deltahedger live`; a backtest needs `csv` to
-# replay a real tape, or `synthetic` to exercise the classification path.
+#
+# `databento` is the only feed that actually carries the aggressor flag --
+# it reads MDP 3.0 directly, so rule 1 resolves the tape and Lee-Ready never
+# runs. It rides the session the Databento open-interest providers own, so
+# it needs data.open_interest on `databento` or `databento_flow` too.
+# `ibkr` relays no flag and falls back to Lee-Ready. Both are live-only; a
+# backtest needs `csv` to replay a real tape, or `synthetic` to exercise the
+# classification path.
 flow:
-  source: none               # none | csv | synthetic | ibkr
+  source: none               # none | csv | synthetic | ibkr | databento
   csv_path: null             # timestamp,expiry,strike,right,price,size
                              # [,bid,ask,aggressor,bid_size_delta,ask_size_delta]
   # The classification chain, in precedence order. Each rule runs only when

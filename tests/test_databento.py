@@ -14,7 +14,7 @@ parent symbol after "ES.OPT" turned out to resolve to nothing live -- see
 the module docstring for what CME actually lists ES's weeklies under.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -23,13 +23,27 @@ from deltahedger.data.databento_source import (
     DatabentoFlowAdjustedOpenInterestProvider,
     DatabentoOpenInterestProvider,
     DatabentoSession,
+    DatabentoTradeFeed,
+    _aggressor_side,
     _Definition,
 )
+from deltahedger.flow import BUY, SELL, UNKNOWN, OptionTrade
 from deltahedger.instruments import get_risk_source
 
 NOW = datetime(2026, 9, 8, 10, 0)
 EXPIRY = date(2026, 9, 8)
 OTHER_EXPIRY = date(2026, 9, 9)
+UTC = timezone.utc
+TAPE_START = datetime(2026, 9, 8, 14, 0, tzinfo=UTC)
+
+
+def buffered(minutes: float, side: str = SELL, size: float = 10.0) -> OptionTrade:
+    """One execution in the session's buffer, ``minutes`` after TAPE_START."""
+    return OptionTrade(
+        timestamp=TAPE_START + timedelta(minutes=minutes),
+        expiry=EXPIRY, strike=5000.0, right="C",
+        price=10.0, size=size, aggressor=side,
+    )
 
 
 class FakeContract:
@@ -296,3 +310,108 @@ class TestStart:
         monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
         with pytest.raises(RuntimeError, match="DATABENTO_API_KEY"):
             session.start()
+
+
+class TestAggressorSide:
+    """The one direction that decides which side the whole system takes.
+
+    MDP 3.0 reports the side of the *aggressor* on a trade, and Databento's
+    own enum documents it that way. ``BID`` is therefore a buy aggressor --
+    a customer who bought, leaving the dealer short the option and short
+    its gamma. Inverting this does not degrade the strategy, it reverses
+    it, which is why the mapping has one definition and this test.
+    """
+
+    def test_bid_is_the_buy_aggressor(self):
+        dbn = pytest.importorskip("databento_dbn")
+        assert _aggressor_side(dbn.Side.BID) == BUY
+
+    def test_ask_is_the_sell_aggressor(self):
+        dbn = pytest.importorskip("databento_dbn")
+        assert _aggressor_side(dbn.Side.ASK) == SELL
+
+    def test_no_named_aggressor_is_unknown_rather_than_a_guess(self):
+        # An implied or administrative match names no aggressor. It falls
+        # through to the rest of the classification chain instead of being
+        # booked as one side or the other.
+        dbn = pytest.importorskip("databento_dbn")
+        assert _aggressor_side(dbn.Side.NONE) == UNKNOWN
+
+    def test_the_open_interest_adjustment_uses_the_same_mapping(self):
+        """The session signs its OI adjustment off this same function.
+
+        Two copies of the direction would be two chances to invert one, and
+        an inverted copy in either place is invisible in a log.
+        """
+        import inspect
+
+        from deltahedger.data import databento_source
+
+        body = inspect.getsource(databento_source.DatabentoSession._on_trade)
+        assert "_aggressor_side" in body
+        assert "dbn.Side" not in body
+
+
+class TestTakeTrades:
+    """Buffering and windowing, driven without a live connection."""
+
+    def test_a_window_returns_only_the_trades_inside_it(self, session):
+        session._trades[EXPIRY] = [buffered(0), buffered(5), buffered(10)]
+        rows = session.take_trades(
+            EXPIRY, TAPE_START, TAPE_START + timedelta(minutes=5)
+        )
+        assert [t.timestamp for t in rows] == [TAPE_START + timedelta(minutes=5)]
+
+    def test_windows_are_half_open_so_nothing_is_counted_twice(self, session):
+        session._trades[EXPIRY] = [buffered(0), buffered(5), buffered(10)]
+        first = session.take_trades(
+            EXPIRY, TAPE_START - timedelta(minutes=1), TAPE_START + timedelta(minutes=5)
+        )
+        second = session.take_trades(
+            EXPIRY, TAPE_START + timedelta(minutes=5), TAPE_START + timedelta(minutes=10)
+        )
+        assert len(first) == 2 and len(second) == 1
+        assert not (set(id(t) for t in first) & set(id(t) for t in second))
+
+    def test_consumed_trades_are_dropped_but_later_ones_are_kept(self, session):
+        session._trades[EXPIRY] = [buffered(0), buffered(10)]
+        session.take_trades(EXPIRY, TAPE_START - timedelta(minutes=1), TAPE_START)
+        # The 10-minute trade has not been asked for yet and must survive.
+        assert len(session._trades[EXPIRY]) == 1
+
+    def test_expiries_are_kept_apart(self, session):
+        session._trades[EXPIRY] = [buffered(0)]
+        assert session.take_trades(
+            OTHER_EXPIRY, TAPE_START - timedelta(minutes=1),
+            TAPE_START + timedelta(minutes=1),
+        ) == []
+
+    def test_an_expiry_with_no_tape_yet_returns_nothing(self, session):
+        assert session.take_trades(EXPIRY, TAPE_START, NOW.replace(tzinfo=UTC)) == []
+
+    def test_an_overflowing_buffer_is_reported_not_silently_truncated(
+        self, session, caplog
+    ):
+        session._dropped_trades = 250
+        session._trades[EXPIRY] = [buffered(0)]
+        with caplog.at_level("WARNING"):
+            session.take_trades(
+                EXPIRY, TAPE_START - timedelta(minutes=1),
+                TAPE_START + timedelta(minutes=1),
+            )
+        assert "dropped 250" in caplog.text
+        # Reported once, not on every subsequent poll.
+        assert session._dropped_trades == 0
+
+
+class TestTradeFeedWiring:
+    def test_constructing_the_feed_turns_capture_on(self, session, es):
+        assert session._capture_trades is False
+        DatabentoTradeFeed(session, FakeConnection(es, trading_class="E2B"))
+        assert session._capture_trades is True
+
+    def test_capture_is_off_until_something_asks_for_it(self, session):
+        # The session decodes every trade anyway for the flow-adjusted
+        # provider; keeping them costs memory a walk that is not measuring
+        # the dealer sign has no use for.
+        assert session._capture_trades is False
