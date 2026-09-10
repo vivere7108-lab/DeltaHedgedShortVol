@@ -154,16 +154,18 @@ class TestSpanScan:
         """Documents why reg_t is not the default.
 
         It charges the losing leg in full against notional rather than
-        against a scanned move, so it lands well above SPAN -- but only by
-        a factor of two or so, not the order of magnitude an earlier
-        revision recorded here. That figure was an artefact of the SPAN
-        branch being run off a scan range ten times too narrow; it is the
-        SPAN number that was wrong, not this one.
+        against a scanned move, so it lands above SPAN -- by a factor of
+        two at CME's published bond, and by a slimmer margin now that the
+        scan is derived from what IBKR actually holds against an outright
+        ES, which is about double the exchange minimum. An earlier
+        revision recorded an order of magnitude here; that was an artefact
+        of the SPAN branch being run off a scan range ten times too
+        narrow. It is the SPAN number that was wrong, not this one.
         """
         quote = straddle(es)
         regt = RegTMarginModel().straddle_requirement(quote, F, es, SHORT)
         scan = span.straddle_requirement(quote, F, es, SHORT)
-        assert 1.5 * scan < regt < 5.0 * scan
+        assert scan < regt < 5.0 * scan
 
     def test_regt_still_charges_only_the_debit_for_a_long(self, es):
         quote = straddle(es)

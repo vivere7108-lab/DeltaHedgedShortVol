@@ -15,8 +15,10 @@ Differences from the backtest that are worth being explicit about:
     squares a half-filled straddle before it records anything.  On top of
     that the book is checked against IBKR's own positions at connect
     (``_reconcile``, which adopts them) and then on the
-    ``live.reconcile_seconds`` timer (``_verify_positions``, which halts
-    entries on any disagreement).  That second check is the one that
+    ``live.reconcile_seconds`` timer and immediately after any leg the
+    strategy reports as failed or squared (``_verify_positions``, which
+    halts entries on any disagreement, and on any position the book has
+    no way to represent).  That second check is the one that
     matters: between two connects the book is only this process's record
     of its own fills, and an order IBKR fills *after*
     ``IbkrExecution._send`` has given up waiting and cancelled it is
@@ -103,6 +105,37 @@ class _PositionRow:
     expiry: date | None = None
     strike: float = 0.0
     right: str = ""
+    #: How IBKR names the contract, for rows the book cannot classify.
+    label: str = ""
+
+
+def _net(rows: list["_PositionRow"]) -> tuple[int, float]:
+    """One signed quantity and its cost-weighted average price.
+
+    IBKR reports one row per contract month, so after a quarterly roll
+    the hedge can be two rows. Reading only the first was fine until it
+    was not.
+    """
+    quantity = sum(row.quantity for row in rows)
+    if quantity == 0:
+        return 0, 0.0
+    weighted = sum(row.quantity * row.entry_price for row in rows)
+    return quantity, weighted / quantity
+
+
+def _describe(rows: list["_PositionRow"]) -> str:
+    return ", ".join(f"{row.quantity:+d} {row.label}" for row in rows)
+
+
+def _foreign_reason(rows: list["_PositionRow"], source: RiskSource) -> str:
+    return (
+        f"the account holds {_describe(rows)}, which is neither the "
+        f"{source.hedge.symbol} hedge nor a {source.option.symbol} option and "
+        "so cannot be marked, hedged or closed by this book. It may be an "
+        "expired option exercised into the future, or something opened "
+        "outside the runner; either way its margin and its P&L are in the "
+        "account's numbers and not in the book's. Close it, then restart."
+    )
 
 
 def _parse_expiry(value: str) -> date:
@@ -200,6 +233,12 @@ class LiveRunner:
         # manages its own session, so it is started once and outlives any
         # number of IBKR gateway restarts.
         self._databento: DatabentoSession | None = None
+        #: The reason entries were halted, kept here because the strategy
+        #: that holds the flag is rebuilt on every reconnect. A halt is a
+        #: finding about the *account*, and the account does not change
+        #: because the gateway restarted at 02:00.
+        self._halt_reason = ""
+        self._warned_foreign_equity = False
 
     def request_stop(self, *_: object) -> None:
         log.info("stop requested; finishing the current cycle")
@@ -332,6 +371,11 @@ class LiveRunner:
 
             execution = IbkrExecution(conn, self.cfg, dry_run=self.dry_run)
             chain_provider = IbkrChainProvider(conn, self.cfg)
+            if self._halt_reason:
+                strategy.halt_entries(
+                    f"{self._halt_reason} (found earlier in this run; a reconnect "
+                    "does not clear it, only a restart once the account is flat)"
+                )
             self._reconcile(conn)
             last_reconcile = time.monotonic()
 
@@ -349,17 +393,29 @@ class LiveRunner:
             ):
                 if not conn.ib.isConnected():
                     raise ConnectionError("the IBKR API connection dropped")
+                events_before = len(strategy.events)
                 self._cycle(conn, chain_provider, execution)
                 self._cycles += 1
+                self._remember_halt(strategy)
                 if self._stop:
                     break
 
                 now = time.monotonic()
                 every = self.cfg.live.reconcile_seconds
-                if every is not None and now - last_reconcile >= every:
+                # A leg that "did not fill", a pair that had to be squared,
+                # a hedge that came back short: each is a moment the book
+                # and the account may have parted, and the next poll is
+                # five seconds away. The timer is for drift nobody saw
+                # coming; this is for drift the strategy just reported.
+                suspect = any(
+                    event.kind.endswith(("_failed", "_partial"))
+                    for event in strategy.events[events_before:]
+                )
+                if every is not None and (suspect or now - last_reconcile >= every):
                     self._verify_positions(conn)
                     self._check_broker_margin(conn)
                     self._rebase_equity(conn)
+                    self._remember_halt(strategy)
                     last_reconcile = now
                 if now - last_heartbeat >= self.cfg.live.heartbeat_seconds:
                     log.info(
@@ -608,15 +664,19 @@ class LiveRunner:
         stop and the wrong one for a target.
         """
         assert self.strategy is not None
-        hedge_rows, option_rows = self._read_positions(conn)
+        hedge_rows, option_rows, foreign_rows = self._read_positions(conn)
         book = self.strategy.portfolio
 
-        for row in hedge_rows:
-            book.hedge.quantity = row.quantity
-            book.hedge.avg_price = row.entry_price
+        if foreign_rows:
+            self.strategy.halt_entries(_foreign_reason(foreign_rows, self.source))
+
+        if hedge_rows:
+            quantity, avg_price = _net(hedge_rows)
+            book.hedge.quantity = quantity
+            book.hedge.avg_price = avg_price
             log.warning(
                 "adopted an existing hedge position: %+d %s @ %.2f",
-                row.quantity, self.source.hedge.symbol, row.entry_price,
+                quantity, self.source.hedge.symbol, avg_price,
             )
 
         straddle = _straddle_from_rows(option_rows, self.source, self._now())
@@ -628,7 +688,7 @@ class LiveRunner:
                 straddle.quantity, straddle.expiry, straddle.strike,
                 straddle.entry_premium, straddle.call_entry, straddle.put_entry,
             )
-        if not hedge_rows and straddle is None:
+        if not hedge_rows and straddle is None and not foreign_rows:
             log.info("no existing positions to adopt")
 
         # After adoption, so the guard inside it sees the book the account
@@ -636,6 +696,16 @@ class LiveRunner:
         # exact is whether *the account* holds a straddle, not whether the
         # book happened to be empty a moment ago.
         self._rebase_equity(conn)
+        # And the account's margin, before the first poll rather than five
+        # minutes into it: on 2026-09-10 the reconnect after the gateway
+        # restart came up un-halted against an account already past its
+        # limit, and the timer was the only thing that noticed.
+        self._check_broker_margin(conn)
+        self._remember_halt(self.strategy)
+
+    def _remember_halt(self, strategy) -> None:
+        if strategy.halted and not self._halt_reason:
+            self._halt_reason = strategy.halt_reason
 
     def _verify_positions(self, conn) -> None:
         """Re-check the broker against the book, mid-session.
@@ -660,7 +730,10 @@ class LiveRunner:
         if strategy.halted:
             return
         try:
-            hedge_rows, option_rows = self._read_positions(conn)
+            hedge_rows, option_rows, foreign_rows = self._read_positions(conn)
+            if foreign_rows:
+                strategy.halt_entries(_foreign_reason(foreign_rows, self.source))
+                return
             broker_straddle = _straddle_from_rows(option_rows, self.source, self._now())
         except ReconciliationError as exc:
             # Not a shape the strategy can hold, so it certainly is not the
@@ -680,7 +753,7 @@ class LiveRunner:
             )
             return
 
-        broker_hedge = hedge_rows[0].quantity if hedge_rows else 0
+        broker_hedge, broker_avg = _net(hedge_rows) if hedge_rows else (0, 0.0)
         if broker_hedge != book.hedge.quantity:
             # The hedge is adopted rather than halted on: it is a single
             # signed number with no shape to get wrong, and the band puts
@@ -692,7 +765,7 @@ class LiveRunner:
             )
             book.hedge.quantity = broker_hedge
             if hedge_rows:
-                book.hedge.avg_price = hedge_rows[0].entry_price
+                book.hedge.avg_price = broker_avg
 
     def _rebase_equity(self, conn) -> None:
         """Size against the account's own value, not against the config.
@@ -714,6 +787,24 @@ class LiveRunner:
         assert self.strategy is not None
         book = self.strategy.portfolio
         if book.straddle is not None:
+            return
+        try:
+            foreign = self._read_positions(conn)[2]
+        except Exception as exc:  # noqa: BLE001 - a position read that fails is not a reason to re-base
+            log.warning("could not read positions before re-basing equity (%s)", exc)
+            return
+        if foreign:
+            # NetLiquidation carries the open P&L of positions the book
+            # has no mark for, so the subtraction below cannot be made.
+            # Entries are halted on these rows anyway; sizing off a number
+            # that moves with an unmanaged futures position is the part
+            # that would be wrong.
+            if not self._warned_foreign_equity:
+                self._warned_foreign_equity = True
+                log.warning(
+                    "not re-basing equity on the account: it holds %s, which "
+                    "the book cannot mark", _describe(foreign),
+                )
             return
         try:
             nav = conn.net_liquidation()
@@ -777,10 +868,21 @@ class LiveRunner:
             "next entry would be sized off a number that is not true."
         )
 
-    def _read_positions(self, conn) -> tuple[list["_PositionRow"], list["_PositionRow"]]:
-        """The account's positions in our two instruments, split by leg."""
+    def _read_positions(
+        self, conn
+    ) -> tuple[list["_PositionRow"], list["_PositionRow"], list["_PositionRow"]]:
+        """The account's positions: hedge leg, option leg, and everything else.
+
+        The third list is what the book has no way to represent -- a
+        future that is not the hedge contract, an option on another root.
+        It is returned rather than dropped because dropping it is how 11
+        ES contracts, exercised out of a naked 0DTE call the runner had
+        already lost track of, sat in the account through a night of
+        "no existing positions to adopt" with the book reporting flat.
+        """
         hedge_rows: list[_PositionRow] = []
         option_rows: list[_PositionRow] = []
+        foreign_rows: list[_PositionRow] = []
         for position in conn.ib.positions(conn.account):
             contract = position.contract
             quantity = int(position.position)
@@ -814,7 +916,18 @@ class LiveRunner:
                         right=str(contract.right).upper()[:1],
                     )
                 )
-        return hedge_rows, option_rows
+            else:
+                foreign_rows.append(
+                    _PositionRow(
+                        quantity=quantity,
+                        entry_price=float(position.avgCost),
+                        label=(
+                            getattr(contract, "localSymbol", "")
+                            or f"{contract.symbol} {contract.secType}"
+                        ),
+                    )
+                )
+        return hedge_rows, option_rows, foreign_rows
 
 
 def run_live(cfg: Config, dry_run: bool = False, max_cycles: int | None = None):

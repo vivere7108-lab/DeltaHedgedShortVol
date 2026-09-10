@@ -38,7 +38,7 @@ gex:
 sizing:
   buying_power_pct: 0.80           # the margin limit less a 20% buffer
   max_straddles: 50                # well above what a $250k account buys
-                                   # (about ten, hedge margin included), and
+                                   # (about five, hedge margin included), and
                                    # below broker.base.MAX_ORDER_CONTRACTS so
                                    # the per-order backstop can actually bind
 

@@ -167,12 +167,17 @@ class TestReconciliation:
         assert hedge.quantity == -12
         assert hedge.avg_price == pytest.approx(5000.0)
 
-    def test_an_unrelated_symbol_is_left_alone(self, tmp_path, monkeypatch):
+    def test_an_unrelated_symbol_is_not_adopted_and_halts_entries(
+        self, tmp_path, monkeypatch
+    ):
+        """Not the hedge, so not the hedge -- and not nothing either. See
+        ``TestPositionsTheBookCannotRepresent``."""
         runner = self._reconciled(
             tmp_path, monkeypatch, [fake_position("FUT", "NQ", 3, avg_cost=100.0)]
         )
         runner.run(max_cycles=1)
         assert runner.strategy.portfolio.hedge.quantity == 0
+        assert runner.strategy.halted
 
     def test_a_zero_row_is_not_a_position(self, tmp_path, monkeypatch):
         """IBKR reports closed positions as zero rows rather than dropping
@@ -695,3 +700,200 @@ class TestTradeFeedSelection:
         feed = runner._trade_feed(None)
         assert isinstance(feed, DatabentoTradeFeed)
         assert runner._databento._capture_trades is True
+
+
+class TestPositionsTheBookCannotRepresent:
+    """A future that is not the hedge, an option on another root.
+
+    On 2026-09-09 a naked 0DTE call expired in the money and IBKR's paper
+    processing left 11 ES in the account. The runner only looked for MES,
+    so the reconnect logged "no existing positions to adopt" and the book
+    reported flat and net delta zero against eleven outright contracts.
+    """
+
+    def _holding(self, tmp_path, monkeypatch, positions, **live):
+        runner = build_runner(tmp_path, **live)
+        patch_session(monkeypatch, runner)
+        runner.connection.ib.set_positions(positions)
+        return runner
+
+    def test_an_outright_future_at_connect_halts_entries(self, tmp_path, monkeypatch):
+        runner = self._holding(
+            tmp_path, monkeypatch, [fake_position("FUT", "ES", 11, avg_cost=382_500.0)]
+        )
+        runner.run(max_cycles=1)
+        assert runner.strategy.halted
+        assert runner.strategy.portfolio.hedge.quantity == 0, "it is not the hedge"
+
+    def test_the_halt_names_the_position(self, tmp_path, monkeypatch):
+        runner = self._holding(
+            tmp_path, monkeypatch, [fake_position("FUT", "ES", 11, avg_cost=382_500.0)]
+        )
+        runner.run(max_cycles=1)
+        reason = runner.strategy.halt_reason
+        assert "+11" in reason and "ES" in reason
+        assert "cannot be marked, hedged or closed" in reason
+
+    def test_an_option_on_another_root_halts_too(self, tmp_path, monkeypatch):
+        runner = self._holding(
+            tmp_path, monkeypatch, [fake_position("FOP", "NQ", -2, right="P")]
+        )
+        runner.run(max_cycles=1)
+        assert runner.strategy.halted
+
+    def test_one_appearing_mid_session_halts_entries(self, tmp_path, monkeypatch):
+        runner = build_runner(tmp_path, reconcile_seconds=0.001)
+        patch_session(monkeypatch, runner)
+        calls = {"n": 0}
+
+        def positions(*_):
+            calls["n"] += 1
+            return [] if calls["n"] <= 2 else [fake_position("FUT", "ES", 13)]
+
+        runner.connection.ib.positions = positions
+        runner.run(max_cycles=4)
+        assert runner.strategy.halted
+        assert "+13" in runner.strategy.halt_reason
+
+    def test_equity_is_not_rebased_over_it(self, tmp_path, monkeypatch):
+        """NetLiquidation carries that position's open P&L and the book has
+        no mark to take it back out with, so the configured equity stands."""
+        runner = self._holding(
+            tmp_path, monkeypatch, [fake_position("FUT", "ES", 11, avg_cost=382_500.0)]
+        )
+        runner.connection.net_liquidation = lambda: 318_000.0
+        runner.connection.account_values = lambda: {"NetLiquidation": 318_000.0}
+        runner.connection.hedge_price = lambda: 5000.0
+        runner.run(max_cycles=1)
+        assert runner.strategy.portfolio.starting_equity == pytest.approx(250_000.0)
+
+
+class TestTheHaltOutlivesAReconnect:
+    """A halt is a finding about the account, and the account does not
+    change because the gateway restarted at 02:00.
+
+    The strategy that carries the flag is rebuilt on every reconnect. On
+    2026-09-10 the runner came back from the nightly restart un-halted,
+    against the same account, and only the margin timer -- five minutes
+    later -- stopped it trading.
+    """
+
+    def test_the_reconnected_strategy_starts_halted(self, tmp_path, monkeypatch):
+        runner = build_runner(tmp_path, drop_after=3, reconcile_seconds=0.001)
+        patch_session(monkeypatch, runner)
+        connection = runner.connection
+        calls = {"n": 0}
+
+        def positions(*_):
+            # First session: flat at connect, then a straddle the book did
+            # not place. Second session: flat again -- nothing to halt on.
+            calls["n"] += 1
+            if connection.connects == 1 and calls["n"] > 2:
+                return _straddle_rows(-8)
+            return []
+
+        connection.ib.positions = positions
+        runner.run(max_cycles=6)
+        assert connection.connects >= 2, "the drop did not reconnect"
+        assert runner.strategy.halted
+        assert "found earlier in this run" in runner.strategy.halt_reason
+        assert "-8" in runner.strategy.halt_reason
+
+
+class TestReconciliationAfterAFailedLeg:
+    """The strategy just said a leg did not fill. That is exactly when the
+    book and the account are most likely to disagree, and the next poll
+    is five seconds away -- the timer is for drift nobody saw coming."""
+
+    def test_a_failed_leg_triggers_a_check_before_the_next_poll(
+        self, tmp_path, monkeypatch
+    ):
+        import deltahedger.live.runner as module
+        from deltahedger.strategy import GexStraddleStrategy
+
+        runner = build_runner(tmp_path, reconcile_seconds=10**6)
+        patch_session(monkeypatch, runner)
+        original = GexStraddleStrategy.on_bar
+
+        def on_bar(self, bar, execution):
+            state = original(self, bar, execution)
+            self._record(OPEN, "entry_failed", "the call leg did not fill")
+            return state
+
+        monkeypatch.setattr(GexStraddleStrategy, "on_bar", on_bar)
+        calls = {"n": 0}
+
+        def positions(*_):
+            calls["n"] += 1
+            return [] if calls["n"] <= 2 else _straddle_rows(13)
+
+        runner.connection.ib.positions = positions
+        runner.run(max_cycles=2)
+        assert runner.strategy.halted, "the drift waited for the timer"
+        assert "+13" in runner.strategy.halt_reason
+
+    def test_an_ordinary_poll_does_not_reconcile_early(self, tmp_path, monkeypatch):
+        """Only a failure or a squared pair brings the check forward.
+        (The stubbed execution fails every leg it is handed, so the bars
+        here have their failures scrubbed to look like quiet ones.)"""
+        from deltahedger.strategy import GexStraddleStrategy
+
+        runner = build_runner(tmp_path, reconcile_seconds=10**6)
+        patch_session(monkeypatch, runner)
+        original = GexStraddleStrategy.on_bar
+
+        def on_bar(self, bar, execution):
+            state = original(self, bar, execution)
+            self.events[:] = [e for e in self.events if not e.kind.endswith("_failed")]
+            return state
+
+        monkeypatch.setattr(GexStraddleStrategy, "on_bar", on_bar)
+        calls = {"n": 0}
+
+        def positions(*_):
+            calls["n"] += 1
+            return [] if calls["n"] <= 2 else _straddle_rows(13)
+
+        runner.connection.ib.positions = positions
+        runner.run(max_cycles=3)
+        assert not runner.strategy.halted
+
+
+class TestMarginIsCheckedAtConnect:
+    def test_an_account_already_past_the_limit_is_halted_before_the_first_poll(
+        self, tmp_path, monkeypatch
+    ):
+        runner = build_runner(tmp_path, reconcile_seconds=None)
+        patch_session(monkeypatch, runner)
+        values = {"NetLiquidation": 313_760.0, "FullInitMarginReq": 378_858.0}
+        runner.connection.account_values = lambda: dict(values)
+        runner.connection.net_liquidation = lambda: 313_760.0
+        runner.connection.hedge_price = lambda: 5000.0
+        runner.run(max_cycles=1)
+        assert runner.strategy.halted
+        assert "121%" in runner.strategy.halt_reason
+
+
+class TestHedgeDriftAcrossContractMonths:
+    def test_two_hedge_rows_are_one_position(self, tmp_path, monkeypatch):
+        """IBKR reports one row per contract month; after a quarterly roll
+        the hedge is two of them."""
+        runner = build_runner(tmp_path, reconcile_seconds=0.001)
+        patch_session(monkeypatch, runner)
+        calls = {"n": 0}
+
+        def positions(*_):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return []
+            return [
+                fake_position("FUT", "MES", -3, avg_cost=5000.0 * 5.0, expiry="20250620"),
+                fake_position("FUT", "MES", -2, avg_cost=5100.0 * 5.0, expiry="20250919"),
+            ]
+
+        runner.connection.ib.positions = positions
+        runner.run(max_cycles=4)
+        hedge = runner.strategy.portfolio.hedge
+        assert hedge.quantity == -5
+        assert hedge.avg_price == pytest.approx(5040.0)
+        assert not runner.strategy.halted

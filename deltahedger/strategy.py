@@ -280,7 +280,9 @@ class GexStraddleStrategy:
         #: broker holding a position this book does not know about. Nothing
         #: clears it: a book that has drifted does not un-drift, and
         #: resuming entries at the next midnight would be the runner
-        #: quietly overruling the only check that caught the problem.
+        #: quietly overruling the only check that caught the problem. The
+        #: live runner carries it across the gateway's nightly reconnect,
+        #: which rebuilds this object; only a process restart starts clean.
         self._halted_for_run = False
         self._halt_reason = ""
         self._profile: GexProfile | None = None
@@ -328,6 +330,10 @@ class GexStraddleStrategy:
     @property
     def halted(self) -> bool:
         return self._halted_for_run
+
+    @property
+    def halt_reason(self) -> str:
+        return self._halt_reason
 
     # -- main loop ------------------------------------------------------
 

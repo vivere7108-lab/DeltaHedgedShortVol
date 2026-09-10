@@ -47,8 +47,8 @@ Where the scan range comes from, and why it matters more than anything
 ----------------------------------------------------------------------
 CME sets the outright futures margin *to* the price scan range, so
 ``RiskSource.future_initial_margin / future.multiplier`` recovers the move
-being scanned -- 352 ES points, about 7% of spot, at a 17,600 outright
-margin.  That one number decides the whole short branch: it is what the
+being scanned -- 690 ES points, about 9% of spot, at the 34,500 outright
+margin IBKR holds.  That one number decides the whole short branch: it is what the
 straddle is repriced across, so halving it roughly halves the charge per
 straddle and doubles the count the budget buys.
 
@@ -83,7 +83,7 @@ account at the default sizing)::
     1DTE at the roll        31.49       $16,026  $1,574                5 /  10
     2DTE                    44.41       $15,379  $2,221                6 /  10
 
-Both counts are with the $17,600 of hedge margin per straddle added to the
+Both counts are with the $34,500 of hedge margin per straddle added to the
 figure in the margin or debit column, which is why they move so little
 across the table and why the two branches are within a factor of two of
 each other.  Charged on the option leg alone they would not be: a short
@@ -206,7 +206,7 @@ class SpanScanMarginModel:
     The price scan range is inferred from the risk source's outright future
     margin -- CME sets that margin *to* the scan range, so
     ``future_initial_margin / multiplier`` recovers the point move being
-    scanned (352 ES points, ~7% of spot, at a 17,600 margin).  Volatility
+    scanned (690 ES points, ~9% of spot, at a 34,500 margin).  Volatility
     is scanned as a relative bump.
 
     The scan is a *one-day* move and does not stretch with the option's

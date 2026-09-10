@@ -473,7 +473,10 @@ class TestWhatIfMargin:
             straddle(), 5000.0, cfg.source, -1
         ) == 1234.0
 
-    def test_the_hedge_margin_is_delegated(self, conn, cfg):
+    def test_the_hedge_margin_falls_back_when_the_account_says_nothing(
+        self, conn, cfg
+    ):
+        conn.ib.margin_change = None
         assert WhatIfMarginModel(conn, self.Heuristic()).hedge_margin(
             cfg.source
         ) == 99.0
@@ -564,3 +567,168 @@ class TestAccountValues:
         assert values == {}
         assert conn.net_liquidation() is None
         assert "base currency is AUD" in caplog.text
+
+
+class TestAnErrorTheLibraryTurnsIntoACancel:
+    """The 2026-09-09 failure: 26 naked 0DTE calls from two "did not fill"s.
+
+    Every order went out with no time-in-force, so IBKR answered each with
+    error 10349 -- "Order TIF was set to DAY based on order preset" --
+    which is information, not a rejection. ib_async does not list 10349
+    as a warning, so it marked the trade Cancelled locally before the
+    gateway had acknowledged the order. ``_send`` read a done state with
+    nothing filled and returned None; the strategy recorded "the call leg
+    did not fill", never sent the put, and retried six seconds later at
+    the next strike. Both calls filled within the second.
+    """
+
+    def _execution(self, conn, cfg):
+        return IbkrExecution(conn, cfg, fill_timeout=1.0, cancel_timeout=0.2)
+
+    def test_orders_say_their_tif_so_the_gateway_never_has_to(self, conn, cfg):
+        self._execution(conn, cfg).execute_option(option(), 5, NOW)
+        self._execution(conn, cfg).execute_hedge(-3, 5000.0, NOW)
+        assert [order.tif for _, order in conn.ib.placed] == ["DAY", "DAY"]
+
+    def test_a_locally_cancelled_order_that_fills_is_reported_as_the_fill(
+        self, conn, cfg
+    ):
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            error_on_placement=10349, updates_before_done=2, price=6.9,
+        )
+        fill = self._execution(conn, cfg).execute_option(option(), 13, NOW)
+        assert fill is not None, "the leg was reported as not filled"
+        assert fill.quantity == 13
+        assert fill.price == pytest.approx(6.9)
+        assert not conn.ib.cancelled, "a working order was cancelled on a guess"
+
+    def test_a_genuine_rejection_reads_as_no_fill_without_waiting(self, conn, cfg):
+        """201 is the gateway's own last word, and it comes at once."""
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(error_on_placement=201)
+        started = time.monotonic()
+        assert self._execution(conn, cfg).execute_option(option(), 5, NOW) is None
+        assert time.monotonic() - started < 0.5
+        assert not conn.ib.cancelled
+
+    def test_an_order_that_never_progresses_after_the_error_is_cancelled_then_read(
+        self, conn, cfg
+    ):
+        """If the gateway says nothing more, the fill timeout still runs
+        out, the cancel is still sent, and what filled is what is booked
+        -- here nothing."""
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            error_on_placement=10349, updates_before_done=None,
+        )
+        execution = IbkrExecution(conn, cfg, fill_timeout=0.05, cancel_timeout=0.2)
+        assert execution.execute_option(option(), 5, NOW) is None
+        assert conn.ib.cancelled, "the order was left working at the exchange"
+
+    def test_an_order_held_inactive_is_cancelled_rather_than_read_as_done(
+        self, conn, cfg
+    ):
+        """``Inactive`` is a done state to the library and a held order to
+        the gateway, which can activate and fill it later. It is treated
+        as a working order: cancelled, and only then read."""
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            filled=0, status="Inactive", cancel_confirms=True,
+        )
+        execution = IbkrExecution(conn, cfg, fill_timeout=0.05, cancel_timeout=0.2)
+        assert execution.execute_option(option(), 5, NOW) is None
+        assert conn.ib.cancelled
+
+
+class TestCommissionReports:
+    """The fee on a fill arrives a message after the fill does."""
+
+    def test_a_report_that_lands_after_the_fill_is_waited_for(self, conn, cfg):
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            commission=2.32, commission_after=2,
+        )
+        fill = IbkrExecution(conn, cfg, commission_timeout=1.0).execute_option(
+            option(), 1, NOW
+        )
+        assert fill.fees == pytest.approx(2.32)
+
+    def test_a_report_that_never_comes_costs_the_fee_not_the_fill(
+        self, conn, cfg, caplog
+    ):
+        conn.ib.outcome_for = lambda c, o: OrderOutcome(
+            commission=2.32, commission_after=None,
+        )
+        execution = IbkrExecution(conn, cfg, commission_timeout=0.05)
+        with caplog.at_level(logging.WARNING, logger="deltahedger.broker.ibkr"):
+            fill = execution.execute_option(option(), 1, NOW)
+        assert fill is not None and fill.quantity == 1
+        assert fill.fees == 0.0
+        assert "understated" in caplog.text
+
+
+class TestWhatIfProbesCarryATif:
+    """The other thing error 10349 broke, silently.
+
+    A what-if request with no TIF is answered with the same informational
+    error instead of an ``OrderState``. ib_async resolves the request to
+    an empty list, ``getattr(list, "initMarginChange", "")`` read that as
+    no margin change, and every live short straddle was sized off the
+    model for as long as ``use_whatif_margin: true`` had been set.
+    """
+
+    def test_the_straddle_probe_is_a_day_order(self, conn, cfg):
+        conn.ib.margin_change = 16_800.0
+        model = WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic())
+        assert model.straddle_requirement(
+            straddle(), 5000.0, cfg.source, -1
+        ) == pytest.approx(16_800.0)
+        assert conn.ib.whatif_orders[0][1].tif == "DAY"
+
+    def test_an_empty_answer_falls_back_rather_than_raising(self, conn, cfg):
+        conn.ib.whatIfOrder = lambda contract, order: []
+        fallback = TestWhatIfMargin.Heuristic()
+        assert WhatIfMarginModel(conn, fallback).straddle_requirement(
+            straddle(), 5000.0, cfg.source, -1
+        ) == 1234.0
+
+
+class TestTheHedgeMarginIsProbed:
+    """The hedge is the larger half of the requirement, and its constant
+    was half of what the account was charged."""
+
+    def test_one_hedge_contract_is_asked_for(self, conn, cfg):
+        conn.ib.margin_change = 3_447.0
+        model = WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic())
+        assert model.hedge_margin(cfg.source) == pytest.approx(3_447.0)
+        contract, order = conn.ib.whatif_orders[0]
+        assert contract is conn.hedge_contract
+        assert order.action == "BUY" and order.totalQuantity == 1
+        assert order.tif == "DAY"
+
+    def test_the_answer_is_cached_rather_than_probed_per_entry(self, conn, cfg):
+        conn.ib.margin_change = 3_447.0
+        model = WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic())
+        for _ in range(5):
+            model.hedge_margin(cfg.source)
+        assert len(conn.ib.whatif_orders) == 1
+
+    def test_an_empty_probe_falls_back_to_the_constant(self, conn, cfg):
+        conn.ib.margin_change = None
+        assert WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic()).hedge_margin(
+            cfg.source
+        ) == 99.0
+
+    def test_a_probe_that_raises_falls_back(self, conn, cfg):
+        def boom(*_):
+            raise RuntimeError("no permissions")
+
+        conn.ib.whatIfOrder = boom
+        assert WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic()).hedge_margin(
+            cfg.source
+        ) == 99.0
+
+    def test_a_constant_far_from_the_account_is_reported_once(self, conn, cfg, caplog):
+        conn.ib.margin_change = 3_447.0  # against a constant of 99
+        model = WhatIfMarginModel(conn, TestWhatIfMargin.Heuristic())
+        with caplog.at_level(logging.WARNING, logger="deltahedger.broker.ibkr"):
+            model.hedge_margin(cfg.source)
+            model._hedge_probed_at = 0.0  # force a re-probe
+            model.hedge_margin(cfg.source)
+        assert caplog.text.count("hedge margin constant is off") == 1

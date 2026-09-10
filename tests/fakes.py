@@ -43,6 +43,7 @@ from ib_async import (  # noqa: F401 - re-exported for tests
     OrderState,
     OrderStatus,
     Trade,
+    TradeLogEntry,
 )
 
 from deltahedger.gex import StrikeOpenInterest
@@ -68,6 +69,19 @@ class OrderOutcome:
     updates_before_done: int | None = 0
     fills_on_cancel: float = 0.0
     cancel_confirms: bool = True
+    #: An error code the gateway sends back on placement. ib_async turns
+    #: any code it does not list as a warning into a local ``Cancelled``
+    #: before the order is acknowledged -- 10349 ("Order TIF was set to
+    #: DAY") is the informational one that did it in production; 201 is a
+    #: genuine rejection. The fake reproduces the library's behaviour: the
+    #: trade reads Cancelled with the code in its log, and, unless the code
+    #: is a real rejection, the order goes on to fill as scripted.
+    error_on_placement: int = 0
+    #: How many ``waitOnUpdate`` calls pass before the commission report
+    #: lands. The real gateway sends it after the ``Filled`` status, so a
+    #: fill read the instant it is done carries no commission. ``None``
+    #: means the report never comes.
+    commission_after: int | None = 0
 
 
 #: Fills everything immediately, which is what a healthy market looks like.
@@ -121,6 +135,9 @@ class FakeIb:
         self.whatif_orders: list[tuple[Any, Order]] = []
         self.market_data: list[Any] = []
         self._pending: list[_Pending] = []
+        #: Fills whose commission report is still on its way.
+        self._commissions_due: list[tuple[Trade, int | None]] = []
+        self._rejected: list[_Pending] = []
         self._next_order_id = 1
         self._positions: list[Any] = []
         self.tickers_for: Callable[[Any], Any] | None = None
@@ -214,6 +231,18 @@ class FakeIb:
         )
         self.trades.append(trade)
         pending = _Pending(trade, outcome, outcome.updates_before_done)
+        if outcome.error_on_placement:
+            # What ib_async's wrapper.error does with a non-warning code on
+            # a not-yet-done trade: status Cancelled, the code in the log,
+            # nothing yet acknowledged by the gateway (permId 0).
+            trade.orderStatus.status = "Cancelled"
+            trade.log.append(TradeLogEntry(
+                datetime(2025, 6, 10, 10, 0), "Cancelled",
+                f"Error {outcome.error_on_placement}", outcome.error_on_placement,
+            ))
+            if outcome.error_on_placement == 201:
+                self._rejected.append(pending)
+                return trade
         if pending.updates_left == 0:
             # Filled on arrival, so it is never pending: leaving it in the
             # queue would let the next waitOnUpdate settle it a second time.
@@ -232,8 +261,21 @@ class FakeIb:
                 # The order the broker gave up on, filling anyway.
                 self._apply_fill(pending, outcome.fills_on_cancel, "Filled")
             elif outcome.cancel_confirms:
-                pending.trade.orderStatus.status = "Cancelled"
+                self._gateway_status(pending.trade, "Cancelled")
             self._pending.remove(pending)
+            return
+        # Not working: held Inactive, or already settled. The gateway still
+        # answers a cancel on it.
+        for trade in self.trades:
+            if trade.order is order and trade.orderStatus.status != "Filled":
+                self._gateway_status(trade, "Cancelled")
+
+    def _gateway_status(self, trade: Trade, status: str) -> None:
+        """An ``orderStatus`` message from the gateway: the status, and a
+        log entry with no error code -- which is how ib_async's own record
+        tells a gateway-set status from one the library set itself."""
+        trade.orderStatus.status = status
+        trade.log.append(TradeLogEntry(datetime(2025, 6, 10, 10, 0), status, ""))
 
     def waitOnUpdate(self, timeout: float = 0) -> bool:
         """True if an update arrived, False on timeout -- as the real one.
@@ -254,6 +296,16 @@ class FakeIb:
             if pending.updates_left <= 0:
                 self._settle(pending)
                 self._pending.remove(pending)
+        for due in list(self._commissions_due):
+            trade, left = due
+            if left is None:
+                continue  # never arrives
+            progressed = True
+            if left <= 1:
+                self._report_commissions(trade)
+                self._commissions_due.remove(due)
+            else:
+                self._commissions_due[self._commissions_due.index(due)] = (trade, left - 1)
         if progressed:
             return True
         if self.idle_updates > 0:
@@ -266,8 +318,13 @@ class FakeIb:
         time.sleep(min(max(timeout, 0.0), self.max_quiet_sleep))
         return False
 
-    def whatIfOrder(self, contract, order: Order) -> OrderState:
+    def whatIfOrder(self, contract, order: Order):
         self.whatif_orders.append((contract, order))
+        if not order.tif:
+            # A what-if with no TIF is answered with error 10349 rather than
+            # an OrderState; ib_async then resolves the request to an empty
+            # list. This is what every live probe got until the TIF was set.
+            return []
         state = OrderState(status="PreSubmitted")
         if self.margin_change is not None:
             state.initMarginChange = str(self.margin_change)
@@ -300,7 +357,8 @@ class FakeIb:
         trade.orderStatus.filled = filled
         trade.orderStatus.remaining = max(wanted - filled, 0.0)
         trade.orderStatus.avgFillPrice = outcome.price if filled else 0.0
-        trade.orderStatus.status = status
+        trade.orderStatus.permId = trade.orderStatus.permId or 900_000 + trade.order.orderId
+        self._gateway_status(trade, status)
         if not filled:
             return
         trade.fills.append(
@@ -311,10 +369,28 @@ class FakeIb:
                     shares=filled,
                     price=outcome.price,
                 ),
-                commissionReport=CommissionReport(commission=outcome.commission),
+                commissionReport=CommissionReport(),
                 time=datetime(2025, 6, 10, 10, 0),
             )
         )
+        if outcome.commission_after == 0:
+            self._report_commissions(trade)
+        else:
+            self._commissions_due.append((trade, outcome.commission_after))
+
+    def _report_commissions(self, trade: Trade) -> None:
+        """The commission report landing: ``dataclassUpdate`` in place, as
+        the real wrapper does, so the fill's report gains an execId."""
+        for fill in trade.fills:
+            commission = self._commission_for(trade)
+            fill.commissionReport.execId = fill.execution.execId
+            fill.commissionReport.commission = commission
+
+    def _commission_for(self, trade: Trade) -> float:
+        for contract, order in self.placed:
+            if order is trade.order:
+                return self.outcome_for(contract, order).commission
+        return 0.0
 
 
 @dataclass

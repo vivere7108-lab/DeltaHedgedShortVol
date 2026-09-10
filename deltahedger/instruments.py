@@ -140,12 +140,17 @@ ES = RiskSource(
     ),
     reference_multiplier=50.0,
     strike_increment=5.0,
-    # CME performance bond for one ES contract (not one MES: an earlier
-    # revision carried the micro's ~$2,455 here, which narrowed the SPAN
-    # price scan to ~1% of spot and undercharged every short straddle by
-    # roughly an order of magnitude). Check the current CME table.
-    future_initial_margin=17_600.0,
-    hedge_initial_margin=1_760.0,
+    # What IBKR holds against one ES and one MES, read off the account with
+    # a what-if on 2026-09-10 (USD 34,465 and 3,447 at 1.3854 AUD/USD). It
+    # is IBKR's house requirement rather than CME's published bond, and it
+    # is the number this account is actually sized against: the previous
+    # 17,600 / 1,760 were half of it, and a 13-straddle long book was sized
+    # whose full-delta hedge alone would have needed more than the account.
+    # (An earlier revision carried the micro's ~$2,455 for the ES figure,
+    # which narrowed the SPAN price scan to ~1% of spot.) Re-check against
+    # the account before a walk; the live path probes IBKR for both.
+    future_initial_margin=34_500.0,
+    hedge_initial_margin=3_450.0,
     aliases=("ES", "SPX-ES", "EMINI"),
 )
 

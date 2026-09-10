@@ -722,6 +722,8 @@ class WhatIfMarginModel:
     #: works would otherwise fill the journal with the same line every
     #: entry, which is how a real warning stops being read.
     _fallbacks: list[int] = field(default_factory=list, repr=False, compare=False)
+    _hedge_probe: float | None = field(default=None, repr=False, compare=False)
+    _hedge_probed_at: float = field(default=0.0, repr=False, compare=False)
 
     def straddle_requirement(
         self, quote: StraddleQuote, future_price: float, source: RiskSource,
@@ -819,14 +821,74 @@ class WhatIfMarginModel:
         )
         order = MarketOrder("BUY", self.probe_quantity)  # the legs carry the sell side
         order.account = self.connection.account
-        state = self.connection.ib.whatIfOrder(combo, order)
-        change = float(getattr(state, "initMarginChange", "") or 0.0)
-        if change > 0:
+        change = self._what_if(combo, order)
+        if change is not None and change > 0:
             return change / self.probe_quantity
         return None
 
+    def _what_if(self, contract: Any, order: Any) -> float | None:
+        """The initial-margin change IBKR reports for ``order``, or ``None``.
+
+        The order is sent as a DAY order because a what-if with no TIF is
+        answered with error 10349 instead of an ``OrderState`` -- ib_async
+        then hands back an empty list, and ``getattr(list, ...)`` read that
+        as "no margin change" for as long as the probe existed. Every live
+        short straddle was sized off the model without anyone noticing.
+        """
+        _as_day_order(order)
+        state = self.connection.ib.whatIfOrder(contract, order)
+        if isinstance(state, list):
+            # ib_async's shape for a request the gateway answered with an
+            # error rather than a state.
+            state = state[0] if state else None
+        if state is None:
+            return None
+        raw = getattr(state, "initMarginChange", "")
+        if raw in ("", None):
+            return None
+        return float(raw)
+
     def hedge_margin(self, source: RiskSource) -> float:
-        return self.fallback.hedge_margin(source)
+        """What one hedge contract costs to carry, from the account.
+
+        The hedge is the larger half of a straddle's all-in requirement on
+        ES, and the constant it was charged at (``hedge_initial_margin``)
+        was half what IBKR held against a micro. So it is probed like the
+        straddle is, once an hour rather than per entry -- the number moves
+        with the exchange's performance-bond table, not with the market.
+        """
+        now = time.monotonic()
+        if self._hedge_probe is not None and now - self._hedge_probed_at < 3600.0:
+            return self._hedge_probe
+        estimate = self.fallback.hedge_margin(source)
+        try:
+            change = self._probe_hedge()
+        except Exception as exc:  # noqa: BLE001 - never block sizing on a probe
+            log.warning("could not probe the hedge margin (%s); using $%s",
+                        exc, f"{estimate:,.0f}")
+            return estimate
+        if change is None or change <= 0:
+            log.warning("IBKR returned no margin change for one %s; using $%s",
+                        source.hedge.symbol, f"{estimate:,.0f}")
+            return estimate
+        if self._hedge_probe is None and not 0.5 <= change / estimate <= 2.0:
+            log.warning(
+                "the hedge margin constant is off by %.1fx against IBKR: "
+                "hedge_initial_margin says $%s per %s where the account is "
+                "charged $%s. The live path uses IBKR's; the backtest sized "
+                "against the constant.",
+                change / estimate, f"{estimate:,.0f}", source.hedge.symbol,
+                f"{change:,.0f}",
+            )
+        self._hedge_probe, self._hedge_probed_at = change, now
+        return change
+
+    def _probe_hedge(self) -> float | None:
+        from ib_async import MarketOrder
+
+        order = MarketOrder("BUY", 1)
+        order.account = self.connection.account
+        return self._what_if(self.connection.hedge_contract, order)
 
 
 def _combo_leg(contract: Any, action: str, exchange: str) -> Any:
@@ -848,6 +910,8 @@ class IbkrExecution:
     #: than the fill timeout because a cancel either lands quickly or the
     #: connection is in trouble, and the caller is blocked meanwhile.
     cancel_timeout: float = 10.0
+    #: Wall-clock seconds to wait for the commission reports behind a fill.
+    commission_timeout: float = 2.0
 
     def execute_option(
         self, quote: OptionQuote, quantity: int, moment: datetime
@@ -889,6 +953,7 @@ class IbkrExecution:
         else:
             order = MarketOrder(action, size)
         order.account = self.connection.account
+        _as_day_order(order)
 
         if self.dry_run:
             log.info(
@@ -899,14 +964,20 @@ class IbkrExecution:
 
         trade = self.connection.ib.placeOrder(contract, order)
         name = getattr(contract, "localSymbol", instrument)
-        if self._await_done(trade, self.fill_timeout):
+        if (
+            self._await(trade, self.fill_timeout, _finished_or_held)
+            and trade.orderStatus.status != "Inactive"
+        ):
             return self._fill_from(trade, quantity, moment, instrument, name)
+        # Still working, or held Inactive by the gateway. An Inactive order
+        # is not dead -- IBKR can activate and fill it later -- so it is
+        # cancelled like a working one rather than read as "did not fill".
         return self._cancel_and_settle(trade, order, quantity, moment, instrument, name)
 
     # -- waiting, cancelling, and finding out what happened ---------------
 
-    def _await_done(self, trade: Any, timeout: float) -> bool:
-        """Wait for ``trade`` to reach a done state. True if it did.
+    def _await(self, trade: Any, timeout: float, done: Any) -> bool:
+        """Wait until ``done(trade)`` holds. True if it did within ``timeout``.
 
         Bounded by the wall clock rather than by gaps between updates.
         ``waitOnUpdate`` wakes on *any* traffic on the socket -- a tick on
@@ -914,9 +985,13 @@ class IbkrExecution:
         as "wait while this trade is not done" runs for as long as the
         market is busy, whatever the timeout is nominally set to, and the
         whole poll loop stalls behind it. Nothing is hedged while it does.
+
+        ``done`` is a predicate rather than ``trade.isDone()`` because the
+        library's idea of done includes states it invented itself -- see
+        ``_gateway_final``.
         """
         deadline = time.monotonic() + max(timeout, 0.0)
-        while not trade.isDone():
+        while not done(trade):
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
@@ -945,12 +1020,13 @@ class IbkrExecution:
         ``None``.
         """
         log.warning(
-            "%s %d %s is still working after %.0fs (status %s); cancelling",
+            "%s %d %s is unresolved after %.0fs (status %s%s); cancelling",
             order.action, int(order.totalQuantity), name, self.fill_timeout,
             trade.orderStatus.status,
+            f", set locally on error {code}" if (code := _last_error(trade)) else "",
         )
         self.connection.ib.cancelOrder(order)
-        if not self._await_done(trade, self.cancel_timeout):
+        if not self._await(trade, self.cancel_timeout, _gateway_final):
             raise OrderStateUnknown(
                 f"sent {order.action} {int(order.totalQuantity)} {name} and could "
                 f"not confirm the cancel within {self.cancel_timeout:.0f}s; it "
@@ -974,9 +1050,10 @@ class IbkrExecution:
         wanted = abs(quantity)
         if filled == 0:
             log.error(
-                "order not filled: %s %d %s (status %s)",
+                "order not filled: %s %d %s (status %s%s)",
                 "BUY" if quantity > 0 else "SELL", wanted, name,
                 trade.orderStatus.status,
+                f", error {code}" if (code := _last_error(trade)) else "",
             )
             return None
         if filled != wanted:
@@ -984,18 +1061,34 @@ class IbkrExecution:
                 "partial fill: %d of %d %s (status %s)",
                 filled, wanted, instrument, trade.orderStatus.status,
             )
+        self._await_commissions(trade, name)
         return Fill(
             quantity=filled if quantity > 0 else -filled,
             price=float(trade.orderStatus.avgFillPrice),
-            fees=sum(
-                float(f.commissionReport.commission or 0.0)
-                for f in trade.fills
-                if f.commissionReport
-            ),
+            fees=sum(float(f.commissionReport.commission or 0.0) for f in trade.fills),
             timestamp=moment,
             instrument=instrument,
             note=trade.orderStatus.status,
         )
+
+    def _await_commissions(self, trade: Any, name: str) -> None:
+        """Give the commission reports a moment to land.
+
+        IBKR sends the ``Filled`` status first and the commission report
+        for each execution a message or two later, so a fill read the
+        instant it is done carries a zero commission and the book's fees
+        run permanently light.  Bounded, and never fatal: a report that
+        does not come costs a few dollars of attribution, not the fill.
+        """
+        def reported(t: Any) -> bool:
+            return all(f.commissionReport.execId for f in t.fills)
+
+        if not self._await(trade, self.commission_timeout, reported):
+            log.warning(
+                "commission for %s had not been reported after %.1fs; fees on "
+                "this fill are understated",
+                name, self.commission_timeout,
+            )
 
     def _check_size(self, quantity: int, instrument: str) -> None:
         limit = min(MAX_ORDER_CONTRACTS, self.cfg.hedge.max_hedge_contracts
@@ -1005,6 +1098,66 @@ class IbkrExecution:
                 f"refusing to send a {abs(quantity)}-contract {instrument} order; "
                 f"the configured limit is {limit}"
             )
+
+
+#: Error codes with which the gateway itself ends an order: rejected (201),
+#: cancelled by IBKR (202), or nothing left to cancel (10147/10148). Any
+#: other error ib_async attaches to an order is *not* the order's fate.
+#: The library marks the trade Cancelled on every non-warning code -- and
+#: its list of warnings is short. 10349, "Order TIF was set to DAY based on
+#: order preset", is informational, arrives before the gateway has even
+#: acknowledged the order, and put 26 naked 0DTE calls on the book on
+#: 2026-09-09: the leg read as "did not fill" while IBKR filled it in the
+#: same second. Orders now carry a TIF so that one is never sent, but the
+#: class of failure is what ``_gateway_final`` guards against.
+_GATEWAY_FINAL_ERRORS = frozenset({201, 202, 10147, 10148})
+
+
+def _as_day_order(order: Any) -> Any:
+    """Say the TIF out loud rather than let the gateway fill it in.
+
+    An order with no ``tif`` makes IBKR reply with error 10349 to tell us
+    it chose DAY. ib_async reads that as a rejection: it marks the trade
+    Cancelled locally, and a what-if request ends with no answer at all.
+    Both are avoided by saying DAY ourselves.
+    """
+    order.tif = "DAY"
+    return order
+
+
+def _last_error(trade: Any) -> int:
+    """The error code on the trade's latest log entry, or 0."""
+    if not trade.log:
+        return 0
+    return int(trade.log[-1].errorCode or 0)
+
+
+def _gateway_final(trade: Any) -> bool:
+    """Whether the *gateway* has had the last word on ``trade``.
+
+    ``trade.isDone()`` is the library's opinion, and it includes a
+    Cancelled it wrote itself on receiving any error code it does not list
+    as a warning. That status is a guess: the order is still live at the
+    exchange, and the next message can be its fill. So a done state that
+    followed an error counts only when the error is one of the gateway's
+    own final words; a done state that came from an ``orderStatus``
+    message counts as it is.
+    """
+    status = trade.orderStatus.status
+    if status == "Filled":
+        return True
+    code = _last_error(trade)
+    if code:
+        return code in _GATEWAY_FINAL_ERRORS
+    return status in ("Cancelled", "ApiCancelled")
+
+
+def _finished_or_held(trade: Any) -> bool:
+    """``_gateway_final``, or held ``Inactive`` -- which ends the wait but
+    is handled as a working order by the caller."""
+    return _gateway_final(trade) or (
+        trade.orderStatus.status == "Inactive" and not _last_error(trade)
+    )
 
 
 def _round_to_tick(price: float, tick: float) -> float:

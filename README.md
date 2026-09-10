@@ -864,10 +864,11 @@ validated historically, not a second implementation of it.
 ## Capital: the margin limit, less a fifth
 
 `sizing.buying_power_pct: 0.80` — the book is sized to the margin limit
-with a 20% buffer left untouched. Within the 80%, `hedge_margin_reserve_pct`
-(0.30) is held back for the MES hedge and its variation margin, and the
-straddle count is what the rest buys at the per-straddle requirement: 56%
-of equity to the straddles, 24% to the hedge, 20% never committed.
+with a 20% buffer left untouched. Within the 80%, each straddle is charged
+its *all-in* requirement: the option leg's margin or debit plus the margin
+on the ten MES it will need once its delta has run out, and the count is
+what the budget buys at that figure. (`hedge_margin_reserve_pct` is
+deprecated and ignored; the hedge is charged per straddle instead.)
 `max_straddles` (500) is a backstop against a sizing bug, matching the
 per-order hard ceiling in `broker/ibkr.py`; the budget is what decides the
 count, and at any ordinary account size the cap does not bind.
@@ -893,9 +894,11 @@ collected most of what the scan move is worth. It is asserted in
 ### What the day does to the two branches
 
 The scan range is the outright futures margin: CME sets one *to* the other,
-so `future_initial_margin / multiplier` recovers the scanned move — 352 ES
-points at a $17,600 outright margin. **That number has to be the full-size
-contract's performance bond.** An earlier revision carried MES's (~$2,455)
+so `future_initial_margin / multiplier` recovers the scanned move — 690 ES
+points at the $34,500 IBKR holds against one ES (read off the account with
+a what-if on 2026-09-10; about double CME's published bond, and the number
+this account is actually sized against). **That number has to be the
+full-size contract's requirement.** An earlier revision carried MES's (~$2,455)
 in `RiskSource.future_initial_margin`, which scanned about 49 points, ~1% of
 spot; the short branch was then charged roughly a tenth of what CME actually
 holds against it, and `buying_power_pct` bought a book several times larger
@@ -912,13 +915,13 @@ on a $250k account at the default sizing:
 
 ```
 moment                premium   SPAN margin   debit    straddles short / long
-0DTE at 09:35 (6.4h)    16.17       $16,791    $809                 5 /  10
-0DTE at 12:00 (4.0h)    12.79       $16,961    $639                 5 /  10
-1DTE at the roll        31.49       $16,026  $1,574                 5 /  10
-2DTE                    44.41       $15,379  $2,221                 6 /  10
+0DTE at 09:35 (6.4h)    16.17       $33,691    $809                 2 /   5
+0DTE at 12:00 (4.0h)    12.79       $33,861    $639                 2 /   5
+1DTE at the roll        31.48       $32,926  $1,574                 2 /   5
+2DTE                    44.40       $32,280  $2,220                 2 /   5
 ```
 
-Both counts include **$17,600 of hedge margin per straddle** on top of the
+Both counts include **$34,500 of hedge margin per straddle** on top of the
 margin or debit column — ten MES once the straddle's delta has run out. A
 straddle cannot be carried without the futures to hedge it, so the two are
 one requirement against one budget, and on ES the hedge is the larger half
@@ -939,9 +942,14 @@ the sizing tests pin that a fifth is never committed at any setting.
 
 For live trading, `use_whatif_margin: true` asks IBKR to price the actual
 order. The straddle is probed as a **combo**, not as two separate orders,
-because that is how it will be margined. A long straddle is not probed at
-all: asking for a margin change on a purchase returns zero, which the
-sizing would read as "free" and size without limit.
+because that is how it will be margined, and the hedge is probed as one
+MES (once an hour; the figure moves with the performance-bond table, not
+the market). A long straddle is not probed at all: asking for a margin
+change on a purchase returns zero, which the sizing would read as "free"
+and size without limit. Every probe and every order is sent as a DAY
+order: with no time-in-force IBKR answers with informational error 10349,
+which ib_async treats as a cancel — a what-if then returns nothing, and a
+live order reads as "did not fill" while the exchange fills it.
 
 ## Known approximations
 
